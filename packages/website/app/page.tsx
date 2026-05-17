@@ -1,4 +1,3 @@
-import Image from "next/image";
 import { ApiPopover } from "./api-popover";
 import { ContactLink } from "./contact-link";
 import { DocsLink } from "./docs-link";
@@ -11,18 +10,6 @@ export const metadata = {
     "Zenbu.js is a JavaScript framework for building hackable software.",
 };
 
-function Logo() {
-  return (
-    <Image
-      src="/logo.png"
-      alt=""
-      width={78}
-      height={87}
-      className="[image-rendering:pixelated] h-11 w-auto"
-    />
-  );
-}
-
 export default function Home() {
   return (
     <div className="flex flex-col">
@@ -30,7 +17,7 @@ export default function Home() {
         {/* Hero */}
         <div className="max-w-lg w-full pt-16 sm:pt-24">
           <div className="flex items-end gap-3">
-            <Logo />
+            <img src="/logo.png" alt="" className="[image-rendering:pixelated] h-11 w-auto" />
             <h1 className="text-[2.5rem] sm:text-[2.75rem] font-semibold tracking-tight leading-[0.8]">
               Zenbu.js
             </h1>
@@ -94,7 +81,7 @@ export default function Home() {
         {/* Links */}
         <div className="max-w-lg w-full mt-16 flex items-center gap-3">
           <a
-            href="https://github.com/zenbu-labs/zenbu"
+            href="https://github.com/zenbu-labs/zenbu.js"
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex items-center gap-2 rounded-lg bg-zinc-900 text-white pl-4 pr-3.5 py-2 text-sm font-medium hover:bg-zinc-800 transition-colors"
