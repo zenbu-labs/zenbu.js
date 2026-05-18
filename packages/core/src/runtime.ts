@@ -579,6 +579,26 @@ export class ServiceRuntime {
       // Initial value broadcast — clients connected before the service
       // evaluated see it appear here.
       this.fireStateChange({ t: "update", path, value: cell.value });
+
+      // Freeze the slot so `this.count = state(0)` later in the
+      // service silently swaps in a NEW cell that the runtime no
+      // longer knows about. Reassign is almost always a bug — the
+      // service author meant `.set(...)`. `configurable: true` is
+      // required so teardown / re-evaluate can redefine the slot.
+      try {
+        Object.defineProperty(instance, fieldName, {
+          value: cell,
+          writable: false,
+          configurable: true,
+          enumerable: true,
+        });
+      } catch (err) {
+        console.warn(
+          `[runtime] could not freeze state field "${key}.${fieldName}": ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
 
     if (paths.size > 0) {
@@ -862,11 +882,17 @@ export class ServiceRuntime {
     slot.status = "evaluating";
     slot.error = null;
 
+    // Class field initializers (including `count = state(0)`) ran
+    // inside the constructor above, so the cells already exist on the
+    // instance. Register them BEFORE evaluate() so any `.set()` calls
+    // inside evaluate() fan out to subscribers + the wire dispatcher
+    // instead of firing into an empty subscriber set.
+    this.registerStateFields(key, slot);
+
     try {
       this.injectCtx(instance, ServiceClass);
       await instance.evaluate();
       slot.status = "ready";
-      this.registerStateFields(key, slot);
     } catch (e) {
       slot.status = "failed";
       slot.error = e;

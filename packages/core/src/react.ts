@@ -45,7 +45,13 @@ import type {
   ResolvedServiceRouter,
   ResolvedEvents,
 } from "./registry";
-import { ClientStateStore, type StateWireMessage } from "./state";
+import {
+  ClientStateStore,
+  STATE_WIRE_CHANNEL,
+  tryRecordSelectorPath,
+  type StateWireMessage,
+} from "./state";
+import type { ResolvedServiceStates } from "./registry";
 
 type AnyRpc = RouterProxy<
   Record<string, Record<string, Record<string, (...args: any[]) => any>>>
@@ -197,7 +203,7 @@ export function ZenbuProvider({
           const stateHandler = (e: MessageEvent) => {
             try {
               const msg = JSON.parse(e.data);
-              if (msg?.ch !== "state") return;
+              if (msg?.ch !== STATE_WIRE_CHANNEL) return;
               stateStore.apply(msg.data as StateWireMessage);
             } catch {
               // Non-JSON or unrelated frame — other channel handlers
@@ -366,32 +372,41 @@ export function useEvents(): EventProxy<RegisteredEvents> {
 // ---- Service state hook ----
 
 /**
- * Shape of the renderer's flat-to-nested view of service state cells.
- * Generated codegen lives elsewhere; the public hook accepts an
- * `unknown`-typed tree so plugin authors can cast at the selector
- * boundary until typegen lands.
+ * The nested-tree shape the `useServiceState` selector receives. When
+ * a plugin runs `zen link`, `ZenbuRegister["state"]` is augmented and
+ * `ResolvedServiceStates` resolves to the precise shape; otherwise the
+ * fallback is `Record<string, unknown>` and call sites must cast at
+ * the selector boundary.
  */
-export type ServiceStateTree = Record<string, unknown>;
+export type ServiceStateTree = ResolvedServiceStates;
 
 /**
  * Subscribe to a slice of a service's in-memory state. Mirrors `useDb` —
- * pass a selector that walks `tree[plugin][service][field]`. Re-renders
- * when the selected value changes (compared with `isEqual`, default
- * `Object.is`).
+ * pass a selector that walks `tree[plugin][service][field]`. The hook
+ * tries to capture the literal access path via a recording Proxy and
+ * subscribes only to that path (one re-render per relevant change);
+ * if the selector does anything the recorder cannot represent — `.find()`,
+ * conditionals, Symbol access — it falls back to a tree-walk with an
+ * `Object.is` snapshot cache.
  *
- *   const status = useServiceState<"idle" | "running">(
- *     (s) => (s.core as any)["server-status"].status,
- *   )
+ *   const status = useServiceState((s) => s.core["server-status"].status)
  *
- * Returns `undefined` for any unknown path — the snapshot may not have
- * arrived yet, or the owning service is not currently registered. Use
- * a default value (`?? "idle"`) at the call site.
+ * Returns `undefined` for any unknown path: the snapshot may not have
+ * arrived yet, or the owning service may not currently be registered.
+ * Default at the call site (`?? "idle"`).
  */
 export function useServiceState<T>(
   selector: (tree: ServiceStateTree) => T,
   isEqual: (a: T, b: T) => boolean = Object.is,
 ): T {
   const store = useConnection().state;
+
+  // Path recording is cheap (a few Proxy traps) — run it every render
+  // so inline selectors don't have to be memoized at the call site.
+  // The selector is `(tree: ResolvedServiceStates) => T`; the recorder
+  // takes `any` — safe because the recorder only inspects shape.
+  const path = tryRecordSelectorPath(selector as (tree: any) => unknown);
+
   const selectorRef = useRef(selector);
   selectorRef.current = selector;
   const isEqualRef = useRef(isEqual);
@@ -401,20 +416,37 @@ export function useServiceState<T>(
     value: undefined as T,
   });
 
-  const getSnapshot = () => {
-    const next = selectorRef.current(store.getTree());
-    if (lastRef.current.has && isEqualRef.current(lastRef.current.value, next)) {
-      return lastRef.current.value;
-    }
-    lastRef.current = { has: true, value: next };
-    return next;
-  };
-
-  return useSyncExternalStore(
-    (cb) => store.subscribe(cb),
-    getSnapshot,
-    getSnapshot,
+  const subscribe = useMemo(
+    () =>
+      path !== null
+        ? (cb: () => void) => store.subscribePath(path, cb)
+        : (cb: () => void) => store.subscribe(cb),
+    [path, store],
   );
+
+  const getSnapshot = useMemo(() => {
+    if (path !== null) {
+      // Fast path: direct path read. Avoids both the tree walk AND
+      // the selector — value is whatever the wire dispatcher placed
+      // at this path, cast to T.
+      return () => store.getValueAt(path) as T;
+    }
+    return () => {
+      const next = selectorRef.current(
+        store.getTree() as ServiceStateTree,
+      );
+      if (
+        lastRef.current.has &&
+        isEqualRef.current(lastRef.current.value, next)
+      ) {
+        return lastRef.current.value;
+      }
+      lastRef.current = { has: true, value: next };
+      return next;
+    };
+  }, [path, store]);
+
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
 export type { CollectionRefValue };
@@ -519,12 +551,12 @@ export function View({
 }: ViewProps): ReactElement {
   // The view registry is now a service in-memory state cell on
   // ViewRegistryService — read it reactively without round-tripping
-  // through the DB. Returns null until the snapshot arrives or until a
-  // view of this type is registered.
+  // through the DB. The `.find()` call falls back to the tree-walk
+  // subscription path; the selector itself is fully typed via
+  // `ResolvedServiceStates` (no `as any`). Returns null until the
+  // snapshot arrives or until a view of this type is registered.
   const url = useServiceState((s) => {
-    const entries = (
-      s as { core?: { ["view-registry"]?: { registry?: Array<{ type: string; url: string }> } } }
-    )?.core?.["view-registry"]?.registry;
+    const entries = s.core["view-registry"]?.registry;
     if (!Array.isArray(entries)) return null;
     return entries.find((v) => v.type === type)?.url ?? null;
   });

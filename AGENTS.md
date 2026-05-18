@@ -466,17 +466,17 @@ Read from the renderer with `useServiceState`:
 import { useServiceState } from "@zenbujs/core/react"
 
 function ServerWidget() {
-  const status = useServiceState((s) =>
-    (s as any).core["server-status"].status,
-  ) ?? "idle"
-  const port = useServiceState((s) =>
-    (s as any).core["server-status"].port,
-  )
+  const status = useServiceState((s) => s.app["server-status"].status) ?? "idle"
+  const port = useServiceState((s) => s.app["server-status"].port)
   return <div>Server: {status}{port ? ` (port ${port})` : ""}</div>
 }
 ```
 
-The selector walks `tree[pluginName][serviceKey][fieldName]`. Returns `undefined` until the initial snapshot arrives or whenever the owning service is not currently registered — default at the call site (`?? "idle"`).
+The selector walks `tree[pluginName][serviceKey][fieldName]`. Types resolve end-to-end via `zen link` — `s.app["server-status"].status` is typed as the union you declared in the cell (`"idle" | "starting" | "running" | "error"`). No `as any` needed.
+
+Internally, the hook captures the selector's access path through a recording Proxy and subscribes only to that exact path — one re-render per relevant change. If the selector does something the recorder cannot represent (`.find()`, conditionals, Symbol access) it falls back to a tree-walk with an `Object.is` snapshot cache; correctness is identical, just less efficient at high update rates.
+
+Returns `undefined` until the initial snapshot arrives or whenever the owning service is not currently registered — default at the call site (`?? "idle"`).
 
 Rules:
 
@@ -484,6 +484,8 @@ Rules:
 * **Values must be JSON-serializable.** No functions, no class instances, no circular references — the wire transport is plain `JSON.stringify`.
 * **Writes are main-process only in v1.** The renderer reads; if it needs to push, call an ordinary RPC method on the service.
 * **Underscore-prefixed fields are skipped** by the runtime walk — use `_internal = state(...)` to keep a reactive cell out of the wire surface.
+* **The slot is frozen at registration.** `this.count = state(0)` later in the service throws — the runtime no longer knows about the new cell. Use `.set()` to change the value.
+* **`.set()` inside `evaluate()` works.** Cells are registered before `evaluate()` runs, so an eager `this.status.set("starting")` during boot reaches subscribers and the wire.
 
 Refactor example: `ViewRegistryService` used to mirror its `Map<string, ViewEntry>` into `root.core.lastKnownViewRegistry` in the database so the renderer's `<View>` could resolve URLs. That field was dropped — the registry is now a `state<ViewRegistrySnapshotEntry[]>([])` cell published whenever a view is registered or removed, and `<View>` reads it via `useServiceState`.
 

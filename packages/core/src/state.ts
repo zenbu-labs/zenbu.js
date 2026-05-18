@@ -49,6 +49,13 @@ export const STATE_MARKER: unique symbol = Symbol.for(
   "@zenbujs/core/ServiceState",
 ) as never;
 
+/**
+ * The WebSocket multiplexer channel name carrying state snapshots and
+ * updates. Imported by both the server (`StateService`) and the renderer
+ * (`ZenbuProvider`) so the two sides cannot drift.
+ */
+export const STATE_WIRE_CHANNEL = "state" as const;
+
 export type StateUnsubscribe = () => void;
 
 export class ServiceState<T> {
@@ -171,30 +178,110 @@ export type StateWireMessage = StateSnapshotMessage | StateUpdateMessage;
  * Lives here (not `react.ts`) so it is plain TS — testable in node and
  * reusable from any renderer-side glue, not just React.
  */
+/**
+ * Try to capture the wire path a selector reads, using a recording
+ * Proxy that records every string-keyed property access. Returns the
+ * dotted path on success, or `null` if the selector did anything the
+ * recorder cannot represent — Symbol access, function calls (`.find`),
+ * `in` checks, conditionals returning a non-leaf, throws. Callers fall
+ * back to tree-walk + dedup in that case.
+ */
+export function tryRecordSelectorPath(
+  selector: (tree: any) => unknown,
+): string | null {
+  const parts: string[] = [];
+  let bailed = false;
+  const make = (): any =>
+    new Proxy(
+      {},
+      {
+        get(_, prop) {
+          if (typeof prop !== "string") {
+            bailed = true;
+            return undefined;
+          }
+          // Common thenable / iteration probes done by libraries or
+          // the React renderer — bail rather than record garbage.
+          if (
+            prop === "then" ||
+            prop === Symbol.toPrimitive.toString() ||
+            prop === "toJSON"
+          ) {
+            bailed = true;
+            return undefined;
+          }
+          parts.push(prop);
+          return make();
+        },
+        has() {
+          bailed = true;
+          return false;
+        },
+        apply() {
+          bailed = true;
+          return undefined;
+        },
+      },
+    );
+  let result: unknown;
+  try {
+    result = selector(make());
+  } catch {
+    return null;
+  }
+  if (bailed) return null;
+  // The leaf must itself be the recording proxy — selector must end at
+  // a property access, not return a literal.
+  if (typeof result !== "object" || result === null) return null;
+  return parts.join(".");
+}
+
 export class ClientStateStore {
   private values = new Map<string, unknown>();
-  private listeners = new Set<() => void>();
+  /** Tree-level (every change) listeners — used by selectors that walk the tree. */
+  private treeListeners = new Set<() => void>();
+  /** Path-indexed listeners — fire only when the specific path's value changes. */
+  private pathListeners = new Map<string, Set<() => void>>();
   private cachedTree: Record<string, unknown> = {};
 
   apply(msg: StateWireMessage): void {
+    const changedPaths: string[] = [];
     if (msg.t === "snapshot") {
-      this.values.clear();
-      for (const [path, value] of Object.entries(msg.values)) {
-        this.values.set(path, value);
+      // Diff: any path that changed value (or was added/removed) counts.
+      const next = new Map<string, unknown>(Object.entries(msg.values));
+      for (const [path, value] of next) {
+        if (!this.values.has(path) || !Object.is(this.values.get(path), value)) {
+          changedPaths.push(path);
+        }
       }
+      for (const path of this.values.keys()) {
+        if (!next.has(path)) changedPaths.push(path);
+      }
+      this.values = next;
     } else {
+      const prev = this.values.get(msg.path);
       if (msg.value === undefined) {
-        this.values.delete(msg.path);
-      } else {
+        if (this.values.has(msg.path)) {
+          this.values.delete(msg.path);
+          changedPaths.push(msg.path);
+        }
+      } else if (!this.values.has(msg.path) || !Object.is(prev, msg.value)) {
         this.values.set(msg.path, msg.value);
+        changedPaths.push(msg.path);
       }
     }
+    if (changedPaths.length === 0) return;
     this.cachedTree = this.buildTree();
-    this.notify();
+    this.notify(changedPaths);
   }
 
   getTree(): Record<string, unknown> {
     return this.cachedTree;
+  }
+
+  /** Direct read by wire path. Returns `undefined` if the path is unknown. */
+  getValueAt(path: string): unknown {
+    return this.values.get(path);
   }
 
   /** Flat path → value view. Same shape as the wire `snapshot.values`. */
@@ -204,19 +291,57 @@ export class ClientStateStore {
     return out;
   }
 
+  /**
+   * Tree-level subscription — `cb` fires after any apply that changes
+   * at least one value. Used by selectors that walk the tree (`.find()`,
+   * etc.) where the consumer cannot pre-declare the path of interest.
+   */
   subscribe(cb: () => void): () => void {
-    this.listeners.add(cb);
+    this.treeListeners.add(cb);
     return () => {
-      this.listeners.delete(cb);
+      this.treeListeners.delete(cb);
     };
   }
 
-  private notify(): void {
-    for (const cb of [...this.listeners]) {
+  /**
+   * Path-indexed subscription — `cb` fires only when the value at
+   * `path` changes (added, replaced, or removed). The fast path for
+   * the `useServiceState` Proxy-recorded selector.
+   */
+  subscribePath(path: string, cb: () => void): () => void {
+    let set = this.pathListeners.get(path);
+    if (!set) {
+      set = new Set();
+      this.pathListeners.set(path, set);
+    }
+    set.add(cb);
+    return () => {
+      const cur = this.pathListeners.get(path);
+      if (!cur) return;
+      cur.delete(cb);
+      if (cur.size === 0) this.pathListeners.delete(path);
+    };
+  }
+
+  private notify(changedPaths: readonly string[]): void {
+    // Path-indexed listeners first — cheap, targeted.
+    for (const path of changedPaths) {
+      const set = this.pathListeners.get(path);
+      if (!set) continue;
+      for (const cb of [...set]) {
+        try {
+          cb();
+        } catch (err) {
+          console.error("[state] client path listener threw:", err);
+        }
+      }
+    }
+    // Tree listeners — fire once per apply, no matter how many paths changed.
+    for (const cb of [...this.treeListeners]) {
       try {
         cb();
       } catch (err) {
-        console.error("[state] client listener threw:", err);
+        console.error("[state] client tree listener threw:", err);
       }
     }
   }

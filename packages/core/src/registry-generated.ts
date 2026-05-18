@@ -9,6 +9,7 @@ import type {
   RendererHostService,
   RpcService,
   ServerService,
+  StateService,
   UpdaterService,
   ViewRegistryService,
   WindowService,
@@ -34,6 +35,15 @@ type ExtractRpcMethods<T> = {
     : never]: T[K]
 }
 
+import type { ServiceState } from "@zenbujs/core/runtime"
+
+type ExtractStateFields<T> = {
+  [K in Exclude<keyof T, ServiceBase | `_${string}`> as T[K] extends
+    ServiceState<any>
+    ? K
+    : never]: T[K] extends ServiceState<infer V> ? V : never
+}
+
 export type CoreServiceRouter = {
   core: {
     "base-window": ExtractRpcMethods<BaseWindowService>;
@@ -43,9 +53,26 @@ export type CoreServiceRouter = {
     "renderer-host": ExtractRpcMethods<RendererHostService>;
     rpc: ExtractRpcMethods<RpcService>;
     server: ExtractRpcMethods<ServerService>;
+    state: ExtractRpcMethods<StateService>;
     updater: ExtractRpcMethods<UpdaterService>;
     "view-registry": ExtractRpcMethods<ViewRegistryService>;
     window: ExtractRpcMethods<WindowService>;
+  };
+}
+
+export type CoreServiceStates = {
+  core: {
+    "base-window": ExtractStateFields<BaseWindowService>;
+    db: ExtractStateFields<DbService>;
+    http: ExtractStateFields<HttpService>;
+    reloader: ExtractStateFields<ReloaderService>;
+    "renderer-host": ExtractStateFields<RendererHostService>;
+    rpc: ExtractStateFields<RpcService>;
+    server: ExtractStateFields<ServerService>;
+    state: ExtractStateFields<StateService>;
+    updater: ExtractStateFields<UpdaterService>;
+    "view-registry": ExtractStateFields<ViewRegistryService>;
+    window: ExtractStateFields<WindowService>;
   };
 }
 

@@ -20,6 +20,9 @@
       "@zenbujs/core/registry-generated": [
         "./src/registry-generated.ts"
       ],
+      "@zenbujs/core/runtime": [
+        "./src/runtime.ts"
+      ],
       "@zenbujs/core/services": [
         "./src/services/index.ts"
       ],

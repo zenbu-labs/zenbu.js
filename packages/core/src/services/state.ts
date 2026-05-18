@@ -1,6 +1,10 @@
 import type { WebSocket } from "ws";
 import { Service, runtime } from "../runtime";
-import type { StateUpdateMessage, StateSnapshotMessage } from "../state";
+import {
+  STATE_WIRE_CHANNEL,
+  type StateUpdateMessage,
+  type StateSnapshotMessage,
+} from "../state";
 import { HttpService } from "./http";
 import { createLogger } from "../shared/log";
 
@@ -36,7 +40,7 @@ export class StateService extends Service.create({
       ) => {
         if (ws.readyState !== ws.OPEN) return;
         try {
-          ws.send(JSON.stringify({ ch: "state", data: payload }));
+          ws.send(JSON.stringify({ ch: STATE_WIRE_CHANNEL, data: payload }));
         } catch (err) {
           log.verbose("ws send failed:", err);
         }
