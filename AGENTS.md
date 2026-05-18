@@ -435,11 +435,64 @@ function Notifications() {
 
 The returned function unsubscribes the listener, so return it from your effect's cleanup to avoid accumulating subscriptions across renders.
 
-## Events vs RPC vs database
+## Service state (in-memory, lifecycle-scoped)
+
+Services often hold transient state in instance properties — a port number, a `Map` of active connections, a "server starting / running / error" status. The renderer needs to read those values reactively, but they should *not* outlive the service: if the process is force-quit, nothing on disk should pretend the service is still running.
+
+`state(...)` is a reactive in-memory cell tied to the service that owns it. The value is mirrored to every connected renderer over the WebSocket and dies with the service.
+
+Declare state as class fields:
+
+```typescript src/main/services/server-status.ts theme={null}
+import { Service, state } from "@zenbujs/core/runtime"
+
+export class ServerStatusService extends Service.create({ key: "server-status" }) {
+  status = state<"idle" | "starting" | "running" | "error">("idle")
+  port   = state<number | null>(null)
+
+  async start() {
+    this.status.set("starting")
+    this.port.set(await spawnServer())
+    this.status.set("running")
+  }
+}
+```
+
+Each `state(initial)` returns a `ServiceState<T>` with `.value` / `.get()` / `.set(next)` / `.update(fn)` / `.subscribe(cb)`. `.set` is a no-op when the new value is `Object.is`-equal to the current — only structural replacement triggers a broadcast.
+
+Read from the renderer with `useServiceState`:
+
+```typescript theme={null}
+import { useServiceState } from "@zenbujs/core/react"
+
+function ServerWidget() {
+  const status = useServiceState((s) =>
+    (s as any).core["server-status"].status,
+  ) ?? "idle"
+  const port = useServiceState((s) =>
+    (s as any).core["server-status"].port,
+  )
+  return <div>Server: {status}{port ? ` (port ${port})` : ""}</div>
+}
+```
+
+The selector walks `tree[pluginName][serviceKey][fieldName]`. Returns `undefined` until the initial snapshot arrives or whenever the owning service is not currently registered — default at the call site (`?? "idle"`).
+
+Rules:
+
+* **Lifetime is the service instance.** On hot reload / shutdown the cells are unregistered and the renderer sees them disappear. The next instance starts with the cell's declared initial value.
+* **Values must be JSON-serializable.** No functions, no class instances, no circular references — the wire transport is plain `JSON.stringify`.
+* **Writes are main-process only in v1.** The renderer reads; if it needs to push, call an ordinary RPC method on the service.
+* **Underscore-prefixed fields are skipped** by the runtime walk — use `_internal = state(...)` to keep a reactive cell out of the wire surface.
+
+Refactor example: `ViewRegistryService` used to mirror its `Map<string, ViewEntry>` into `root.core.lastKnownViewRegistry` in the database so the renderer's `<View>` could resolve URLs. That field was dropped — the registry is now a `state<ViewRegistrySnapshotEntry[]>([])` cell published whenever a view is registered or removed, and `<View>` reads it via `useServiceState`.
+
+## Events vs RPC vs database vs state
 
 * **Events** are for transient updates that don't need to be persisted, like streaming terminal output or push notifications.
 * **RPC** is for getting the main process to run code the renderer process can't, like reading a file or calling a system API.
 * **Database** is for state that should persist and drive your UI.
+* **Service state** is for transient, reactive values tied to the lifetime of a service — pick this over the database when there is nothing to recover after a crash.
 
 
 # Plugins

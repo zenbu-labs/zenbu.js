@@ -7,6 +7,29 @@ import {
   type AdviceSpec,
   type ContentScriptSpec,
 } from "./services/advice-config";
+import {
+  isServiceState,
+  stateEntryPath,
+  type ServiceState,
+  type StateEntry,
+  type StateUpdateMessage,
+} from "./state";
+
+export {
+  ServiceState,
+  state,
+  isServiceState,
+  STATE_MARKER,
+  stateEntryPath,
+  ClientStateStore,
+} from "./state";
+export type {
+  StateEntry,
+  StateSnapshotMessage,
+  StateUpdateMessage,
+  StateUnsubscribe,
+  StateWireMessage,
+} from "./state";
 
 /**
  * The synthetic plugin name used for everything that ships inside
@@ -251,6 +274,22 @@ export class ServiceRuntime {
     Set<(instance: Service | undefined) => void>
   >();
 
+  /**
+   * Service in-memory state registry. Keyed by the dotted wire path
+   * `<plugin>.<service>.<field>`. Populated by `registerStateFields()`
+   * after a service evaluates, cleared by `unregisterStateFields()` on
+   * teardown. The `StateService` reads `getStateEntries()` to build the
+   * initial snapshot for new clients and subscribes via
+   * `subscribeStateChanges()` to fan out per-field updates.
+   */
+  private stateEntries = new Map<string, StateEntry>();
+  /** path → unsubscribe. Detached when the cell is unregistered. */
+  private stateCellUnsubs = new Map<string, () => void>();
+  /** slot key → set of paths owned by that service. */
+  private stateEntriesByService = new Map<string, Set<string>>();
+  /** Wire-update callbacks. Wired by `StateService` on evaluate. */
+  private stateChangeSubscribers = new Set<(msg: StateUpdateMessage) => void>();
+
   register(
     ServiceClass: ServiceConstructor,
     importMeta?: ImportMeta | null,
@@ -455,6 +494,122 @@ export class ServiceRuntime {
     };
   }
 
+  // =========================================================================
+  //                          Service state registry
+  // =========================================================================
+
+  /**
+   * Snapshot of every registered state cell, keyed by
+   * `<plugin>.<service>.<field>` — the shape `StateService` ships to a
+   * newly connected client. Values are read from each cell at call time
+   * so the result is a coherent "right now" snapshot.
+   */
+  getStateEntries(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [path, entry] of this.stateEntries) {
+      out[path] = entry.cell.value;
+    }
+    return out;
+  }
+
+  /**
+   * Subscribe to every state-cell change in the runtime. The callback
+   * fires once per `.set()`/`.update()` with a wire-ready update
+   * message (`path` + new `value`). `value` is `undefined` when the
+   * underlying service is torn down. Returns an unsubscribe.
+   */
+  subscribeStateChanges(
+    cb: (msg: StateUpdateMessage) => void,
+  ): () => void {
+    this.stateChangeSubscribers.add(cb);
+    return () => {
+      this.stateChangeSubscribers.delete(cb);
+    };
+  }
+
+  private fireStateChange(msg: StateUpdateMessage): void {
+    if (this.stateChangeSubscribers.size === 0) return;
+    for (const cb of [...this.stateChangeSubscribers]) {
+      try {
+        cb(msg);
+      } catch (err) {
+        console.error("[hot] state change subscriber threw:", err);
+      }
+    }
+  }
+
+  /**
+   * Walk a freshly-evaluated service instance and register every
+   * `ServiceState` own-property under `<plugin>.<service>.<field>`.
+   * Symbol-keyed properties are ignored. Skips re-registration if the
+   * service was already registered (e.g. evaluate() ran twice in a
+   * weird HMR edge); we unregister first to avoid duplicate
+   * subscriptions.
+   */
+  private registerStateFields(key: string, slot: ServiceSlot): void {
+    if (!slot.instance) return;
+    // Make sure no stale entries linger from a previous evaluation.
+    this.unregisterStateFields(key);
+
+    const pluginName = pluginNameForDir(slot.pluginDir);
+    const paths = new Set<string>();
+    const instance = slot.instance as unknown as Record<string, unknown>;
+
+    for (const fieldName of Object.keys(instance)) {
+      if (fieldName.startsWith("_")) continue;
+      const value = instance[fieldName];
+      if (!isServiceState(value)) continue;
+
+      const path = stateEntryPath(pluginName, key, fieldName);
+      const cell = value as ServiceState<unknown>;
+      const entry: StateEntry = {
+        path,
+        pluginName,
+        serviceKey: key,
+        fieldName,
+        cell,
+      };
+      this.stateEntries.set(path, entry);
+      paths.add(path);
+      // Bridge cell → wire dispatcher.
+      const unsub = cell.subscribe((next) => {
+        this.fireStateChange({ t: "update", path, value: next });
+      });
+      this.stateCellUnsubs.set(path, unsub);
+      // Initial value broadcast — clients connected before the service
+      // evaluated see it appear here.
+      this.fireStateChange({ t: "update", path, value: cell.value });
+    }
+
+    if (paths.size > 0) {
+      this.stateEntriesByService.set(key, paths);
+    }
+  }
+
+  /**
+   * Drop every state cell owned by `key` and broadcast a removal
+   * (`value: undefined`) for each. Idempotent.
+   */
+  private unregisterStateFields(key: string): void {
+    const paths = this.stateEntriesByService.get(key);
+    if (!paths || paths.size === 0) return;
+    this.stateEntriesByService.delete(key);
+
+    for (const path of paths) {
+      const unsub = this.stateCellUnsubs.get(path);
+      if (unsub) {
+        try {
+          unsub();
+        } catch (err) {
+          console.error("[hot] state cell unsubscribe threw:", err);
+        }
+        this.stateCellUnsubs.delete(path);
+      }
+      this.stateEntries.delete(path);
+      this.fireStateChange({ t: "update", path, value: undefined });
+    }
+  }
+
   private resolveDepSlot(depKey: string): ServiceSlot | undefined {
     return this.slots.get(depKey);
   }
@@ -549,6 +704,11 @@ export class ServiceRuntime {
     slot.status = "blocked";
     slot.error = null;
 
+    // Setup cleanup handlers below may call `state.set(...)` to flush
+    // a final value to the renderer (e.g. "status: idle"). Keep cells
+    // registered until cleanups finish; then drop them and broadcast
+    // an `undefined` removal so the renderer no longer reads stale.
+
     if (instance) {
       const reason = options.reason ?? "shutdown";
       // Bound each service's cleanup. A pty/socket/watcher whose drain
@@ -572,6 +732,10 @@ export class ServiceRuntime {
         if (timer) clearTimeout(timer);
       }
     }
+
+    // Cleanups have run (or timed out). Now drop the state cells so the
+    // renderer sees them go away.
+    this.unregisterStateFields(key);
 
     if (options.removeSlot) {
       this.slots.delete(key);
@@ -702,6 +866,7 @@ export class ServiceRuntime {
       this.injectCtx(instance, ServiceClass);
       await instance.evaluate();
       slot.status = "ready";
+      this.registerStateFields(key, slot);
     } catch (e) {
       slot.status = "failed";
       slot.error = e;

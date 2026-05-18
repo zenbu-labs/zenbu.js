@@ -1,10 +1,22 @@
-import * as Effect from "effect/Effect";
-import { Service, runtime, getPlugins } from "../runtime";
-import { ReloaderService, type ReloaderEntry } from "./reloader";
-import { DbService } from "./db";
+import { Service, runtime, state, getPlugins } from "../runtime";
+import { ReloaderService } from "./reloader";
 import { createLogger } from "../shared/log";
 
 const log = createLogger("view-registry");
+
+/**
+ * Renderer-facing shape for a registered view. The same shape is exposed
+ * over the `state` wire channel via the `registry` cell below — kept in
+ * its own type so renderer code (`<View>` in `react.ts`) can import
+ * without pulling in the whole service module.
+ */
+export interface ViewRegistrySnapshotEntry {
+  type: string;
+  url: string;
+  port: number;
+  icon?: string;
+  meta?: ViewMeta;
+}
 
 /**
  * View metadata surfaced to the renderer (icon picker, sidebar slot,
@@ -57,10 +69,21 @@ export interface RegisterAliasSpec {
 
 export class ViewRegistryService extends Service.create({
   key: "view-registry",
-  deps: { reloader: ReloaderService, db: DbService },
+  deps: { reloader: ReloaderService },
 }) {
+  /**
+   * Source of truth (main-process only). `registry` below is the
+   * serialized projection broadcast to the renderer.
+   */
   private views = new Map<string, ViewEntry>();
   private manifestIcons = new Map<string, string>();
+
+  /**
+   * Renderer-visible snapshot. Mirrored to every connected renderer
+   * via `StateService` over the `state` wire channel. Dies with this
+   * service instance — no DB round-trip, no stale rows after a crash.
+   */
+  registry = state<ViewRegistrySnapshotEntry[]>([]);
 
   async register(spec: RegisterViewSpec): Promise<ViewEntry> {
     const { type, root, configFile, meta } = spec;
@@ -86,7 +109,7 @@ export class ViewRegistryService extends Service.create({
       meta,
     };
     this.views.set(type, entry);
-    await this.syncToDb();
+    this.publish();
     log.verbose(`"${type}" registered at ${entry.url}`);
     return entry;
   }
@@ -110,7 +133,7 @@ export class ViewRegistryService extends Service.create({
       meta,
     };
     this.views.set(type, entry);
-    void this.syncToDb();
+    this.publish();
     return entry;
   }
 
@@ -121,7 +144,7 @@ export class ViewRegistryService extends Service.create({
       await this.ctx.reloader.remove(type);
     }
     this.views.delete(type);
-    await this.syncToDb();
+    this.publish();
   }
 
   get(type: string): ViewEntry | undefined {
@@ -130,9 +153,8 @@ export class ViewRegistryService extends Service.create({
 
   evaluate() {
     this.loadManifestIcons();
-
-    // Wipe stale rows from any prior session; ports are fresh on boot.
-    void this.syncToDb();
+    // Fresh boot: empty registry. Renderer sees [] until views register.
+    this.publish();
 
     this.setup("view-registry-cleanup", () => {
       return async () => {
@@ -142,7 +164,7 @@ export class ViewRegistryService extends Service.create({
           }
         }
         this.views.clear();
-        await this.syncToDb();
+        this.publish();
       };
     });
   }
@@ -157,22 +179,17 @@ export class ViewRegistryService extends Service.create({
     }
   }
 
-  private async syncToDb(): Promise<void> {
-    const client = this.ctx.db.effectClient;
-    const snapshot = [...this.views.values()].map((e) => ({
-      type: e.type,
-      url: e.url,
-      port: e.port,
-      icon: this.manifestIcons.get(e.type),
-      meta: e.meta,
-    }));
-    await Effect.runPromise(
-      client.update((root) => {
-        root.core.lastKnownViewRegistry = snapshot;
+  private publish(): void {
+    const snapshot: ViewRegistrySnapshotEntry[] = [...this.views.values()].map(
+      (e) => ({
+        type: e.type,
+        url: e.url,
+        port: e.port,
+        icon: this.manifestIcons.get(e.type),
+        meta: e.meta,
       }),
-    ).catch((err) => {
-      // log removed
-    });
+    );
+    this.registry.set(snapshot);
   }
 }
 

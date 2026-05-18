@@ -9,6 +9,7 @@ export async function defaultServices(): Promise<void> {
   await import("./db");
   await import("./base-window");
   await import("./rpc");
+  await import("./state");
   await import("./view-registry");
   await import("./window");
   await import("./advice-config");

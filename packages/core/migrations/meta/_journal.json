@@ -5,6 +5,11 @@
       "idx": 0,
       "tag": "migration",
       "when": 1778221349410
+    },
+    {
+      "idx": 1,
+      "tag": "remove_view_registry_from_db",
+      "when": 1779120125128
     }
   ]
 }

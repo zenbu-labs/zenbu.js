@@ -17,6 +17,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ReactElement,
   type ReactNode,
@@ -44,6 +45,7 @@ import type {
   ResolvedServiceRouter,
   ResolvedEvents,
 } from "./registry";
+import { ClientStateStore, type StateWireMessage } from "./state";
 
 type AnyRpc = RouterProxy<
   Record<string, Record<string, Record<string, (...args: any[]) => any>>>
@@ -57,6 +59,7 @@ type Connection = {
   events: AnyEvents;
   db: AnyDbClient;
   replica: Replica;
+  state: ClientStateStore;
 };
 
 type ConnectionState =
@@ -188,7 +191,25 @@ export function ZenbuProvider({
             },
           });
 
+          // Service in-memory state replica. Pure receive — there is no
+          // client→server channel in v1 (writes still go through RPC).
+          const stateStore = new ClientStateStore();
+          const stateHandler = (e: MessageEvent) => {
+            try {
+              const msg = JSON.parse(e.data);
+              if (msg?.ch !== "state") return;
+              stateStore.apply(msg.data as StateWireMessage);
+            } catch {
+              // Non-JSON or unrelated frame — other channel handlers
+              // already inspected it.
+            }
+          };
+          ws.addEventListener("message", stateHandler);
+          const disconnectState = () =>
+            ws.removeEventListener("message", stateHandler);
+
           if (cancelled) {
+            disconnectState();
             await disconnectDb();
             disconnectRpc();
             ws.close();
@@ -219,6 +240,7 @@ export function ZenbuProvider({
 
           cleanupRef.current = () => {
             unsubReload?.();
+            disconnectState();
             disconnectDb();
             disconnectRpc();
             ws.close();
@@ -231,6 +253,7 @@ export function ZenbuProvider({
               events: events as AnyEvents,
               db: db as AnyDbClient,
               replica,
+              state: stateStore,
             },
           });
         } catch (err) {
@@ -340,6 +363,60 @@ export function useEvents(): EventProxy<RegisteredEvents> {
   return useConnection().events as unknown as EventProxy<RegisteredEvents>;
 }
 
+// ---- Service state hook ----
+
+/**
+ * Shape of the renderer's flat-to-nested view of service state cells.
+ * Generated codegen lives elsewhere; the public hook accepts an
+ * `unknown`-typed tree so plugin authors can cast at the selector
+ * boundary until typegen lands.
+ */
+export type ServiceStateTree = Record<string, unknown>;
+
+/**
+ * Subscribe to a slice of a service's in-memory state. Mirrors `useDb` —
+ * pass a selector that walks `tree[plugin][service][field]`. Re-renders
+ * when the selected value changes (compared with `isEqual`, default
+ * `Object.is`).
+ *
+ *   const status = useServiceState<"idle" | "running">(
+ *     (s) => (s.core as any)["server-status"].status,
+ *   )
+ *
+ * Returns `undefined` for any unknown path — the snapshot may not have
+ * arrived yet, or the owning service is not currently registered. Use
+ * a default value (`?? "idle"`) at the call site.
+ */
+export function useServiceState<T>(
+  selector: (tree: ServiceStateTree) => T,
+  isEqual: (a: T, b: T) => boolean = Object.is,
+): T {
+  const store = useConnection().state;
+  const selectorRef = useRef(selector);
+  selectorRef.current = selector;
+  const isEqualRef = useRef(isEqual);
+  isEqualRef.current = isEqual;
+  const lastRef = useRef<{ has: boolean; value: T }>({
+    has: false,
+    value: undefined as T,
+  });
+
+  const getSnapshot = () => {
+    const next = selectorRef.current(store.getTree());
+    if (lastRef.current.has && isEqualRef.current(lastRef.current.value, next)) {
+      return lastRef.current.value;
+    }
+    lastRef.current = { has: true, value: next };
+    return next;
+  };
+
+  return useSyncExternalStore(
+    (cb) => store.subscribe(cb),
+    getSnapshot,
+    getSnapshot,
+  );
+}
+
 export type { CollectionRefValue };
 
 // ---- <View>: child-iframe primitive ----
@@ -440,14 +517,17 @@ export function View({
   onLoad,
   fallback = null,
 }: ViewProps): ReactElement {
-  // The view registry is replicated to the renderer via the core db slice.
-  const url = useDb((root) =>
-    (
-      root as unknown as {
-        core: { lastKnownViewRegistry: Array<{ type: string; url: string }> };
-      }
-    ).core.lastKnownViewRegistry.find((v) => v.type === type)?.url ?? null,
-  );
+  // The view registry is now a service in-memory state cell on
+  // ViewRegistryService — read it reactively without round-tripping
+  // through the DB. Returns null until the snapshot arrives or until a
+  // view of this type is registered.
+  const url = useServiceState((s) => {
+    const entries = (
+      s as { core?: { ["view-registry"]?: { registry?: Array<{ type: string; url: string }> } } }
+    )?.core?.["view-registry"]?.registry;
+    if (!Array.isArray(entries)) return null;
+    return entries.find((v) => v.type === type)?.url ?? null;
+  });
 
   // Snapshot the iframe URL on first commit and never recompute. Changes to
   // `args` after mount go via postMessage — rewriting `src` would reload

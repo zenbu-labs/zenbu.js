@@ -1,0 +1,12 @@
+{
+  "id": "20bde910-d362-4a81-8e4a-02a8b0775699",
+  "prevId": "96242ba8-b98f-4856-8c2f-ac755aae4805",
+  "fields": {
+    "windowPrefs": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d15bbfd72cb9fe18",
+      "default": {}
+    }
+  }
+}
