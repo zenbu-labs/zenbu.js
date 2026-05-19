@@ -69,9 +69,13 @@ Editing the raw source code of the application can be risky. If a user and the d
 
 Plugins run in the same process as the application code and get access to the same APIs. This means any feature written in the main app could be written as a plugin.
 
-When you write an app in Zenbu you do not need to think about writing a plugin API. The framework APIs are designed so that your code is **extensible by default**.
+When you write an app in Zenbu your code is **extensible by default**, so plugins can extend it without you designing a plugin API up front. For more complex parts of your app that need a richer extension model, you can define your own on top.
 
 Plugins hot reload just like application code, because application code is itself implemented as a plugin.
+
+## What this is not
+
+Zenbu.js is not a one-size-fits-all model for building extensible applications. It provides a general-purpose way to load external code, with primitives for hot reloading, sharing state, and extending UI. For more complex behavior that isn't covered by Zenbu's architecture, you'll need your own conventions and systems for how that part gets extended, defined inside your Zenbu app.
 
 ## Compatibility
 
@@ -81,6 +85,25 @@ Plugins hot reload just like application code, because application code is itsel
 | Node.js        | 🚧 WIP       |
 | Tauri          | 🚧 WIP       |
 | Browser-native | 🚧 WIP       |
+
+## Roadmap
+
+- Non sandboxed out-of-process plugins
+- Improved sandboxing controls for plugins
+- Performance work
+- Migrate custom node HMR to Vite's [environments API](https://vite.dev/guide/api-environment)
+- HMR for `node_modules`, advice, and content scripts
+- Windows and Linux support
+- Automatic CLI per app
+- Git-based auto updater
+- WebRTC adapter for zenrpc and kyju (the database)
+- Add optimized production mode that pre-compiles and bundles the typescript to javascript (would opt project out of allowing its source code edited at runtime by user)
+- Support for running outside of electron (local node.js process + website, within tauri, natively on the web)
+- Plugin devtools
+
+## Project
+
+Zenbu.js is a project from [Zenbu Labs](https://github.com/zenbu-labs).
 
 ## FAQ
 
@@ -121,21 +144,6 @@ For now, yes. But support for other runtimes like Tauri and pure Node.js is comi
 No - Zenbu.js is still in alpha, so it may still contain bugs and have large API changes
 
 </details>
-
-## Roadmap
-
-- Out-of-process plugins via Electron utility processes
-- Performance work
-- Migrate Node HMR to Vite's [environments API](https://vite.dev/guide/api-environment)
-- HMR for `node_modules`, advice, and content scripts
-- Windows and Linux support
-- Automatic CLI per app
-- Git-based updates for `node_modules`
-- WebRTC adapter for ZenRPC and the database
-
-## Project
-
-Zenbu.js is a project from [Zenbu Labs](https://zenbu.dev).
 
 <br />
 
