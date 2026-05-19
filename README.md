@@ -122,6 +122,21 @@ No - Zenbu.js is still in alpha, so it may still contain bugs and have large API
 
 </details>
 
+## Roadmap
+
+- Out-of-process plugins via Electron utility processes
+- Performance work
+- Migrate Node HMR to Vite's [environments API](https://vite.dev/guide/api-environment)
+- HMR for `node_modules`, advice, and content scripts
+- Windows and Linux support
+- Automatic CLI per app
+- Git-based updates for `node_modules`
+- WebRTC adapter for ZenRPC and the database
+
+## Project
+
+Zenbu.js is a project from [Zenbu Labs](https://zenbu.dev).
+
 <br />
 
 <p align="center">
