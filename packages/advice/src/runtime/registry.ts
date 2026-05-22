@@ -13,9 +13,6 @@ export interface FunctionEntry {
 }
 
 const registry = new Map<string, Map<string, FunctionEntry>>()
-// Tracks short moduleId aliases that have already been migrated to a full path.
-// Used to detect ambiguous conflicts when a second full path matches the same short alias.
-const migratedAliases = new Map<string, string>() // shortId → fullId it was migrated to
 
 function key(moduleId: string, name: string): string {
   return `${moduleId}:${name}`
@@ -39,44 +36,39 @@ export function getOrCreateEntry(moduleId: string, name: string): FunctionEntry 
   return entry
 }
 
-function migrateSuffixAliases(fullModuleId: string): void {
-  if (migratedAliases.size === 0 && registry.size === 0) return
-
-  for (const [shortId, migratedTo] of migratedAliases) {
-    if (fullModuleId.endsWith("/" + shortId) && migratedTo !== fullModuleId) {
-      console.error(
-        `[zenbu/advice] moduleId "${shortId}" is ambiguous — it matches both ` +
-        `"${migratedTo}" and "${fullModuleId}". ` +
-        `Use the full path in your advise() call to avoid conflicts.`
-      )
-      return
-    }
-  }
-
+/**
+ * When a real module registers itself via `setImpl(fullModuleId, ...)`,
+ * detect any *short* moduleIds already present in the registry that
+ * are a suffix of `fullModuleId`. Those entries are advice that was
+ * registered against a non-canonical id (e.g. `"messages/tool-call.tsx"`
+ * instead of `"/abs/path/to/messages/tool-call.tsx"`).
+ *
+ * Without auto-migration that advice will never fire — the registry
+ * keys it on the short id, but the real module registers under the
+ * full path, so the chain stays empty.
+ *
+ * Rather than silently auto-resolving (which makes short-id advice
+ * "work by magic" and creates ambiguity when two files share a
+ * basename), this function just logs a loud `console.error` pointing
+ * the caller at the exact full id they should use. The short-id
+ * advice does not apply. Callers must pass the full moduleId.
+ */
+function reportShortIdAdvice(fullModuleId: string, name: string): void {
+  if (registry.size === 0) return
   for (const [existingId, existingMap] of registry) {
     if (existingId === fullModuleId) continue
     if (!fullModuleId.endsWith("/" + existingId)) continue
-
-    console.warn(
-      `[zenbu/advice] moduleId "${existingId}" matched "${fullModuleId}" by suffix. ` +
-      `Use the full path "${fullModuleId}" in your advise() call to avoid conflicts.`
+    if (!existingMap.has(name)) continue
+    console.error(
+      `[zenbu/advice] short moduleId "${existingId}" does not match the real module ` +
+      `"${fullModuleId}" \u2014 advice on "${name}" will not fire. ` +
+      `Pass the full moduleId to advise()/replace(): "${fullModuleId}".`
     )
-
-    migratedAliases.set(existingId, fullModuleId)
-    const targetMap = registry.get(fullModuleId)
-    if (!targetMap) {
-      registry.set(fullModuleId, existingMap)
-    } else {
-      for (const [name, entry] of existingMap) {
-        if (!targetMap.has(name)) targetMap.set(name, entry)
-      }
-    }
-    registry.delete(existingId)
   }
 }
 
 export function setImpl(moduleId: string, name: string, fn: Function): void {
-  migrateSuffixAliases(moduleId)
+  reportShortIdAdvice(moduleId, name)
   const entry = getOrCreateEntry(moduleId, name)
   entry.impl = fn
   entry.wrapper = undefined
@@ -104,9 +96,6 @@ export function addAdvice(moduleId: string, name: string, type: AdviceType, fn: 
 
 export function clearModule(moduleId: string): void {
   registry.delete(moduleId)
-  for (const [shortId, fullId] of migratedAliases) {
-    if (fullId === moduleId) migratedAliases.delete(shortId)
-  }
 }
 
-export { registry, migratedAliases }
+export { registry }

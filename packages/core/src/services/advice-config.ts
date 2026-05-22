@@ -138,8 +138,17 @@ export function addAdvice(pluginDir: string, spec: AdviceSpec): () => void {
   }
 }
 
+/**
+ * Returns advice entries that apply to `type`. Mirrors the wildcard
+ * semantics of `getContentScripts`: entries registered with
+ * `view: "*"` apply to every concrete view, listed before view-scoped
+ * entries (so concrete-view advice wraps wildcard advice in the
+ * around-chain order).
+ */
 export function getAdvice(type: string): ViewAdviceEntry[] {
-  return adviceEntries.get(type) ?? []
+  const scoped = adviceEntries.get(type) ?? []
+  const wildcard = type !== "*" ? (adviceEntries.get("*") ?? []) : []
+  return [...wildcard, ...scoped]
 }
 
 export function getAllAdviceTypes(): string[] {

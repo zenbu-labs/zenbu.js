@@ -2,12 +2,10 @@ import { describe, it, expect, beforeEach, vi } from "vitest"
 import { transformSync } from "@babel/core"
 import zenbuAdviceTransform from "./transform/index.js"
 import { __def, __ref, replace, unreplace, advise } from "./runtime/index.js"
-import { clearModule } from "./runtime/registry.js"
-import { registry, migratedAliases } from "./runtime/registry.js"
+import { registry } from "./runtime/registry.js"
 
 beforeEach(() => {
   registry.clear()
-  migratedAliases.clear()
 })
 
 function transform(code: string, filename = "/project/test.ts"): string {
@@ -508,57 +506,46 @@ function factorial(n) { return n <= 1 ? 1 : n * factorial(n - 1) }
   })
 })
 
-// ─── moduleId suffix resolution ─────────────────────────────────────────────
+// ─── short moduleId detection ───────────────────────────────────────────────
 
-describe("runtime: moduleId suffix resolution", () => {
-  it("short moduleId resolves to full path when unambiguous", () => {
+describe("runtime: short moduleId detection", () => {
+  it("short moduleId does NOT match full path — advice stays on the short key", () => {
     replace("home.tsx", "Home", () => "replaced")
     __def("components/home.tsx", "Home", () => "original")
     const fn = __ref("components/home.tsx", "Home") as () => string
-    expect(fn()).toBe("replaced")
+    expect(fn()).toBe("original")
   })
 
-  it("short moduleId: warns with full path suggestion", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
-    replace("home.tsx", "Home", () => "replaced")
-    __def("components/home.tsx", "Home", () => "original")
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"home.tsx" matched "components/home.tsx"'))
-    warn.mockRestore()
-  })
-
-  it("short moduleId matching two files: logs ambiguity error", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+  it("short moduleId: logs an error pointing at the full path", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {})
     replace("home.tsx", "Home", () => "replaced")
-    __def("components/home.tsx", "Home", () => "from-components")
-    __def("views/home.tsx", "Home", () => "from-views")
-    expect(error).toHaveBeenCalledWith(expect.stringContaining('"home.tsx" is ambiguous'))
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("components/home.tsx"))
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("views/home.tsx"))
-    warn.mockRestore()
+    __def("components/home.tsx", "Home", () => "original")
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('short moduleId "home.tsx"'),
+    )
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('"components/home.tsx"'),
+    )
     error.mockRestore()
   })
 
-  it("full-path moduleId: no warning", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+  it("full-path moduleId: no error", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
     replace("components/home.tsx", "Home", () => "replaced")
     __def("components/home.tsx", "Home", () => "original")
     const fn = __ref("components/home.tsx", "Home") as () => string
     expect(fn()).toBe("replaced")
-    expect(warn).not.toHaveBeenCalled()
-    warn.mockRestore()
+    expect(error).not.toHaveBeenCalled()
+    error.mockRestore()
   })
 
-  it("clearModule clears migrated alias so HMR re-registration is clean", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+  it("short moduleId matching two files: errors on each registration", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {})
     replace("home.tsx", "Home", () => "replaced")
-    __def("components/home.tsx", "Home", () => "original")
-    clearModule("components/home.tsx")
-    replace("home.tsx", "Home", () => "replaced-again")
-    __def("components/home.tsx", "Home", () => "original-v2")
-    expect(error).not.toHaveBeenCalled()
-    warn.mockRestore()
+    __def("components/home.tsx", "Home", () => "from-components")
+    __def("views/home.tsx", "Home", () => "from-views")
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("components/home.tsx"))
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("views/home.tsx"))
     error.mockRestore()
   })
 })
