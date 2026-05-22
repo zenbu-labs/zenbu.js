@@ -1,11 +1,13 @@
-import { describe, it, expect, beforeEach } from "vitest"
+import { describe, it, expect, beforeEach, vi } from "vitest"
 import { transformSync } from "@babel/core"
 import zenbuAdviceTransform from "./transform/index.js"
 import { __def, __ref, replace, unreplace, advise } from "./runtime/index.js"
-import { registry } from "./runtime/registry.js"
+import { clearModule } from "./runtime/registry.js"
+import { registry, migratedAliases } from "./runtime/registry.js"
 
 beforeEach(() => {
   registry.clear()
+  migratedAliases.clear()
 })
 
 function transform(code: string, filename = "/project/test.ts"): string {
@@ -503,5 +505,60 @@ function factorial(n) { return n <= 1 ? 1 : n * factorial(n - 1) }
     expect(render()).toBe("plugin-render")
     unreplace("mod.ts", "render")
     expect(render()).toBe("original-render")
+  })
+})
+
+// ─── moduleId suffix resolution ─────────────────────────────────────────────
+
+describe("runtime: moduleId suffix resolution", () => {
+  it("short moduleId resolves to full path when unambiguous", () => {
+    replace("home.tsx", "Home", () => "replaced")
+    __def("components/home.tsx", "Home", () => "original")
+    const fn = __ref("components/home.tsx", "Home") as () => string
+    expect(fn()).toBe("replaced")
+  })
+
+  it("short moduleId: warns with full path suggestion", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    replace("home.tsx", "Home", () => "replaced")
+    __def("components/home.tsx", "Home", () => "original")
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"home.tsx" matched "components/home.tsx"'))
+    warn.mockRestore()
+  })
+
+  it("short moduleId matching two files: logs ambiguity error", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    replace("home.tsx", "Home", () => "replaced")
+    __def("components/home.tsx", "Home", () => "from-components")
+    __def("views/home.tsx", "Home", () => "from-views")
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('"home.tsx" is ambiguous'))
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("components/home.tsx"))
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("views/home.tsx"))
+    warn.mockRestore()
+    error.mockRestore()
+  })
+
+  it("full-path moduleId: no warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    replace("components/home.tsx", "Home", () => "replaced")
+    __def("components/home.tsx", "Home", () => "original")
+    const fn = __ref("components/home.tsx", "Home") as () => string
+    expect(fn()).toBe("replaced")
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it("clearModule clears migrated alias so HMR re-registration is clean", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    replace("home.tsx", "Home", () => "replaced")
+    __def("components/home.tsx", "Home", () => "original")
+    clearModule("components/home.tsx")
+    replace("home.tsx", "Home", () => "replaced-again")
+    __def("components/home.tsx", "Home", () => "original-v2")
+    expect(error).not.toHaveBeenCalled()
+    warn.mockRestore()
+    error.mockRestore()
   })
 })
