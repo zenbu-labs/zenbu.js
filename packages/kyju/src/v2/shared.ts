@@ -31,11 +31,17 @@ export type ReferenceExistsError = {
   readonly message: string;
 };
 
+export type WriteFailedError = {
+  readonly _tag: "WriteFailedError";
+  readonly message: string;
+};
+
 export type KyjuError =
   | InvalidSessionError
   | VersionMismatchError
   | NotFoundError
-  | ReferenceExistsError;
+  | ReferenceExistsError
+  | WriteFailedError;
 
 export type ErrorTag = KyjuError["_tag"];
 

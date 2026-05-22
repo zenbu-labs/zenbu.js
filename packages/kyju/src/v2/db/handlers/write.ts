@@ -37,22 +37,96 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
     switch (event.op.type) {
       case "root.set": {
         const typedOp = event.op;
-        yield* traceKyju(
-          "kyju:db.root.mutex+cache",
-          ctx.rootMutex.withPermits(1)(
-            Effect.gen(function* () {
-              const root = yield* ctx.rootCache.read();
-              const updated = traceKyjuSync("kyju:db.root.setAtPath", () =>
-                setAtPath({
-                  root,
-                  path: typedOp.path,
-                  value: typedOp.value,
-                }),
-              );
-              yield* ctx.rootCache.set(updated);
-            }),
+
+        // Defensive instrumentation: anything beyond a couple dozen
+        // segments is almost certainly a bug in the caller (e.g. a
+        // recording proxy walking a cyclic/non-plain object). Log
+        // enough context to identify the culprit before we attempt
+        // the write.
+        if (typedOp.path.length > 64) {
+          let valuePreview = "<unserializable>";
+          try {
+            const s = JSON.stringify(typedOp.value);
+            valuePreview = s == null ? String(typedOp.value) : s.slice(0, 200);
+          } catch (e) {
+            valuePreview = `<unserializable: ${(e as Error).message}>`;
+          }
+          // eslint-disable-next-line no-console
+          console.error("[kyju] suspicious root.set path", {
+            length: typedOp.path.length,
+            head: typedOp.path.slice(0, 10),
+            tail: typedOp.path.slice(-10),
+            valueType: typeof typedOp.value,
+            valuePreview,
+            sessionId: event.sessionId,
+            requestId: event.requestId,
+          });
+        }
+
+        // Use Effect.exit so we catch both typed errors AND defects
+        // (synchronous throws from setAtPath surface as defects).
+        const writeExit = yield* Effect.exit(
+          traceKyju(
+            "kyju:db.root.mutex+cache",
+            ctx.rootMutex.withPermits(1)(
+              Effect.gen(function* () {
+                const root = yield* ctx.rootCache.read();
+                const updated = yield* Effect.try({
+                  try: () =>
+                    setAtPath({
+                      root,
+                      path: typedOp.path,
+                      value: typedOp.value,
+                    }),
+                  catch: (e) =>
+                    e instanceof Error ? e : new Error(String(e)),
+                });
+                yield* ctx.rootCache.set(updated);
+              }),
+            ),
           ),
         );
+
+        if (writeExit._tag === "Failure") {
+          const cause = writeExit.cause;
+          const message = (() => {
+            // Cause may be a Fail (typed) or Die (defect). Both have
+            // a useful string form.
+            try {
+              // @ts-ignore — runtime shape check
+              if (cause && typeof cause === "object" && "defect" in cause) {
+                const d = (cause as { defect: unknown }).defect;
+                return d instanceof Error ? d.message : String(d);
+              }
+              // @ts-ignore — runtime shape check
+              if (cause && typeof cause === "object" && "error" in cause) {
+                const er = (cause as { error: unknown }).error;
+                return er instanceof Error ? er.message : String(er);
+              }
+            } catch {}
+            return String(cause);
+          })();
+          // eslint-disable-next-line no-console
+          console.error("[kyju] root.set failed", {
+            message,
+            pathLength: typedOp.path.length,
+            head: typedOp.path.slice(0, 10),
+            tail: typedOp.path.slice(-10),
+            sessionId: event.sessionId,
+            requestId: event.requestId,
+          });
+          sendAck({
+            session,
+            ack: makeErrorAck({
+              requestId: event.requestId,
+              sessionId: event.sessionId,
+              _tag: "WriteFailedError",
+              message,
+            }),
+          });
+          return;
+        }
+
         sendAck({
           session,
           ack: makeAck({

@@ -152,10 +152,20 @@ export const sendAck = ({ session, ack }: { session: Session; ack: Ack<any, any>
 };
 
 
+const isIndexKey = (s: string | undefined): boolean =>
+  typeof s === "string" && s.length > 0 && /^\d+$/.test(s);
+
 /**
- * 
- *todo: explore this impl im very sus with the regex testing
+ * Iterative replacement for the previously recursive setAtPath.
  *
+ * Walks the path once descending (creating/coercing intermediate
+ * containers as needed) and mutates leaves in place. The db variant
+ * does not need to preserve referential identity of intermediates
+ * (that's the replica's job for React), so a single pass is enough.
+ *
+ * Why iterative: deep paths used to recurse one stack frame per
+ * segment and overflowed at ~14k. We never want kyju to crash the
+ * main process because a caller built a pathological path.
  */
 export const setAtPath = ({ root, path: pathSegments, value }: {
   root: KyjuJSON;
@@ -164,57 +174,49 @@ export const setAtPath = ({ root, path: pathSegments, value }: {
 }): KyjuJSON => {
   if (pathSegments.length === 0) return value;
 
-  const [head, ...rest] = pathSegments;
-  const isIndex = /^\d+$/.test(head!);
+  // If the top-level type doesn't match the first segment, coerce.
+  let topRoot = root;
+  const firstIsIndex = isIndexKey(pathSegments[0]);
+  if (typeof topRoot !== "object" || topRoot === null) {
+    topRoot = firstIsIndex ? [] : {};
+  } else if (Array.isArray(topRoot) !== firstIsIndex) {
+    // Type mismatch at root: keep behavior closest to old code, which
+    // simply mutated whatever was there. We choose to keep `topRoot`
+    // as-is rather than silently swap its type.
+  }
 
-  if (Array.isArray(root)) {
-    const arr = root as KyjuJSON[];
-    const index = Number(head);
-    if (rest.length === 0) {
-      arr[index] = value;
-      return arr;
+  let cursor: KyjuJSON = topRoot;
+  for (let i = 0; i < pathSegments.length - 1; i++) {
+    const seg = pathSegments[i]!;
+    const nextSeg = pathSegments[i + 1]!;
+    const nextIsIndex = isIndexKey(nextSeg);
+    if (Array.isArray(cursor)) {
+      const arr = cursor as KyjuJSON[];
+      const idx = Number(seg);
+      let child = arr[idx];
+      if (child === undefined || child === null || typeof child !== "object") {
+        child = nextIsIndex ? [] : {};
+        arr[idx] = child;
+      }
+      cursor = child;
+    } else {
+      const obj = cursor as Record<string, KyjuJSON>;
+      let child = obj[seg];
+      if (child === undefined || child === null || typeof child !== "object") {
+        child = nextIsIndex ? [] : {};
+        obj[seg] = child;
+      }
+      cursor = child;
     }
-    const nextRoot = arr[index] ?? (/^\d+$/.test(rest[0] ?? "") ? [] : {});
-    arr[index] = setAtPath({
-      root: nextRoot,
-      path: rest,
-      value,
-    });
-    return arr;
   }
 
-  if (typeof root !== "object" || root === null) {
-    root = isIndex ? [] : {};
+  const last = pathSegments[pathSegments.length - 1]!;
+  if (Array.isArray(cursor)) {
+    (cursor as KyjuJSON[])[Number(last)] = value;
+  } else {
+    (cursor as Record<string, KyjuJSON>)[last] = value;
   }
-
-  if (Array.isArray(root)) {
-    const arr = root as KyjuJSON[];
-    const index = Number(head);
-    if (rest.length === 0) {
-      arr[index] = value;
-      return arr;
-    }
-    const nextRoot = arr[index] ?? (/^\d+$/.test(rest[0] ?? "") ? [] : {});
-    arr[index] = setAtPath({
-      root: nextRoot,
-      path: rest,
-      value,
-    });
-    return arr;
-  }
-
-  const obj = root as Record<string, KyjuJSON>;
-  if (rest.length === 0) {
-    obj[head!] = value;
-    return obj;
-  }
-
-  obj[head!] = setAtPath({
-    root: obj[head!] ?? (/^\d+$/.test(rest[0] ?? "") ? [] : {}),
-    path: rest,
-    value,
-  });
-  return obj;
+  return topRoot;
 };
 
 export type CollectionIndex = {

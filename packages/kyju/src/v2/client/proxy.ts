@@ -26,7 +26,24 @@ export const createRecordingProxy = <T extends Record<string, any>>(
     }
   };
 
+
+  /**
+   * invariant for a bug we encoutnered and are optimistically fixing
+   */
+  let warnedDeep = false;
+  const warnDeep = (path: string[]) => {
+    if (warnedDeep) return;
+    warnedDeep = true;
+    // eslint-disable-next-line no-console
+    console.warn("[kyju] recording proxy navigated suspiciously deep", {
+      length: path.length,
+      head: path.slice(0, 10),
+      tail: path.slice(-10),
+    });
+  };
+
   const makeProxy = (obj: any, currentPath: string[]): any => {
+    if (currentPath.length > 64) warnDeep(currentPath);
     return new Proxy(obj, {
       get(t, prop, receiver) {
         if (typeof prop === "symbol") return Reflect.get(t, prop, receiver);
@@ -45,8 +62,10 @@ export const createRecordingProxy = <T extends Record<string, any>>(
         if (Array.isArray(t)) {
           markArrayDirty(currentPath, t);
         } else {
+          const opPath = [...currentPath, prop as string];
+          if (opPath.length > 64) warnDeep(opPath);
           operations.push({
-            path: [...currentPath, prop as string],
+            path: opPath,
             value: value as KyjuJSON,
           });
         }
