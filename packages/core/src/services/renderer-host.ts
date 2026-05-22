@@ -24,8 +24,11 @@ async function pathExists(filePath: string): Promise<boolean> {
  * it is served through Vite. `splash.html` (sibling) is loaded raw — see
  * `setup-gate.spawnSplashWindow`.
  *
- * `vite.config.ts` is picked up from the project root if present (sibling
- * of `zenbu.config.ts`).
+ * `vite.config.ts` is resolved by walking up from `rendererRoot` toward
+ * the project root (the dir holding `zenbu.config.ts`). The first match
+ * wins, so a per-package config (e.g. `packages/app/vite.config.ts`)
+ * takes precedence over a root-level one. If none is found we return
+ * `false` and Vite uses its built-in defaults.
  */
 async function resolveRendererRoot(): Promise<{
   rendererRoot: string;
@@ -46,10 +49,36 @@ async function resolveRendererRoot(): Promise<{
 
   const configPath = process.env.ZENBU_CONFIG_PATH;
   const projectDir = configPath ? path.dirname(configPath) : rendererRoot;
-  const viteConfig = path.join(projectDir, "vite.config.ts");
-  const configFile = (await pathExists(viteConfig)) ? viteConfig : false;
+  const configFile = await findViteConfigUp(rendererRoot, projectDir);
 
   return { rendererRoot, configFile };
+}
+
+/**
+ * Walk deepest → shallowest from `rendererRoot` up to (and including)
+ * `projectDir`, returning the first `vite.config.ts` found.
+ *
+ * Bounded by the number of path segments between the two dirs (typically
+ * 0–4), so no risk of unbounded traversal. If `rendererRoot` doesn't sit
+ * inside `projectDir` (`path.relative` returns `..` or an absolute path)
+ * we only probe `projectDir` itself — the legacy behavior.
+ */
+async function findViteConfigUp(
+  rendererRoot: string,
+  projectDir: string,
+): Promise<string | false> {
+  const rel = path.relative(projectDir, rendererRoot);
+  const escaping = rel.startsWith("..") || path.isAbsolute(rel);
+  const segments = escaping || rel === "" ? [] : rel.split(path.sep);
+  for (let i = segments.length; i >= 0; i--) {
+    const candidate = path.join(
+      projectDir,
+      ...segments.slice(0, i),
+      "vite.config.ts",
+    );
+    if (await pathExists(candidate)) return candidate;
+  }
+  return false;
 }
 
 export class RendererHostService extends Service.create({
