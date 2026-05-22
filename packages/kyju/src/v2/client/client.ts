@@ -151,6 +151,21 @@ export type EffectClientProxy<Shape extends SchemaShape> = {
   createBlob(data: Uint8Array, hot?: boolean): Effect.Effect<string, KyjuError>;
   deleteBlob(blobId: string): Effect.Effect<void, KyjuError>;
   getBlobData(blobId: string): Effect.Effect<Uint8Array | null, KyjuError>;
+  /**
+   * Refcounted subscription to a collection by its id.
+   *
+   * Increments an internal counter scoped to this client. Sends
+   * `subscribe-collection` to the replica only on the 0→N transition
+   * and `unsubscribe-collection` only on the N→0 transition, so that
+   * multiple independent callers (e.g. two React components on the
+   * same `useCollection(ref)`, or a hook + a manual `subscribeData`)
+   * can share one logical subscription without one tearing down the
+   * other's data.
+   *
+   * Returns an idempotent unsubscribe function. Calling it more than
+   * once is a no-op.
+   */
+  subscribeCollection(collectionId: string): () => void;
 };
 
 export type ClientProxy<Shape extends SchemaShape> = {
@@ -165,6 +180,8 @@ export type ClientProxy<Shape extends SchemaShape> = {
   createBlob(data: Uint8Array, hot?: boolean): Promise<string>;
   deleteBlob(blobId: string): Promise<void>;
   getBlobData(blobId: string): Promise<Uint8Array | null>;
+  /** See `EffectClientProxy.subscribeCollection`. */
+  subscribeCollection(collectionId: string): () => void;
 };
 
 type EffectReplica = {
@@ -210,8 +227,67 @@ function createClientCore<TShape extends SchemaShape>(
     ) => void;
   },
 ): EffectClientProxy<TShape> {
+  // Per-client refcount of active collection subscriptions, keyed by
+  // collectionId. Shared by both `subscribeData(cb)` (path-bound,
+  // delivers concat events) and `subscribeCollection(id)` (id-bound,
+  // just keeps the data alive). Sharing matters: with two separate
+  // counters the second consumer's teardown could unsubscribe a
+  // collection the first is still using, and the replica drops its
+  // local copy on every `unsubscribe-collection` it receives.
   const subscriberCounts = new Map<string, number>();
   const subscribePromises = new Map<string, Promise<void>>();
+
+  /**
+   * Refcounted subscribe by collectionId. Returns:
+   *   - `ready`: resolves once the subscribe ack has landed (or
+   *     immediately, if another caller already subscribed).
+   *   - `unsubscribe`: idempotent. Drops the refcount and only
+   *     posts `unsubscribe-collection` when the last subscriber leaves.
+   */
+  const subscribeCollectionRefcounted = (
+    collectionId: string,
+  ): { ready: Promise<void>; unsubscribe: () => void } => {
+    const count = subscriberCounts.get(collectionId) ?? 0;
+    subscriberCounts.set(collectionId, count + 1);
+
+    let ready: Promise<void>;
+    if (count === 0) {
+      ready = Effect.runPromise(
+        send({ kind: "subscribe-collection", collectionId }).pipe(
+          Effect.catchAll(() => Effect.void),
+        ),
+      );
+      subscribePromises.set(collectionId, ready);
+    } else {
+      ready = subscribePromises.get(collectionId) ?? Promise.resolve();
+    }
+
+    let unsubscribed = false;
+    return {
+      ready,
+      unsubscribe: () => {
+        if (unsubscribed) return;
+        unsubscribed = true;
+        const current = subscriberCounts.get(collectionId) ?? 1;
+        if (current <= 1) {
+          subscriberCounts.delete(collectionId);
+          subscribePromises.delete(collectionId);
+          Effect.runPromise(
+            send({ kind: "unsubscribe-collection", collectionId }).pipe(
+              Effect.catchAll(() => Effect.void),
+            ),
+          );
+        } else {
+          subscriberCounts.set(collectionId, current - 1);
+        }
+      },
+    };
+  };
+
+  const subscribeCollectionFn = (collectionId: string): (() => void) => {
+    const { unsubscribe } = subscribeCollectionRefcounted(collectionId);
+    return unsubscribe;
+  };
 
   const getConnectedState = (): ConnectedState => {
     const state = replica.getState();
@@ -376,14 +452,14 @@ function createClientCore<TShape extends SchemaShape>(
       subscribe: (cb) => subscribeToPath(path, cb),
       subscribeData: (cb) => {
         const collectionId = getCollectionId();
-        const count = subscriberCounts.get(collectionId) ?? 0;
-        subscriberCounts.set(collectionId, count + 1);
 
         const wrappedCb: CollectionConcatCallback = (data) => {
           cb({ collection: data.collection, newItems: data.newItems as any[] });
         };
-
         replica.onCollectionConcat(collectionId, wrappedCb);
+
+        const { ready, unsubscribe } =
+          subscribeCollectionRefcounted(collectionId);
 
         const deliverInitial = () => {
           const state = replica.getState();
@@ -394,41 +470,14 @@ function createClientCore<TShape extends SchemaShape>(
             }
           }
         };
-
-        if (count === 0) {
-          const p = Effect.runPromise(
-            send({ kind: "subscribe-collection", collectionId }).pipe(
-              Effect.catchAll(() => Effect.void),
-            ),
-          ).then(deliverInitial);
-          subscribePromises.set(collectionId, p);
-        } else {
-          const existing = subscribePromises.get(collectionId);
-          if (existing) {
-            existing.then(deliverInitial);
-          } else {
-            deliverInitial();
-          }
-        }
+        ready.then(deliverInitial);
 
         let unsubscribed = false;
         return () => {
           if (unsubscribed) return;
           unsubscribed = true;
-
           replica.offCollectionConcat(collectionId, wrappedCb);
-          const current = subscriberCounts.get(collectionId) ?? 1;
-          if (current <= 1) {
-            subscriberCounts.delete(collectionId);
-            subscribePromises.delete(collectionId);
-            Effect.runPromise(
-              send({ kind: "unsubscribe-collection", collectionId }).pipe(
-                Effect.catchAll(() => Effect.void),
-              ),
-            );
-          } else {
-            subscriberCounts.set(collectionId, current - 1);
-          }
+          unsubscribe();
         };
       },
     };
@@ -660,6 +709,7 @@ function createClientCore<TShape extends SchemaShape>(
       if (prop === "createBlob") return createBlobFn;
       if (prop === "deleteBlob") return deleteBlobFn;
       if (prop === "getBlobData") return getBlobDataFn;
+      if (prop === "subscribeCollection") return subscribeCollectionFn;
 
       const rootVal = getAtPath(getRoot(), [prop as string]);
       if (isCollectionValue(rootVal)) return makeCollectionNode(prop as string);

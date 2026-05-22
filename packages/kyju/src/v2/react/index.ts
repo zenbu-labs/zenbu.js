@@ -108,7 +108,7 @@ export function createKyjuReact<
     ref: T | null | undefined,
   ): CollectionResult<InferCollectionItem<T>> {
     type Item = InferCollectionItem<T>;
-    const { replica } = useKyjuContext();
+    const { client, replica } = useKyjuContext();
     const collectionId = ref?.collectionId || null;
 
     // Drive subscription lifecycle from an effect (post-render so we
@@ -116,15 +116,19 @@ export function createKyjuReact<
     // displayed data is read directly off the replica via
     // useSyncExternalStore below — see the comment on `getSnapshot`
     // for why mirroring into React state isn't safe here.
+    //
+    // We go through `client.subscribeCollection` rather than posting
+    // raw subscribe/unsubscribe messages on the replica so the
+    // refcount in the client is honored. Without this, two
+    // `useCollection(ref)` instances pointing at the same collection
+    // (e.g. the same chat shown in two split panes) would each
+    // independently unsubscribe on unmount — and the replica drops
+    // its local copy of the collection on every `unsubscribe-collection`
+    // it sees, blanking out any other still-mounted consumer.
     useEffect(() => {
       if (!collectionId) return;
-      replica.postMessage({ kind: "subscribe-collection", collectionId });
-      return () => {
-        replica
-          .postMessage({ kind: "unsubscribe-collection", collectionId })
-          .catch(() => {});
-      };
-    }, [collectionId, replica]);
+      return client.subscribeCollection(collectionId);
+    }, [collectionId, client]);
 
     // Cache for useSyncExternalStore: getSnapshot must return
     // `Object.is`-stable values across calls when nothing changed, or

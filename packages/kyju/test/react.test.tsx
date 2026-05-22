@@ -235,6 +235,87 @@ describe("useCollection", () => {
       expect(col).toBeUndefined();
     }
   });
+
+  // Regression: when two `useCollection` hooks point at the same
+  // collectionId (e.g. the same chat shown in two split panes), the
+  // first hook to unmount used to send `unsubscribe-collection` to
+  // the replica, which unconditionally dropped the collection from
+  // local state — leaving the still-mounted hook reading empty items
+  // until something else triggered a resubscribe. The fix routes
+  // through the client's refcounted `subscribeCollection`, so the
+  // replica only drops the collection when the last consumer leaves.
+  it(
+    "keeps data alive when one of two consumers on the same collection unmounts",
+    async () => {
+      const ctx = await setup();
+      cleanup = ctx.cleanup;
+
+      await ctx.client.messages.concat([
+        { text: "shared", author: "system" },
+      ]);
+
+      // First consumer mounts and waits for the initial data to land.
+      const first = renderHook(
+        () => {
+          const messagesRef = useDb((root) => root.messages);
+          return useCollection(messagesRef);
+        },
+        { wrapper: makeWrapper(ctx) },
+      );
+      await act(async () => {
+        await delay(50);
+      });
+      expect(first.result.current.items.length).toBe(1);
+
+      // Second consumer mounts on the same collection — simulating
+      // a split pane showing the same chat.
+      const second = renderHook(
+        () => {
+          const messagesRef = useDb((root) => root.messages);
+          return useCollection(messagesRef);
+        },
+        { wrapper: makeWrapper(ctx) },
+      );
+      await act(async () => {
+        await delay(50);
+      });
+      expect(second.result.current.items.length).toBe(1);
+
+      // Close the second pane.
+      second.unmount();
+      await act(async () => {
+        await delay(50);
+      });
+
+      // First pane MUST still see the data. Previously this came back
+      // as 0 because the replica had dropped the collection.
+      expect(first.result.current.items.length).toBe(1);
+      expect(first.result.current.items[0]).toEqual({
+        text: "shared",
+        author: "system",
+      });
+
+      // And new writes still flow through to the surviving consumer.
+      await act(async () => {
+        await ctx.client.messages.concat([
+          { text: "after-close", author: "system" },
+        ]);
+        await delay(50);
+      });
+      expect(first.result.current.items.length).toBe(2);
+
+      first.unmount();
+      await delay(20);
+
+      // After the last consumer leaves, the collection IS dropped.
+      const state = ctx.replica.getState();
+      if (state.kind === "connected") {
+        const collectionId = (state.root as any).messages.collectionId;
+        const col = state.collections.find((c) => c.id === collectionId);
+        expect(col).toBeUndefined();
+      }
+    },
+  );
 });
 
 const arraySchema = createSchema({
