@@ -385,6 +385,40 @@ export type ViewProps = {
 
 const VIEW_ARGS_MESSAGE_KIND = "zenbu:view-args";
 const VIEW_ARGS_PARAM_LIMIT = 1500;
+const VIEW_THEME_MESSAGE_KIND = "zenbu:view-theme";
+
+/**
+ * Shadcn-standard design tokens we forward from the host's `:root` into
+ * every plugin iframe. The host *defines* these in its own CSS (it's
+ * already shadcn or shadcn-compatible). The framework just reads them
+ * off `getComputedStyle(document.documentElement)` and propagates them
+ * to plugin views so the views automatically match the host's theme.
+ *
+ * Extending this list later doesn't break older plugins because they
+ * just won't reference the newer vars.
+ */
+const HOST_THEME_TOKENS: readonly string[] = [
+  "--background",
+  "--foreground",
+  "--card",
+  "--card-foreground",
+  "--popover",
+  "--popover-foreground",
+  "--primary",
+  "--primary-foreground",
+  "--secondary",
+  "--secondary-foreground",
+  "--muted",
+  "--muted-foreground",
+  "--accent",
+  "--accent-foreground",
+  "--destructive",
+  "--destructive-foreground",
+  "--border",
+  "--input",
+  "--ring",
+  "--radius",
+];
 
 function encodeViewArgs(args: Record<string, unknown> | undefined): string | null {
   if (!args) return null;
@@ -406,10 +440,37 @@ function decodeViewArgs<T>(encoded: string | null): T {
   }
 }
 
+/**
+ * Read the configured set of host theme tokens off `:root`. Empty
+ * strings are skipped — lets the host omit individual vars without
+ * having to define every shadcn slot.
+ */
+function readHostTheme(): Record<string, string> {
+  if (typeof document === "undefined") return {};
+  const style = getComputedStyle(document.documentElement);
+  const tokens: Record<string, string> = {};
+  for (const name of HOST_THEME_TOKENS) {
+    const value = style.getPropertyValue(name).trim();
+    if (value) tokens[name] = value;
+  }
+  return tokens;
+}
+
+function encodeViewTheme(tokens: Record<string, string>): string | null {
+  if (Object.keys(tokens).length === 0) return null;
+  try {
+    return btoa(unescape(encodeURIComponent(JSON.stringify(tokens))));
+  } catch (err) {
+    console.warn("[zenbu/View] failed to encode theme:", err);
+    return null;
+  }
+}
+
 function buildViewUrl(
   baseUrl: string,
   type: string,
   encodedArgs: string | null,
+  encodedTheme: string | null,
 ): string {
   const trimmed = baseUrl.replace(/\/$/, "");
   const parentParams = new URLSearchParams(window.location.search);
@@ -420,6 +481,7 @@ function buildViewUrl(
   if (wsToken) params.set("wsToken", wsToken);
   params.set("type", type);
   if (encodedArgs) params.set("args", encodedArgs);
+  if (encodedTheme) params.set("theme", encodedTheme);
   return `${trimmed}/?${params.toString()}`;
 }
 
@@ -455,17 +517,21 @@ export function View({
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const initialUrlRef = useRef<string | null>(null);
   const lastArgsRef = useRef<string | null>(null);
+  const lastThemeRef = useRef<Record<string, string> | null>(null);
   const loadedRef = useRef(false);
 
   if (initialUrlRef.current === null && url) {
-    const encoded = encodeViewArgs(args);
-    if (encoded && encoded.length > VIEW_ARGS_PARAM_LIMIT) {
+    const encodedArgs = encodeViewArgs(args);
+    if (encodedArgs && encodedArgs.length > VIEW_ARGS_PARAM_LIMIT) {
       console.warn(
         `[zenbu/View] args for "${type}" exceed ${VIEW_ARGS_PARAM_LIMIT} chars in URL — consider postMessage-only updates.`,
       );
     }
-    lastArgsRef.current = encoded;
-    initialUrlRef.current = buildViewUrl(url, type, encoded);
+    const theme = readHostTheme();
+    const encodedTheme = encodeViewTheme(theme);
+    lastArgsRef.current = encodedArgs;
+    lastThemeRef.current = theme;
+    initialUrlRef.current = buildViewUrl(url, type, encodedArgs, encodedTheme);
   }
 
   useEffect(() => {
@@ -493,6 +559,48 @@ export function View({
       return () => iframe.removeEventListener("load", onceLoaded);
     }
   }, [args]);
+
+  // Track host theme changes and push them into the iframe so plugin
+  // views automatically follow toggles (dark mode, theme picker, OS
+  // `prefers-color-scheme`). The *initial* paint is handled by the
+  // `?theme=` URL param above plus vite's `transformIndexHtml` (which
+  // inlines a synchronous `<style>` before any other CSS) — this hook
+  // is for live updates only.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const pushIfChanged = () => {
+      const tokens = readHostTheme();
+      if (shallowJSONEqual(tokens, lastThemeRef.current)) return;
+      lastThemeRef.current = tokens;
+      const iframe = iframeRef.current;
+      if (!iframe?.contentWindow) return;
+      const send = () =>
+        iframe.contentWindow?.postMessage(
+          { kind: VIEW_THEME_MESSAGE_KIND, tokens },
+          "*",
+        );
+      if (loadedRef.current) send();
+      else iframe.addEventListener("load", send, { once: true });
+    };
+
+    // Catches class / data-theme / inline style swaps on <html>, which
+    // is how shadcn-style theme pickers usually flip palettes.
+    const observer = new MutationObserver(pushIfChanged);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style", "data-theme"],
+    });
+
+    // Catches OS-level dark mode toggles when the host follows the
+    // system theme.
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    media.addEventListener("change", pushIfChanged);
+
+    return () => {
+      observer.disconnect();
+      media.removeEventListener("change", pushIfChanged);
+    };
+  }, []);
 
   if (!initialUrlRef.current) {
     return createElement(

@@ -107,8 +107,28 @@ function parsePreludeId(id: string): { type: string } {
   return { type: rest.slice(0, queryIdx) };
 }
 
+/**
+ * Generates the per-iframe prelude module. Always emits the host-theme
+ * postMessage listener so plugin views automatically follow the host's
+ * theme picker; advice / content-script imports come after.
+ */
 function generateAdvicePreludeCode(entries: ViewAdviceEntry[]): string {
-  if (entries.length === 0) return "";
+  const themeListener = `
+window.addEventListener("message", (e) => {
+  if (e.data && e.data.kind === "zenbu:view-theme") {
+    const tokens = e.data.tokens || {};
+    const css = ":root{" + Object.keys(tokens).map(k => k + ":" + tokens[k]).join(";") + "}";
+    let el = document.getElementById("zenbu-view-theme");
+    if (!el) {
+      el = document.createElement("style");
+      el.id = "zenbu-view-theme";
+      document.head.prepend(el);
+    }
+    el.textContent = css;
+  }
+});
+`;
+  if (entries.length === 0) return themeListener;
   const imports: string[] = [
     'import { replace, advise } from "@zenbu/advice/runtime"',
   ];
@@ -134,7 +154,34 @@ function generateAdvicePreludeCode(entries: ViewAdviceEntry[]): string {
       );
     }
   });
-  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n" + themeListener;
+}
+
+/**
+ * Decodes a `?theme=<base64>` query param into a CSS string that defines
+ * the host's design tokens on `:root`. Returned as-is for inlining into
+ * the iframe's `<head>` so the very first paint already has the host's
+ * theme — no flash, no JS round-trip.
+ */
+function buildInlineThemeCss(themeParam: string | null): string | null {
+  if (!themeParam) return null;
+  try {
+    const json = decodeURIComponent(escape(atob(themeParam)));
+    const tokens = JSON.parse(json) as Record<string, string>;
+    const keys = Object.keys(tokens);
+    if (keys.length === 0) return null;
+    return ":root{" + keys.map((k) => `${k}:${tokens[k]}`).join(";") + "}";
+  } catch {
+    return null;
+  }
+}
+
+function extractThemeParam(originalUrl: string | undefined): string | null {
+  if (!originalUrl) return null;
+  const queryIdx = originalUrl.indexOf("?");
+  if (queryIdx < 0) return null;
+  const params = new URLSearchParams(originalUrl.slice(queryIdx + 1));
+  return params.get("theme");
 }
 
 /**
@@ -227,16 +274,40 @@ export function advicePreludePlugin(): Plugin {
     transformIndexHtml(html, ctx) {
       const type = resolveType(ctx.path ?? "", ctx.originalUrl);
       if (!type) return html;
-      const hasAdvice = getAdvice(type).length > 0;
-      const hasScripts = getContentScripts(type).length > 0;
-      if (!hasAdvice && !hasScripts) return html;
-      return [
-        {
-          tag: "script",
-          attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
-          injectTo: "head" as const,
-        },
-      ];
+
+      const tags: Array<{
+        tag: string;
+        attrs?: Record<string, string>;
+        children?: string;
+        injectTo: "head" | "head-prepend" | "body" | "body-prepend";
+      }> = [];
+
+      // 1. Synchronously inline the host's design tokens on `:root` so
+      //    the iframe's first paint already matches the host theme.
+      //    `head-prepend` puts the tag at the very start of <head>, so
+      //    subsequent stylesheets / @theme blocks can reference these
+      //    vars without depending on style-order timing.
+      const themeCss = buildInlineThemeCss(extractThemeParam(ctx.originalUrl));
+      if (themeCss) {
+        tags.push({
+          tag: "style",
+          attrs: { id: "zenbu-view-theme" },
+          children: themeCss,
+          injectTo: "head-prepend",
+        });
+      }
+
+      // 2. Always inject the prelude module — it carries the
+      //    postMessage listener that keeps the inlined `<style>`
+      //    above in sync with later host theme changes, plus any
+      //    advice / content scripts registered for this view type.
+      tags.push({
+        tag: "script",
+        attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
+        injectTo: "head",
+      });
+
+      return { html, tags };
     },
   };
 }
