@@ -111,38 +111,84 @@ export function createKyjuReact<
     const { replica } = useKyjuContext();
     const collectionId = ref?.collectionId || null;
 
-    const [state, setState] = useState<{
+    // Drive subscription lifecycle from an effect (post-render so we
+    // don't side-effect the replica during render). The actual
+    // displayed data is read directly off the replica via
+    // useSyncExternalStore below — see the comment on `getSnapshot`
+    // for why mirroring into React state isn't safe here.
+    useEffect(() => {
+      if (!collectionId) return;
+      replica.postMessage({ kind: "subscribe-collection", collectionId });
+      return () => {
+        replica
+          .postMessage({ kind: "unsubscribe-collection", collectionId })
+          .catch(() => {});
+      };
+    }, [collectionId, replica]);
+
+    // Cache for useSyncExternalStore: getSnapshot must return
+    // `Object.is`-stable values across calls when nothing changed, or
+    // React will warn and re-render forever. We key the cache on
+    // `collectionId` + the underlying `CollectionState` reference so
+    // we hand out the same wrapper object until either changes.
+    type Snapshot = {
       items: Item[];
       totalCount: number;
       collection: CollectionState | null;
-    }>({ items: [], totalCount: 0, collection: null });
+    };
+    const cacheRef = useRef<{
+      id: string | null;
+      collection: CollectionState | null;
+      out: Snapshot;
+    } | null>(null);
 
-    useEffect(() => {
-      if (!collectionId) return;
+    const subscribe = useCallback(
+      (cb: () => void) => replica.subscribe(() => cb()),
+      [replica],
+    );
 
-      const onData = (data: { collection: CollectionState; newItems: unknown[] }) => {
-        setState({
-          items: data.collection.items as Item[],
-          totalCount: data.collection.totalCount,
-          collection: data.collection,
-        });
+    // Read the current collection state synchronously from the replica
+    // on every render. The previous implementation mirrored the
+    // collection's items into React state via setState in an effect:
+    // when `collectionId` flipped (e.g. switching between two chats'
+    // event logs), the stale items from the previous collection
+    // remained in state until the new subscribe-collection ack landed,
+    // which renderers painted as a one-frame flicker of the wrong
+    // collection's data. Reading directly from the replica's state
+    // closes that window — a `collectionId` change shows the new
+    // collection's data (or empty, if it isn't loaded yet) on the
+    // very same render.
+    const getSnapshot = useCallback((): Snapshot => {
+      if (!collectionId) {
+        const cached = cacheRef.current;
+        if (cached && cached.id === null) return cached.out;
+        const out: Snapshot = { items: [], totalCount: 0, collection: null };
+        cacheRef.current = { id: null, collection: null, out };
+        return out;
+      }
+      const s = replica.getState();
+      const col =
+        s.kind === "connected"
+          ? s.collections.find((c) => c.id === collectionId) ?? null
+          : null;
+      const cached = cacheRef.current;
+      if (
+        cached &&
+        cached.id === collectionId &&
+        cached.collection === col
+      ) {
+        return cached.out;
+      }
+      const out: Snapshot = {
+        items: (col?.items ?? []) as Item[],
+        totalCount: col?.totalCount ?? 0,
+        collection: col,
       };
+      cacheRef.current = { id: collectionId, collection: col, out };
+      return out;
+    }, [replica, collectionId]);
 
-      replica.onCollectionConcat(collectionId, onData);
-
-      replica.postMessage({ kind: "subscribe-collection", collectionId }).then(() => {
-        const s = replica.getState();
-        if (s.kind === "connected") {
-          const col = s.collections.find((c) => c.id === collectionId);
-          if (col) onData({ collection: col, newItems: [] });
-        }
-      });
-
-      return () => {
-        replica.offCollectionConcat(collectionId, onData);
-        replica.postMessage({ kind: "unsubscribe-collection", collectionId }).catch(() => {});
-      };
-    }, [collectionId, replica]);
+    const snapshot = useSyncExternalStore(subscribe, getSnapshot);
 
     const concat = useMemo(() => {
       if (!collectionId) return (_items: Item[]) => {};
@@ -154,7 +200,15 @@ export function createKyjuReact<
       };
     }, [collectionId, replica]);
 
-    return useMemo(() => ({ ...state, concat }), [state, concat]);
+    return useMemo(
+      () => ({
+        items: snapshot.items,
+        totalCount: snapshot.totalCount,
+        collection: snapshot.collection,
+        concat,
+      }),
+      [snapshot, concat],
+    );
   }
 
   return { KyjuProvider, useDb, useCollection };

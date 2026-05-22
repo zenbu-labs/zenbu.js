@@ -37,6 +37,7 @@ Communication is structured as events. Each event has a `kind` that determines i
 | `subscribe-collection` | replica -> server | Yes | Subscribes to a collection's data (all items). |
 | `unsubscribe-collection` | replica -> server | Yes | Unsubscribes from a collection's data. |
 | `write` | replica -> server | Yes | Mutates state. Applied locally then sent to server. |
+| `write-batch` | replica-local | Yes (per op) | Multiple write ops applied as a single local transition, then replicated op-by-op to the server. Never crosses the wire as a single event. |
 | `replicated-write` | server -> replica | No | Server-broadcast mutation. Applied locally by receiving replicas. |
 | `read` | replica -> server | Yes | Queries data from the server. |
 | `db-update` | server -> replica | No | Server-initiated state update (acks, metadata changes). |
@@ -44,6 +45,9 @@ Communication is structured as events. Each event has a `kind` that determines i
 The server only receives `connect`, `disconnect`, `subscribe-collection`, `unsubscribe-collection`, `write`, and `read` events.
 
 `write` and `replicated-write` carry the same operation types and share the same local-apply logic. The difference: `write` is sent to the server and acked; `replicated-write` is only applied locally.
+
+`write-batch` carries a list of write ops produced by a single client-side transaction (e.g. one `client.update(fn)` call). The replica folds every op into the local state in a single state transition, so subscribers observe exactly one new state for the whole batch rather than one per op. After the local apply, the replica replicates each op to the server as an individual `write` event in batch order; the wire protocol is unchanged.
+
 
 ### Collection Broadcast Rules
 
@@ -145,7 +149,23 @@ Removes the collection from the session's subscription set. The replica should c
 
 ## Write Operations
 
-Carried by `write` (replica -> server) and `replicated-write` (server -> replica) events. The database applies them and broadcasts as `replicated-write`. Root and blob writes are broadcast to all other connected replicas. Collection writes are broadcast only to sessions subscribed to the target collection.
+Carried by `write` (replica -> server), `write-batch` (replica-local), and `replicated-write` (server -> replica) events. The database applies them and broadcasts as `replicated-write`. Root and blob writes are broadcast to all other connected replicas. Collection writes are broadcast only to sessions subscribed to the target collection.
+
+### Batched Writes
+
+`write-batch` is a replica-local event used by clients to commit several write ops as a single local transition:
+
+```
+{ type: "write-batch", ops: WriteOp[] }
+```
+
+Each element of `ops` is one of the operation shapes defined below (`root.set`, `collection.*`, `blob.*`). The replica must:
+
+1. Fold every op into local state in a single state transition. Subscribers observe one new state, not one per op.
+2. Notify collection-concat callbacks once per `collection.concat` op in the batch, in batch order, after the local apply.
+3. Replicate each op to the server as an individual `write` event in batch order. Failure semantics are identical to issuing those `write` events one by one — ops earlier in the batch may already be applied locally when a later op's ack returns an error.
+
+The batch never crosses the wire as a single event. Implementations that don't need batching can treat `write-batch` as syntactic sugar over a sequence of `write` events, at the cost of subscribers observing intermediate states.
 
 ### Root
 

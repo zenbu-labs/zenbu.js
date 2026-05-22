@@ -148,6 +148,13 @@ export type ClientEvent =
   | { kind: "subscribe-collection"; collectionId: string }
   | { kind: "unsubscribe-collection"; collectionId: string }
   | { kind: "write"; op: WriteOp }
+  /**
+   * Apply multiple write ops as a single local transition: subscribers
+   * see one state change for the whole batch, not one per op. The wire
+   * protocol is unchanged — ops still ship to the server as individual
+   * `kind: "write"` events.
+   */
+  | { kind: "write-batch"; ops: WriteOp[] }
   | { kind: "replicated-write"; op: WriteOp }
   | { kind: "read"; op: ReadOp }
   | { kind: "db-update"; message: DbUpdateMessage };

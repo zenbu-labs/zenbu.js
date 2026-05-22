@@ -6,21 +6,15 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { nanoid } from "nanoid";
 import {
   type Ack,
-  type BlobCreateOp,
-  type BlobDeleteOp,
-  type BlobSetOp,
   type ClientBlob,
   type ClientEvent,
   type ClientState,
-  type CollectionCreateOp,
-  type CollectionDeleteOp,
   type CollectionFetchRangeAck,
   type CollectionState,
   type ConnectAck,
   type SubscribeAck,
   type BlobReadAck,
   type KyjuJSON,
-  type RootSetOp,
   type ServerEvent,
   type WriteOp,
   ClientStateRef,
@@ -33,6 +27,7 @@ import {
   makeRequestAwaiter,
   requireConnected,
   setAtPath,
+  type ConnectedState,
 } from "./helpers";
 import { traceKyju } from "../trace";
 
@@ -48,88 +43,76 @@ const concatToCollection = (
   };
 };
 
-const applyRootSet = (ref: Ref.Ref<ClientState>, op: RootSetOp) =>
-  applyState({
-    ref,
-    fn: (state) => ({
-      ...state,
-      root: setAtPath({ root: state.root, path: op.path, value: op.value }),
-    }),
-  });
-
-const applyCollectionCreate = (
-  ref: Ref.Ref<ClientState>,
-  op: CollectionCreateOp,
-) => {
-  const collection: CollectionState = {
-    id: op.collectionId,
-    totalCount: op.data?.length ?? 0,
-    items: op.data ?? [],
-  };
-  return applyState({
-    ref,
-    fn: (state) => ({
-      ...state,
-      collections: [...state.collections, collection],
-    }),
-  });
+/**
+ * Pure reducer: fold a single write op into a connected client state
+ * snapshot. Used both for one-shot writes (`applyWrite`) and for batched
+ * writes (`applyWriteBatch`), which fold N ops in a single `Ref.update`
+ * so subscribers see one transition for the whole batch.
+ */
+const reduceWrite = (state: ConnectedState, op: WriteOp): ConnectedState => {
+  switch (op.type) {
+    case "root.set":
+      return {
+        ...state,
+        root: setAtPath({ root: state.root, path: op.path, value: op.value }),
+      };
+    case "collection.create": {
+      const collection: CollectionState = {
+        id: op.collectionId,
+        totalCount: op.data?.length ?? 0,
+        items: op.data ?? [],
+      };
+      return { ...state, collections: [...state.collections, collection] };
+    }
+    case "collection.concat":
+      return {
+        ...state,
+        collections: state.collections.map((col) =>
+          col.id === op.collectionId
+            ? concatToCollection(col, op.data)
+            : col,
+        ),
+      };
+    case "collection.delete":
+      return {
+        ...state,
+        collections: state.collections.filter(
+          (col) => col.id !== op.collectionId,
+        ),
+      };
+    case "blob.create": {
+      const blob: ClientBlob = {
+        id: op.blobId,
+        data: op.hot
+          ? { kind: "hot", value: op.data }
+          : { kind: "cold" },
+        fileSize: 0,
+      };
+      return { ...state, blobs: [...state.blobs, blob] };
+    }
+    case "blob.set":
+      return {
+        ...state,
+        blobs: state.blobs.map((blob) => {
+          if (blob.id !== op.blobId) return blob;
+          if (blob.data.kind === "hot") {
+            return {
+              ...blob,
+              data: { kind: "hot" as const, value: op.data },
+            };
+          }
+          return blob;
+        }),
+      };
+    case "blob.delete":
+      return {
+        ...state,
+        blobs: state.blobs.filter((blob) => blob.id !== op.blobId),
+      };
+  }
+  op satisfies never;
+  return state;
 };
-
-const applyCollectionDelete = (
-  ref: Ref.Ref<ClientState>,
-  op: CollectionDeleteOp,
-) =>
-  applyState({
-    ref,
-    fn: (state) => ({
-      ...state,
-      collections: state.collections.filter(
-        (col) => col.id !== op.collectionId,
-      ),
-    }),
-  });
-
-const applyBlobCreate = (ref: Ref.Ref<ClientState>, op: BlobCreateOp) => {
-  const blob: ClientBlob = {
-    id: op.blobId,
-    data: op.hot ? { kind: "hot", value: op.data } : { kind: "cold" },
-    fileSize: 0,
-  };
-  return applyState({
-    ref,
-    fn: (state) => ({
-      ...state,
-      blobs: [...state.blobs, blob],
-    }),
-  });
-};
-
-const applyBlobSet = (ref: Ref.Ref<ClientState>, op: BlobSetOp) =>
-  applyState({
-    ref,
-    fn: (state) => ({
-      ...state,
-      blobs: state.blobs.map((blob) => {
-        if (blob.id !== op.blobId) return blob;
-        if (blob.data.kind === "hot") {
-          return {
-            ...blob,
-            data: { kind: "hot" as const, value: op.data },
-          };
-        }
-        return blob;
-      }),
-    }),
-  });
-
-const applyBlobDelete = (ref: Ref.Ref<ClientState>, op: BlobDeleteOp) =>
-  applyState({
-    ref,
-    fn: (state) => ({
-      ...state,
-      blobs: state.blobs.filter((blob) => blob.id !== op.blobId),
-    }),
-  });
 
 const applyWrite = ({
   stateRef,
@@ -137,71 +120,32 @@ const applyWrite = ({
 }: {
   stateRef: Ref.Ref<ClientState>;
   op: WriteOp;
-}) => {
-  switch (op.type) {
-    case "root.set":
-      return applyRootSet(stateRef, op);
-    case "collection.create":
-      return applyCollectionCreate(stateRef, op);
-    case "collection.concat":
-      return applyState({
-        ref: stateRef,
-        fn: (state) => ({
-          ...state,
-          collections: state.collections.map((col) =>
-            col.id === op.collectionId
-              ? concatToCollection(col, op.data)
-              : col,
-          ),
-        }),
-      });
-    case "collection.delete":
-      return applyCollectionDelete(stateRef, op);
-    case "blob.create":
-      return applyBlobCreate(stateRef, op);
-    case "blob.set":
-      return applyBlobSet(stateRef, op);
-    case "blob.delete":
-      return applyBlobDelete(stateRef, op);
-  }
-  op satisfies never;
-};
+}) =>
+  applyState({
+    ref: stateRef,
+    fn: (state) => reduceWrite(state, op),
+  });
 
-const applyReplicatedWrite = ({
+/**
+ * Apply a whole batch in a single `Ref.update`. Subscribers see exactly
+ * one state transition for the batch, even though the wire-side replication
+ * still ships one server event per op.
+ */
+const applyWriteBatch = ({
   stateRef,
-  op,
+  ops,
 }: {
   stateRef: Ref.Ref<ClientState>;
-  op: WriteOp;
-}) => {
-  switch (op.type) {
-    case "root.set":
-      return applyRootSet(stateRef, op);
-    case "collection.create":
-      return applyCollectionCreate(stateRef, op);
-    case "collection.concat": {
-      return applyState({
-        ref: stateRef,
-        fn: (state) => ({
-          ...state,
-          collections: state.collections.map((col) => {
-            if (col.id !== op.collectionId) return col;
-            return concatToCollection(col, op.data);
-          }),
-        }),
-      });
-    }
-    case "collection.delete":
-      return applyCollectionDelete(stateRef, op);
-    case "blob.create":
-      return applyBlobCreate(stateRef, op);
-    case "blob.set":
-      return applyBlobSet(stateRef, op);
-    case "blob.delete":
-      return applyBlobDelete(stateRef, op);
-  }
-  op satisfies never;
-};
+  ops: WriteOp[];
+}) =>
+  applyState({
+    ref: stateRef,
+    fn: (state) => ops.reduce(reduceWrite, state),
+  });
+
+// Replicated writes (events arriving from the server / other replicas)
+// go through the same reducer.
+const applyReplicatedWrite = applyWrite;
 
 export type CollectionConcatCallback = (data: {
   collectionId: string;
@@ -387,6 +331,50 @@ const createReplicaEffect = (
               { op: event.op.type },
             );
             if (writeAck.error) return yield* Effect.fail(writeAck.error);
+            return;
+          }
+
+          case "write-batch": {
+            const state = yield* requireConnected({ ref: stateRef });
+            if (event.ops.length === 0) return;
+
+            // ONE Ref.update for the whole batch — subscribers see one
+            // transition for the entire `client.update(fn)` call, so
+            // renderers can't paint partially-applied intermediate states.
+            yield* traceKyju(
+              "kyju:replica.applyWriteBatch",
+              applyWriteBatch({ stateRef, ops: event.ops }),
+              { count: event.ops.length },
+            );
+
+            // Concat callbacks (used by collection subscribers) are
+            // observed once per concat op, in batch order.
+            for (const op of event.ops) {
+              yield* notifyConcatCallbacks(op);
+            }
+
+            // Replicate to server op-by-op so the wire protocol stays
+            // unchanged. If an ack errors we surface it; earlier ops in
+            // the batch are already applied locally — same loss-of-atomicity
+            // contract as the single-op `kind: "write"` path on failure.
+            for (const op of event.ops) {
+              const writeRequestId = nanoid();
+              const writeAck = yield* traceKyju(
+                "kyju:replica.sendToServer",
+                sendToServer<Ack>(
+                  {
+                    kind: "write",
+                    op,
+                    sessionId: state.sessionId,
+                    requestId: writeRequestId,
+                    replicaId,
+                  },
+                  writeRequestId,
+                ),
+                { op: op.type },
+              );
+              if (writeAck.error) return yield* Effect.fail(writeAck.error);
+            }
             return;
           }
 

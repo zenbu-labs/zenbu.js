@@ -6,6 +6,7 @@ import type {
   ClientEvent,
   KyjuJSON,
   KyjuError,
+  WriteOp,
 } from "../shared";
 import type { CollectionConcatCallback } from "../replica/replica";
 import type zod from "zod";
@@ -576,19 +577,40 @@ function createClientCore<TShape extends SchemaShape>(
         const result = fn(proxy);
 
         if (result !== undefined) {
+          // Returning a value from the updater replaces the whole root,
+          // which is already a single op.
           yield* send({
             kind: "write",
             op: { type: "root.set", path: [], value: result },
           });
-        } else {
-          const ops = getOperations();
-          for (const op of ops) {
-            yield* send({
-              kind: "write",
-              op: { type: "root.set", path: op.path, value: op.value },
-            });
-          }
+          return;
         }
+
+        const recorded = getOperations();
+        if (recorded.length === 0) return;
+
+        const ops: WriteOp[] = recorded.map((op) => ({
+          type: "root.set" as const,
+          path: op.path,
+          value: op.value,
+        }));
+
+        if (ops.length === 1) {
+          // Fast path: no batching overhead for the common single-write
+          // case, and behaviour is byte-identical to pre-batching builds.
+          yield* send({ kind: "write", op: ops[0]! });
+          return;
+        }
+
+        // Multiple ops produced by one `update(fn)` get shipped to the
+        // replica as a single `write-batch` event. The replica folds
+        // them with one `Ref.update` so every `useDb` / `subscribe`
+        // caller observes exactly one new state per `update()` call,
+        // not one per recorded op. Without this the renderer paints
+        // intermediate states where some paths are written and others
+        // are not yet, which surfaces as visible flicker on actions
+        // the app author wrote as a single transaction.
+        yield* send({ kind: "write-batch", ops });
       }),
     );
 
