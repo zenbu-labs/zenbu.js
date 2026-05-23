@@ -81,7 +81,12 @@ describe("generate --amend", () => {
     expect(migContent).toContain("fundamental-mode");
     expect(migContent).toContain("version: 2");
 
-    expect(fs.existsSync(path.join(out, "0002_add_mode.ts"))).toBe(false);
+    // Amending must not leave a stale second migration on disk.
+    const tsFiles = fs.readdirSync(out).filter((f) => f.endsWith(".ts"));
+    expect(tsFiles).toHaveLength(2);
+    const lastEntry = journal.entries[1]!;
+    expect(lastEntry.file).toBeDefined();
+    expect(fs.existsSync(path.join(out, `${lastEntry.file}.ts`))).toBe(true);
   });
 
   it("amend with only one migration replaces it", () => {
@@ -147,7 +152,9 @@ describe("generate --amend", () => {
 
     const journal = readJournal(out);
     expect(journal.entries[0]!.tag).toBe("my_feature");
-    expect(fs.existsSync(path.join(out, "0000_my_feature.ts"))).toBe(true);
+    const entry = journal.entries[0]!;
+    expect(entry.file).toBe(`my_feature_${entry.when}`);
+    expect(fs.existsSync(path.join(out, `${entry.file}.ts`))).toBe(true);
   });
 
   it("amend cleans up old migration file when name changes", () => {
@@ -161,7 +168,10 @@ describe("generate --amend", () => {
       name: "old_name",
     });
 
-    expect(fs.existsSync(path.join(out, "0000_old_name.ts"))).toBe(true);
+    const initialJournal = readJournal(out);
+    const oldEntry = initialJournal.entries[0]!;
+    expect(oldEntry.file).toBe(`old_name_${oldEntry.when}`);
+    expect(fs.existsSync(path.join(out, `${oldEntry.file}.ts`))).toBe(true);
 
     generate({
       outPath: out,
@@ -171,7 +181,11 @@ describe("generate --amend", () => {
       amend: true,
     });
 
-    expect(fs.existsSync(path.join(out, "0000_old_name.ts"))).toBe(false);
-    expect(fs.existsSync(path.join(out, "0000_new_name.ts"))).toBe(true);
+    const newJournal = readJournal(out);
+    const newEntry = newJournal.entries[0]!;
+    expect(newEntry.tag).toBe("new_name");
+    expect(newEntry.file).toBe(`new_name_${newEntry.when}`);
+    expect(fs.existsSync(path.join(out, `${oldEntry.file}.ts`))).toBe(false);
+    expect(fs.existsSync(path.join(out, `${newEntry.file}.ts`))).toBe(true);
   });
 });

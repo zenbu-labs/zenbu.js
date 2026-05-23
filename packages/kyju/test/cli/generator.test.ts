@@ -61,7 +61,7 @@ describe("generator", () => {
     expect(journal.entries[0]!.tag).toBe("initial");
   });
 
-  it("consecutive generates produce incrementing prefixes", () => {
+  it("consecutive generates produce idx-ordered journal entries with merge-safe filenames", () => {
     const out = tmpDir();
     cleanups.push(out);
 
@@ -80,8 +80,17 @@ describe("generator", () => {
       name: "second",
     });
 
-    expect(fs.existsSync(path.join(out, "0000_first.ts"))).toBe(true);
-    expect(fs.existsSync(path.join(out, "0001_second.ts"))).toBe(true);
+    const journal = readJournal(out);
+    expect(journal.entries.map((e) => e.idx)).toEqual([0, 1]);
+    expect(journal.entries.map((e) => e.tag)).toEqual(["first", "second"]);
+
+    // Filenames no longer carry the numeric `idx` prefix — that's what caused
+    // the merge-conflict footgun. They live under `{tag}_{when}` so branches
+    // diverging off the same head produce distinct files.
+    for (const entry of journal.entries) {
+      expect(entry.file).toBe(`${entry.tag}_${entry.when}`);
+      expect(fs.existsSync(path.join(out, `${entry.file}.ts`))).toBe(true);
+    }
   });
 
   it("snapshot written with correct id/prevId", () => {
@@ -194,6 +203,37 @@ describe("generator", () => {
     expect(content).toContain('import type { KyjuMigration } from "#zenbu/kyju"');
     expect(content).not.toContain("type MigrationOp =");
     expect(content).toContain("version: 1");
+  });
+
+  it("falls back to legacy naming when journal entry has no `file` field", () => {
+    const out = tmpDir();
+    cleanups.push(out);
+
+    // Simulate a migration directory written by an older version of the
+    // generator: numeric-prefixed filenames and a journal entry without a
+    // `file` field. The loader/snapshot lookup must keep working.
+    fs.mkdirSync(path.join(out, "meta"), { recursive: true });
+    fs.writeFileSync(
+      path.join(out, "0000_legacy.ts"),
+      "export default { version: 1, operations: [] }\n",
+    );
+    fs.writeFileSync(
+      path.join(out, "meta", "0000_snapshot.json"),
+      JSON.stringify(makeSnapshot({}, "legacy-id", ""), null, 2),
+    );
+    fs.writeFileSync(
+      path.join(out, "meta", "_journal.json"),
+      JSON.stringify(
+        { version: "1", entries: [{ idx: 0, tag: "legacy", when: 1 }] },
+        null,
+        2,
+      ),
+    );
+
+    const journal = readJournal(out);
+    const snap = getLastSnapshot(out, journal);
+    expect(snap).not.toBeNull();
+    expect(snap!.id).toBe("legacy-id");
   });
 
   it("no alias inlines type definitions", () => {

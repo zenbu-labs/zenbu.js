@@ -7,12 +7,46 @@ export type JournalEntry = {
   idx: number;
   tag: string;
   when: number;
+  /**
+   * Basename (no extension) of the on-disk migration file. Newly generated
+   * migrations always populate this. When absent (legacy entries written
+   * before this field existed), the loader falls back to the historical
+   * `{pad(idx)}_{tag}` naming so existing migration directories keep
+   * loading without rewrites.
+   *
+   * Why this exists: the old `{pad(idx)}_{tag}` convention guaranteed a
+   * merge conflict whenever two branches each generated a migration off
+   * the same head — both picked the same `idx`, both wrote the same
+   * filename. The new convention embeds `when` (a near-unique timestamp)
+   * so parallel branches produce distinct files. The journal still owns
+   * ordering via `idx`; only `idx` need be reconciled at merge time.
+   */
+  file?: string;
 };
 
 export type Journal = {
   version: string;
   entries: JournalEntry[];
 };
+
+/**
+ * Resolve the on-disk basename for a journal entry. Prefers the explicit
+ * `file` field for new entries, falls back to the legacy numeric naming
+ * for entries written before `file` was tracked.
+ */
+export function entryBaseName(entry: JournalEntry): string {
+  return entry.file ?? `${pad(entry.idx)}_${entry.tag}`;
+}
+
+/**
+ * Resolve the on-disk basename for an entry's snapshot file (without the
+ * `_snapshot.json` suffix or `meta/` prefix). Mirrors `entryBaseName` for
+ * new entries; falls back to the legacy `{pad(idx)}` snapshot naming for
+ * legacy entries (snapshots historically did NOT include the tag).
+ */
+export function entrySnapshotBaseName(entry: JournalEntry): string {
+  return entry.file ?? pad(entry.idx);
+}
 
 const INLINE_MIGRATION_TYPES = `type MigrationOp =
   | { op: "add"; key: string; kind: "data"; hasDefault: boolean; default?: any }
@@ -46,20 +80,33 @@ export function readJournal(outPath: string): Journal {
   return JSON.parse(fs.readFileSync(journalPath, "utf-8"));
 }
 
+function readSnapshotForEntry(outPath: string, entry: JournalEntry): SchemaSnapshot | null {
+  const primary = path.join(outPath, "meta", `${entrySnapshotBaseName(entry)}_snapshot.json`);
+  if (fs.existsSync(primary)) {
+    return JSON.parse(fs.readFileSync(primary, "utf-8"));
+  }
+  // Legacy fallback: an entry written with the new `file` field but
+  // sitting next to a snapshot that was generated under the old naming
+  // scheme. Should be rare, but cheap to support.
+  if (entry.file) {
+    const legacy = path.join(outPath, "meta", `${pad(entry.idx)}_snapshot.json`);
+    if (fs.existsSync(legacy)) {
+      return JSON.parse(fs.readFileSync(legacy, "utf-8"));
+    }
+  }
+  return null;
+}
+
 export function getLastSnapshot(outPath: string, journal: Journal): SchemaSnapshot | null {
   if (journal.entries.length === 0) return null;
   const lastEntry = journal.entries[journal.entries.length - 1]!;
-  const snapshotPath = path.join(outPath, "meta", `${pad(lastEntry.idx)}_snapshot.json`);
-  if (!fs.existsSync(snapshotPath)) return null;
-  return JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
+  return readSnapshotForEntry(outPath, lastEntry);
 }
 
 export function getSnapshotAtIndex(outPath: string, journal: Journal, index: number): SchemaSnapshot | null {
   const entry = journal.entries[index];
   if (!entry) return null;
-  const snapshotPath = path.join(outPath, "meta", `${pad(entry.idx)}_snapshot.json`);
-  if (!fs.existsSync(snapshotPath)) return null;
-  return JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
+  return readSnapshotForEntry(outPath, entry);
 }
 
 function typesPreamble(alias?: string): string {
@@ -130,6 +177,7 @@ export function generate(opts: GenerateOptions): {
 
   let idx: number;
   let tag: string;
+  let when: number;
 
   if (amend) {
     if (journal.entries.length === 0) {
@@ -138,22 +186,37 @@ export function generate(opts: GenerateOptions): {
     const lastEntry = journal.entries[journal.entries.length - 1]!;
     idx = lastEntry.idx;
     tag = sanitizeTag(name || lastEntry.tag);
+    when = Date.now();
 
-    const oldMigration = path.join(outPath, `${pad(idx)}_${lastEntry.tag}.ts`);
-    const oldSnapshot = path.join(outPath, "meta", `${pad(idx)}_snapshot.json`);
+    // Delete the previous on-disk artifacts. Use the journal's recorded
+    // basename when present (new entries); fall back to the legacy naming
+    // for entries created before `file` was tracked.
+    const oldMigBase = entryBaseName(lastEntry);
+    const oldSnapBase = entrySnapshotBaseName(lastEntry);
+    const oldMigration = path.join(outPath, `${oldMigBase}.ts`);
+    const oldSnapshot = path.join(outPath, "meta", `${oldSnapBase}_snapshot.json`);
     if (fs.existsSync(oldMigration)) fs.unlinkSync(oldMigration);
     if (fs.existsSync(oldSnapshot)) fs.unlinkSync(oldSnapshot);
-
-    journal.entries[journal.entries.length - 1] = { idx, tag, when: Date.now() };
   } else {
     idx = journal.entries.length;
     tag = sanitizeTag(name || `migration`);
-    journal.entries.push({ idx, tag, when: Date.now() });
+    when = Date.now();
   }
 
-  const prefix = pad(idx);
+  // Filename is `{tag}_{when}`. Two branches diverging off the same head
+  // produce different `when` values, so the files don't collide and the
+  // only merge surface is the journal itself (which is small and easy to
+  // reconcile by renumbering `idx`).
+  const file = `${tag}_${when}`;
+  const entry: JournalEntry = { idx, tag, when, file };
 
-  const snapshotPath = path.join(outPath, "meta", `${prefix}_snapshot.json`);
+  if (amend) {
+    journal.entries[journal.entries.length - 1] = entry;
+  } else {
+    journal.entries.push(entry);
+  }
+
+  const snapshotPath = path.join(outPath, "meta", `${file}_snapshot.json`);
   fs.writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2) + "\n");
 
   const hasAlterOps = ops.some((o) => o.op === "alter");
@@ -163,7 +226,7 @@ export function generate(opts: GenerateOptions): {
     ? generateCustomMigration(idx, ops, alias)
     : generateDeclarativeMigration(idx, ops, alias);
 
-  const migrationPath = path.join(outPath, `${prefix}_${tag}.ts`);
+  const migrationPath = path.join(outPath, `${file}.ts`);
   fs.writeFileSync(migrationPath, migrationCode);
 
   const journalPath = path.join(outPath, "meta", "_journal.json");

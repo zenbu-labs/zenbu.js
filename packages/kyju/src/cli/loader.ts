@@ -2,11 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { KyjuMigration } from "../v2/migrations";
-import type { Journal } from "./generator";
-
-function pad(n: number, width = 4): string {
-  return String(n).padStart(width, "0");
-}
+import { entryBaseName, type Journal } from "./generator";
 
 function readJournalFromDir(dir: string): Journal {
   const journalPath = path.join(dir, "meta", "_journal.json");
@@ -29,7 +25,11 @@ export async function loadMigrationsFromDir(dir: string): Promise<KyjuMigration[
   const migrations: KyjuMigration[] = [];
 
   for (const entry of journal.entries) {
-    const base = `${pad(entry.idx)}_${entry.tag}`;
+    // `entryBaseName` returns the journal-recorded basename for new entries
+    // and falls back to the legacy `{pad(idx)}_{tag}` naming for entries
+    // written before `file` was tracked. That keeps every migration dir on
+    // disk loading correctly without a rewrite step.
+    const base = entryBaseName(entry);
     const candidates = [".ts", ".js", ".mjs"];
     let filePath: string | null = null;
     for (const ext of candidates) {
