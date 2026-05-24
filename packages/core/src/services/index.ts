@@ -8,3 +8,9 @@ export { RpcService } from "./rpc";
 export { ViewRegistryService } from "./view-registry";
 export { WindowService } from "./window";
 export { UpdaterService } from "./updater";
+export {
+  ShortcutsService,
+  type ShortcutDef,
+  type ShortcutListing,
+  type KeyboardInput,
+} from "./shortcuts";

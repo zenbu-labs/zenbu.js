@@ -14,6 +14,8 @@ export default defineConfig([
       "node-loader": "../advice/src/node-loader.ts",
       "advice-runtime": "../advice/src/runtime/index.ts",
       "loaders/zenbu": "src/loaders/zenbu.ts",
+      "prelude/theme-listener": "src/prelude/theme-listener.ts",
+      "prelude/shortcut-bridge": "src/prelude/shortcut-bridge.ts",
       "services/index": "src/services/index.ts",
       "services/default": "src/services/default.ts",
       db: "src/db.ts",

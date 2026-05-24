@@ -219,6 +219,56 @@ export const setAtPath = ({ root, path: pathSegments, value }: {
   return topRoot;
 };
 
+/**
+ * Counterpart to `setAtPath` for the canonical (db-side) root.
+ *
+ * Walks once and removes the leaf at `path` in place. Unlike the
+ * replica-side `deleteAtPath`, we don't clone intermediates — the db
+ * doesn't need to preserve referential identity (no React
+ * subscriptions on this side).
+ *
+ * Returns the same `root` it was given so callers can chain the same
+ * way they do with `setAtPath`. Empty `path` is a no-op (caller would
+ * have meant "clear the root", which they should express as a
+ * `root.set` to `{}`/`[]`).
+ */
+export const deleteAtPath = ({
+  root,
+  path,
+}: {
+  root: KyjuJSON;
+  path: string[];
+}): KyjuJSON => {
+  if (path.length === 0) return root;
+  if (typeof root !== "object" || root === null) return root;
+
+  let cursor: KyjuJSON = root;
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = path[i]!;
+    if (Array.isArray(cursor)) {
+      const child = (cursor as KyjuJSON[])[Number(seg)];
+      if (child === undefined || child === null || typeof child !== "object")
+        return root;
+      cursor = child;
+    } else {
+      const child = (cursor as Record<string, KyjuJSON>)[seg];
+      if (child === undefined || child === null || typeof child !== "object")
+        return root;
+      cursor = child;
+    }
+  }
+  const lastSeg = path[path.length - 1]!;
+  if (Array.isArray(cursor)) {
+    const idx = Number(lastSeg);
+    if (idx >= 0 && idx < (cursor as KyjuJSON[]).length) {
+      (cursor as KyjuJSON[]).splice(idx, 1);
+    }
+  } else {
+    delete (cursor as Record<string, KyjuJSON>)[lastSeg];
+  }
+  return root;
+};
+
 export type CollectionIndex = {
   activePageId: string;
   totalPages: number;

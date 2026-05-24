@@ -13,4 +13,5 @@ export async function defaultServices(): Promise<void> {
   await import("./window");
   await import("./advice-config");
   await import("./updater");
+  await import("./shortcuts");
 }

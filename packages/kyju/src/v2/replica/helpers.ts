@@ -103,6 +103,94 @@ export const setAtPath = ({
   return topClone;
 };
 
+/**
+ * Counterpart to `setAtPath`: remove the leaf at `path` from `root`,
+ * cloning intermediate containers so React subscribers see a fresh
+ * reference all the way down (same identity contract as `setAtPath`).
+ *
+ * - If any intermediate segment doesn't exist, the delete is a no-op
+ *   and the original `root` is returned unchanged (no spurious clones).
+ * - Empty `path` is a no-op — "delete the whole root" has no sensible
+ *   semantics; callers wanting that should set the root to `{}`/`[]`.
+ * - Array index deletes use `splice` so we don't leave sparse holes.
+ */
+export const deleteAtPath = ({
+  root,
+  path,
+}: {
+  root: KyjuJSON;
+  path: string[];
+}): KyjuJSON => {
+  if (path.length === 0) return root;
+  if (typeof root !== "object" || root === null) return root;
+
+  // Walk to check the path actually leads somewhere. If any step is
+  // missing we have nothing to delete — return the original root so
+  // subscribers don't see a no-op re-render.
+  let cursor: KyjuJSON = root;
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = path[i]!;
+    if (Array.isArray(cursor)) {
+      const child = (cursor as KyjuJSON[])[Number(seg)];
+      if (child === undefined || child === null || typeof child !== "object")
+        return root;
+      cursor = child;
+    } else {
+      const child = (cursor as Record<string, KyjuJSON>)[seg];
+      if (child === undefined || child === null || typeof child !== "object")
+        return root;
+      cursor = child;
+    }
+  }
+  const lastSeg = path[path.length - 1]!;
+  if (Array.isArray(cursor)) {
+    if (Number(lastSeg) >= (cursor as KyjuJSON[]).length) return root;
+  } else if (
+    !Object.prototype.hasOwnProperty.call(
+      cursor as Record<string, KyjuJSON>,
+      lastSeg,
+    )
+  ) {
+    return root;
+  }
+
+  // Now clone the chain and apply the delete on the deepest clone.
+  const clones: KyjuJSON[] = [];
+  const topClone: KyjuJSON = Array.isArray(root)
+    ? [...(root as KyjuJSON[])]
+    : { ...(root as Record<string, KyjuJSON>) };
+  clones.push(topClone);
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = path[i]!;
+    const parent = clones[i]!;
+    const child = Array.isArray(parent)
+      ? (parent as KyjuJSON[])[Number(seg)]!
+      : (parent as Record<string, KyjuJSON>)[seg]!;
+    const childClone: KyjuJSON = Array.isArray(child)
+      ? [...(child as KyjuJSON[])]
+      : { ...(child as Record<string, KyjuJSON>) };
+    clones.push(childClone);
+  }
+  const deepest = clones[clones.length - 1]!;
+  if (Array.isArray(deepest)) {
+    (deepest as KyjuJSON[]).splice(Number(lastSeg), 1);
+  } else {
+    delete (deepest as Record<string, KyjuJSON>)[lastSeg];
+  }
+  // Stitch parents to point at cloned children.
+  for (let i = clones.length - 2; i >= 0; i--) {
+    const parent = clones[i]!;
+    const child = clones[i + 1]!;
+    const seg = path[i]!;
+    if (Array.isArray(parent)) {
+      (parent as KyjuJSON[])[Number(seg)] = child;
+    } else {
+      (parent as Record<string, KyjuJSON>)[seg] = child;
+    }
+  }
+  return topClone;
+};
+
 export type ConnectedState = Extract<ClientState, { kind: "connected" }>;
 
 export const requireConnected = ({ ref }: { ref: Ref.Ref<ClientState> }) =>

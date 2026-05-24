@@ -18,8 +18,10 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
   type ReactElement,
   type ReactNode,
+  type Ref,
 } from "react";
 import {
   connectReplica,
@@ -341,6 +343,144 @@ export function useEvents(): EventProxy<RegisteredEvents> {
 }
 
 export type { CollectionRefValue };
+
+// ---- <FocusContext>: focus-context primitive for shortcut `when` ----
+
+/**
+ * Declares a named focus region. The region is *active* whenever DOM
+ * focus is anywhere inside the wrapper element (including inside
+ * descendant iframes). Shortcuts registered with a matching `when`
+ * clause only fire while the region is active.
+ *
+ * Multiple `<FocusContext>` instances nest naturally — the active
+ * stack is innermost-first. You can declare more than one id at the
+ * same level by passing an array (`id={["app.sidebar", "app.workspace"]}`),
+ * which is exposed to the prelude as a space-separated
+ * `data-zenbu-focus-context` attribute (same convention as `class`).
+ *
+ * `<FocusContext>` renders a `<div>` wrapper by default. Pass
+ * `tabIndex={-1}` and a `ref` (or use `useFocusContext`) if you want
+ * the wrapper itself to be programmatically focusable.
+ */
+export interface FocusContextProps {
+  id: string | string[];
+  children?: ReactNode;
+  className?: string;
+  style?: CSSProperties;
+  tabIndex?: number;
+  /** Forwarded onto the wrapper so callers can imperatively `focus()` it. */
+  innerRef?: Ref<HTMLDivElement>;
+}
+
+export function FocusContext({
+  id,
+  children,
+  className,
+  style,
+  tabIndex,
+  innerRef,
+}: FocusContextProps): ReactElement {
+  const ids = Array.isArray(id) ? id : [id];
+  const dataValue = ids.filter(Boolean).join(" ");
+  return createElement(
+    "div",
+    {
+      ref: innerRef,
+      className,
+      style,
+      tabIndex,
+      "data-zenbu-focus-context": dataValue,
+      // Route pointerdown on non-focusable children back to the wrapper
+      // so clicking an unfocusable list row still "enters" the context.
+      // We only steal focus when the click target isn't itself focusable
+      // — buttons, inputs, links handle their own focus.
+      onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        // Already focusable? Let the native behavior take over.
+        if (isFocusable(target)) return;
+        const wrapper = e.currentTarget;
+        if (wrapper && wrapper.tabIndex >= 0) {
+          // preventScroll keeps lists from jumping when the user just
+          // wanted to click a row, and preventDefault below would
+          // otherwise also kill text selection.
+          try { wrapper.focus({ preventScroll: true }); } catch {}
+        }
+      },
+    },
+    children,
+  );
+}
+
+function isFocusable(el: HTMLElement): boolean {
+  if (el.tabIndex >= 0) return true;
+  // Tab-stop heuristic: covers the elements the user really clicks on.
+  // We intentionally don't enumerate every focusable element type — if
+  // a custom element wants to opt in it can set `tabIndex >= 0`.
+  const tag = el.tagName;
+  if (tag === "BUTTON" || tag === "A" || tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
+    return true;
+  }
+  // Walk up a couple of levels so clicking the icon inside a button
+  // still counts as a focusable target. Bounded so we don't re-walk
+  // the whole tree.
+  let node: HTMLElement | null = el.parentElement;
+  for (let i = 0; node && i < 3; i++) {
+    if (node.tabIndex >= 0) return true;
+    const ntag = node.tagName;
+    if (ntag === "BUTTON" || ntag === "A") return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
+/**
+ * Hook companion for `<FocusContext>`. Returns:
+ *
+ *   - `ref`     : attach to your container (or pass to `<FocusContext
+ *                 innerRef={...} tabIndex={-1}>`) so callers can
+ *                 programmatically focus the region.
+ *   - `active`  : true while DOM focus is inside `ref.current`.
+ *                 Reactive — the component re-renders on transitions.
+ *   - `focus()` : imperatively focus the container with `preventScroll`.
+ *
+ * The `active` flag tracks the *single* element this hook owns; for
+ * "is the global stack including this id active" use
+ * `useDb(root => root.core.focus.contexts.includes(id))`.
+ */
+export function useFocusContext(_id: string | string[]) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [active, setActive] = useState(false);
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const el = ref.current;
+    const update = () => {
+      const focused =
+        document.activeElement === el ||
+        (document.activeElement != null && el.contains(document.activeElement));
+      setActive((prev) => (prev === focused ? prev : focused));
+    };
+    update();
+    document.addEventListener("focusin", update, true);
+    document.addEventListener("focusout", update, true);
+    return () => {
+      document.removeEventListener("focusin", update, true);
+      document.removeEventListener("focusout", update, true);
+    };
+  }, []);
+
+  const focus = useMemo(
+    () => () => {
+      try {
+        ref.current?.focus({ preventScroll: true });
+      } catch {}
+    },
+    [],
+  );
+
+  return { ref, active, focus };
+}
 
 // ---- <View>: child-iframe primitive ----
 

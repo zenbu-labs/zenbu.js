@@ -24,6 +24,7 @@ import {
 } from "../shared";
 import {
   applyState,
+  deleteAtPath,
   makeRequestAwaiter,
   requireConnected,
   setAtPath,
@@ -55,6 +56,11 @@ const reduceWrite = (state: ConnectedState, op: WriteOp): ConnectedState => {
       return {
         ...state,
         root: setAtPath({ root: state.root, path: op.path, value: op.value }),
+      };
+    case "root.delete":
+      return {
+        ...state,
+        root: deleteAtPath({ root: state.root, path: op.path }),
       };
     case "collection.create": {
       const collection: CollectionState = {

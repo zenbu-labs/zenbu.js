@@ -11,6 +11,7 @@ import {
   broadcastWrite,
   createBlob,
   createCollection,
+  deleteAtPath,
   makeAck,
   makeErrorAck,
   paths,
@@ -112,6 +113,100 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
             pathLength: typedOp.path.length,
             head: typedOp.path.slice(0, 10),
             tail: typedOp.path.slice(-10),
+            sessionId: event.sessionId,
+            requestId: event.requestId,
+          });
+          sendAck({
+            session,
+            ack: makeErrorAck({
+              requestId: event.requestId,
+              sessionId: event.sessionId,
+              _tag: "WriteFailedError",
+              message,
+            }),
+          });
+          return;
+        }
+
+        sendAck({
+          session,
+          ack: makeAck({
+            requestId: event.requestId,
+            sessionId: event.sessionId,
+          }),
+        });
+
+        const sessions = yield* Ref.get(ctx.sessionsRef);
+        traceKyjuSync("kyju:db.root.broadcast", () =>
+          broadcastWrite({
+            sessions,
+            excludeSessionId: event.sessionId,
+            op: event.op,
+          }),
+        );
+        return;
+      }
+
+      case "root.delete": {
+        // Mirror image of `root.set`: walk the canonical root under
+        // the mutex, unset the leaf at `path`, persist, broadcast.
+        // Empty path is a no-op (caller would have meant
+        // "clear the root", which they should express as a
+        // `root.set` to `{}`/`[]`).
+        const typedOp = event.op;
+        if (typedOp.path.length === 0) {
+          sendAck({
+            session,
+            ack: makeAck({
+              requestId: event.requestId,
+              sessionId: event.sessionId,
+            }),
+          });
+          return;
+        }
+
+        const writeExit = yield* Effect.exit(
+          traceKyju(
+            "kyju:db.root.mutex+cache",
+            ctx.rootMutex.withPermits(1)(
+              Effect.gen(function* () {
+                const root = yield* ctx.rootCache.read();
+                const updated = yield* Effect.try({
+                  try: () =>
+                    deleteAtPath({
+                      root,
+                      path: typedOp.path,
+                    }),
+                  catch: (e) =>
+                    e instanceof Error ? e : new Error(String(e)),
+                });
+                yield* ctx.rootCache.set(updated);
+              }),
+            ),
+          ),
+        );
+
+        if (writeExit._tag === "Failure") {
+          const cause = writeExit.cause;
+          const message = (() => {
+            try {
+              // @ts-ignore — runtime shape check
+              if (cause && typeof cause === "object" && "defect" in cause) {
+                const d = (cause as { defect: unknown }).defect;
+                return d instanceof Error ? d.message : String(d);
+              }
+              // @ts-ignore — runtime shape check
+              if (cause && typeof cause === "object" && "error" in cause) {
+                const er = (cause as { error: unknown }).error;
+                return er instanceof Error ? er.message : String(er);
+              }
+            } catch {}
+            return String(cause);
+          })();
+          // eslint-disable-next-line no-console
+          console.error("[kyju] root.delete failed", {
+            message,
+            path: typedOp.path,
             sessionId: event.sessionId,
             requestId: event.requestId,
           });

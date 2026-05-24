@@ -9,6 +9,7 @@ import type {
   RendererHostService,
   RpcService,
   ServerService,
+  ShortcutsService,
   UpdaterService,
   ViewRegistryService,
   WindowService,
@@ -43,6 +44,7 @@ export type CoreServiceRouter = {
     "renderer-host": ExtractRpcMethods<RendererHostService>;
     rpc: ExtractRpcMethods<RpcService>;
     server: ExtractRpcMethods<ServerService>;
+    shortcuts: ExtractRpcMethods<ShortcutsService>;
     updater: ExtractRpcMethods<UpdaterService>;
     "view-registry": ExtractRpcMethods<ViewRegistryService>;
     window: ExtractRpcMethods<WindowService>;

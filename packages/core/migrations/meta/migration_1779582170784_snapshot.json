@@ -1,0 +1,33 @@
+{
+  "id": "218c2b94-86f1-429b-8fe4-205a4eef5fcd",
+  "prevId": "e4417b9f-eabe-481c-93d4-abac2c9c505b",
+  "fields": {
+    "lastKnownViewRegistry": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "e5ae4a80339714d8",
+      "default": []
+    },
+    "windowPrefs": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d15bbfd72cb9fe18",
+      "default": {}
+    },
+    "shortcuts": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d2534dc6e73ef123",
+      "default": {}
+    },
+    "focus": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "009e035028c96a15",
+      "default": {
+        "iframes": [],
+        "contexts": []
+      }
+    }
+  }
+}

@@ -21,6 +21,23 @@ const RESOLVED_PREFIX = "\0@advice-prelude/";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ADVICE_RUNTIME_ENTRY = path.resolve(HERE, "advice-runtime.mjs");
+const THEME_LISTENER_ENTRY = path.resolve(
+  HERE,
+  "prelude/theme-listener.mjs",
+);
+const SHORTCUT_BRIDGE_ENTRY = path.resolve(
+  HERE,
+  "prelude/shortcut-bridge.mjs",
+);
+
+/**
+ * Virtual import specifiers used by the generated prelude module to pull
+ * in the framework's per-iframe runtime helpers. Resolved by
+ * `resolveAdviceRuntime` (and the analogous resolver below) to absolute
+ * paths in core's `dist/`.
+ */
+const THEME_LISTENER_SPECIFIER = "@zenbu/core/prelude/theme-listener";
+const SHORTCUT_BRIDGE_SPECIFIER = "@zenbu/core/prelude/shortcut-bridge";
 
 /**
  * The package directory of `@zenbujs/core` itself. We expose it on the dev
@@ -108,53 +125,56 @@ function parsePreludeId(id: string): { type: string } {
 }
 
 /**
- * Generates the per-iframe prelude module. Always emits the host-theme
- * postMessage listener so plugin views automatically follow the host's
- * theme picker; advice / content-script imports come after.
+ * Generates the per-iframe prelude module. Always pulls in the host-theme
+ * postMessage listener and the shortcut/focus bridge so plugin views
+ * automatically follow the host's theme picker and participate in the
+ * global keybinding system; advice / content-script imports come after.
+ *
+ * The bridge and listener live as real source modules under
+ * `packages/core/src/prelude/`. They're bundled into core's `dist/` by
+ * tsdown and resolved here through the virtual specifiers above.
  */
-function generateAdvicePreludeCode(entries: ViewAdviceEntry[]): string {
-  const themeListener = `
-window.addEventListener("message", (e) => {
-  if (e.data && e.data.kind === "zenbu:view-theme") {
-    const tokens = e.data.tokens || {};
-    const css = ":root{" + Object.keys(tokens).map(k => k + ":" + tokens[k]).join(";") + "}";
-    let el = document.getElementById("zenbu-view-theme");
-    if (!el) {
-      el = document.createElement("style");
-      el.id = "zenbu-view-theme";
-      document.head.prepend(el);
-    }
-    el.textContent = css;
-  }
-});
-`;
-  if (entries.length === 0) return themeListener;
+function generateAdvicePreludeCode(
+  entries: ViewAdviceEntry[],
+  viewType: string,
+): string {
   const imports: string[] = [
-    'import { replace, advise } from "@zenbu/advice/runtime"',
+    `import { installThemeListener } from ${JSON.stringify(
+      THEME_LISTENER_SPECIFIER,
+    )}`,
+    `import { installShortcutBridge } from ${JSON.stringify(
+      SHORTCUT_BRIDGE_SPECIFIER,
+    )}`,
   ];
-  const calls: string[] = [];
-  entries.forEach((entry, i) => {
-    const alias = `__r${i}`;
-    imports.push(
-      `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
-        entry.modulePath,
-      )}`,
-    );
-    if (entry.type === "replace") {
-      calls.push(
-        `replace(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
-          entry.name,
-        )}, ${alias})`,
+  const calls: string[] = [
+    `installThemeListener()`,
+    `installShortcutBridge(${JSON.stringify(viewType)})`,
+  ];
+  if (entries.length > 0) {
+    imports.push('import { replace, advise } from "@zenbu/advice/runtime"');
+    entries.forEach((entry, i) => {
+      const alias = `__r${i}`;
+      imports.push(
+        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
+          entry.modulePath,
+        )}`,
       );
-    } else {
-      calls.push(
-        `advise(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
-          entry.name,
-        )}, ${JSON.stringify(entry.type)}, ${alias})`,
-      );
-    }
-  });
-  return imports.join("\n") + "\n" + calls.join("\n") + "\n" + themeListener;
+      if (entry.type === "replace") {
+        calls.push(
+          `replace(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
+            entry.name,
+          )}, ${alias})`,
+        );
+      } else {
+        calls.push(
+          `advise(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
+            entry.name,
+          )}, ${JSON.stringify(entry.type)}, ${alias})`,
+        );
+      }
+    });
+  }
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
 }
 
 /**
@@ -185,18 +205,27 @@ function extractThemeParam(originalUrl: string | undefined): string | null {
 }
 
 /**
- * Resolves `@zenbu/advice/runtime` to the bundled core runtime so plugins'
- * advice + content scripts can `import { replace, advise } from "@zenbu/advice/runtime"`
- * without depending on the package directly.
+ * Resolves the framework's virtual runtime specifiers to absolute paths
+ * inside core's bundled `dist/`:
+ *
+ *  - `@zenbu/advice/runtime` — the advice runtime that plugins import to
+ *    call `replace` / `advise`.
+ *  - `@zenbu/core/prelude/theme-listener` — host-theme postMessage
+ *    listener installed into every iframe.
+ *  - `@zenbu/core/prelude/shortcut-bridge` — keydown / focus / bindings
+ *    bridge installed into every iframe.
+ *
+ * Resolving them here means the generated prelude module can use clean
+ * bare-specifier imports instead of inlining their source as strings.
  */
 export function resolveAdviceRuntime(): Plugin {
   return {
     name: "zenbu-resolve-advice-runtime",
     enforce: "pre",
     resolveId(source) {
-      if (source === "@zenbu/advice/runtime") {
-        return ADVICE_RUNTIME_ENTRY;
-      }
+      if (source === "@zenbu/advice/runtime") return ADVICE_RUNTIME_ENTRY;
+      if (source === THEME_LISTENER_SPECIFIER) return THEME_LISTENER_ENTRY;
+      if (source === SHORTCUT_BRIDGE_SPECIFIER) return SHORTCUT_BRIDGE_ENTRY;
       return null;
     },
   };
@@ -223,7 +252,7 @@ export function advicePreludePlugin(): Plugin {
     load(id) {
       if (!id.startsWith(RESOLVED_PREFIX)) return null;
       const { type } = parsePreludeId(id);
-      let code = generateAdvicePreludeCode(getAdvice(type));
+      let code = generateAdvicePreludeCode(getAdvice(type), type);
       for (const scriptPath of getContentScripts(type)) {
         code += `import ${JSON.stringify(scriptPath)}\n`;
       }

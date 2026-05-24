@@ -58,6 +58,20 @@ export type RootSetOp = {
   value: KyjuJSON;
 };
 
+/**
+ * Removes the leaf at `path` from the canonical root. Produced by the
+ * recording proxy's `deleteProperty` trap (i.e. `delete root.foo[id]`
+ * inside `client.update(fn)`) and applied by the reducer.
+ *
+ * `path` must have at least one segment — deleting the root itself
+ * has no sensible semantics; callers wanting to clear the root should
+ * return a fresh object from the updater (`root.set` to `[]`/`{}`).
+ */
+export type RootDeleteOp = {
+  type: "root.delete";
+  path: string[];
+};
+
 export type CollectionCreateOp = {
   type: "collection.create";
   collectionId: string;
@@ -96,6 +110,7 @@ export type BlobDeleteOp = {
 
 export type WriteOp =
   | RootSetOp
+  | RootDeleteOp
   | CollectionCreateOp
   | CollectionConcatOp
   | CollectionDeleteOp

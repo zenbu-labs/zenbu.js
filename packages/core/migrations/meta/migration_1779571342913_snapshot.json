@@ -1,0 +1,30 @@
+{
+  "id": "e4417b9f-eabe-481c-93d4-abac2c9c505b",
+  "prevId": "96242ba8-b98f-4856-8c2f-ac755aae4805",
+  "fields": {
+    "lastKnownViewRegistry": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "e5ae4a80339714d8",
+      "default": []
+    },
+    "windowPrefs": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d15bbfd72cb9fe18",
+      "default": {}
+    },
+    "shortcuts": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d2534dc6e73ef123",
+      "default": {}
+    },
+    "focusedView": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "0ed2d8dfb82a0df5",
+      "default": null
+    }
+  }
+}

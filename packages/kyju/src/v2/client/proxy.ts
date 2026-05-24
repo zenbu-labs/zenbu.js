@@ -1,6 +1,17 @@
 import type { KyjuJSON } from "../shared";
 
-export type RecordedOp = { path: string[]; value: KyjuJSON };
+/**
+ * Recorded mutation captured by `createRecordingProxy`. `set` ops
+ * carry the new value; `delete` ops carry no value because the
+ * intent is "unset this path" — not "set it to `undefined`/`null`".
+ *
+ * The downstream batcher in `client.ts` maps these onto wire-level
+ * `root.set` / `root.delete` write ops; the replica + db reducers
+ * fold them into the canonical root.
+ */
+export type RecordedOp =
+  | { kind: "set"; path: string[]; value: KyjuJSON }
+  | { kind: "delete"; path: string[] };
 
 /**
  * 
@@ -65,9 +76,32 @@ export const createRecordingProxy = <T extends Record<string, any>>(
           const opPath = [...currentPath, prop as string];
           if (opPath.length > 64) warnDeep(opPath);
           operations.push({
+            kind: "set",
             path: opPath,
             value: value as KyjuJSON,
           });
+        }
+        return true;
+      },
+      deleteProperty(t, prop) {
+        // Skip symbol-keyed deletes and no-op deletes of properties
+        // that aren't present: no observable mutation happened, so
+        // there's nothing to ship to the replica.
+        if (typeof prop === "symbol") {
+          return Reflect.deleteProperty(t, prop);
+        }
+        const had = Object.prototype.hasOwnProperty.call(t, prop);
+        const ok = delete t[prop];
+        if (!ok || !had) return ok;
+        if (Array.isArray(t)) {
+          // Deleting an array index leaves a sparse hole; treat the
+          // whole array as dirty so we replay it verbatim, same as
+          // `set` on an array element.
+          markArrayDirty(currentPath, t);
+        } else {
+          const opPath = [...currentPath, prop as string];
+          if (opPath.length > 64) warnDeep(opPath);
+          operations.push({ kind: "delete", path: opPath });
         }
         return true;
       },
@@ -78,9 +112,9 @@ export const createRecordingProxy = <T extends Record<string, any>>(
   return {
     proxy: makeProxy(snapshot, []),
     getOperations: () => {
-      const result = [...operations];
+      const result: RecordedOp[] = [...operations];
       for (const { path, arr } of dirtyArrayPaths.values()) {
-        result.push({ path, value: arr as KyjuJSON });
+        result.push({ kind: "set", path, value: arr as KyjuJSON });
       }
       return result;
     },

@@ -638,11 +638,15 @@ function createClientCore<TShape extends SchemaShape>(
         const recorded = getOperations();
         if (recorded.length === 0) return;
 
-        const ops: WriteOp[] = recorded.map((op) => ({
-          type: "root.set" as const,
-          path: op.path,
-          value: op.value,
-        }));
+        const ops: WriteOp[] = recorded.map((op) =>
+          op.kind === "delete"
+            ? ({ type: "root.delete" as const, path: op.path })
+            : ({
+                type: "root.set" as const,
+                path: op.path,
+                value: op.value,
+              }),
+        );
 
         if (ops.length === 1) {
           // Fast path: no batching overhead for the common single-write
