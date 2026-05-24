@@ -245,17 +245,19 @@ export const deleteAtPath = ({
   let cursor: KyjuJSON = root;
   for (let i = 0; i < path.length - 1; i++) {
     const seg = path[i]!;
+    // Explicit annotation: TS can't narrow `child` through the recursive
+    // `KyjuJSON` type by itself, so it falls back to implicit-any and
+    // refuses to compile under `noImplicitAny`. Pinning the type here
+    // keeps the body otherwise unchanged.
+    let child: KyjuJSON | undefined;
     if (Array.isArray(cursor)) {
-      const child = (cursor as KyjuJSON[])[Number(seg)];
-      if (child === undefined || child === null || typeof child !== "object")
-        return root;
-      cursor = child;
+      child = (cursor as KyjuJSON[])[Number(seg)];
     } else {
-      const child = (cursor as Record<string, KyjuJSON>)[seg];
-      if (child === undefined || child === null || typeof child !== "object")
-        return root;
-      cursor = child;
+      child = (cursor as Record<string, KyjuJSON>)[seg];
     }
+    if (child === undefined || child === null || typeof child !== "object")
+      return root;
+    cursor = child;
   }
   const lastSeg = path[path.length - 1]!;
   if (Array.isArray(cursor)) {
