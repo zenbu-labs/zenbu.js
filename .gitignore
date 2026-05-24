@@ -157,10 +157,6 @@ tsconfig.local.json
 explorations/
 tmp/
 
-# Local agent workspace (goals, worktrees, scratch)
-.claude-workspace/
-tasks/
-
 # Local runtime data
 packages/init/.zenbu/db/
 
