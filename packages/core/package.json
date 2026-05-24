@@ -1,6 +1,6 @@
 {
   "name": "@zenbujs/core",
-  "version": "0.0.25",
+  "version": "0.0.27",
   "type": "module",
   "publishConfig": {
     "access": "public"
