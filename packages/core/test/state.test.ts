@@ -73,6 +73,48 @@ describe("ServiceState primitive", () => {
     expect(cbOk).toHaveBeenCalledWith(1);
     errors.mockRestore();
   });
+
+  it("warns on top-level non-JSON-safe values (Map/Set/Date/BigInt/Error/function)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cases: Array<[string, unknown]> = [
+      ["Map", new Map()],
+      ["Set", new Set()],
+      ["Date", new Date()],
+      ["Error", new Error("x")],
+      ["function", () => 1],
+      ["BigInt", 1n],
+    ];
+    for (const [label, value] of cases) {
+      const cell = state<unknown>(null);
+      warn.mockClear();
+      cell.set(value);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain(label);
+    }
+    warn.mockRestore();
+  });
+
+  it("warns when an own-property of an object value is non-serializable", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cell = state<Record<string, unknown>>({});
+    cell.set({ when: new Date(), ok: 1 });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('"when"');
+    expect(warn.mock.calls[0][0]).toContain("Date");
+    warn.mockRestore();
+  });
+
+  it("does not warn on plain JSON-safe values", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cell = state<unknown>(null);
+    cell.set({ a: 1, b: "x", c: null, d: [1, 2], e: true });
+    cell.set([1, 2, 3]);
+    cell.set("hello");
+    cell.set(42);
+    cell.set(null);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
 });
 
 describe("isServiceState / STATE_MARKER", () => {

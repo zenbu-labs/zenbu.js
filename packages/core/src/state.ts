@@ -32,11 +32,17 @@
  *
  * Constraints:
  *   - values must be JSON-serializable (no functions, no class instances,
- *     no circular references — the wire transport is plain JSON.stringify)
+ *     no circular references — the wire transport is plain JSON.stringify).
+ *     `set()` warns in dev when it spots a top-level Map/Set/Date/BigInt/
+ *     Error/Function — those silently lose data on the wire.
  *   - equality is `Object.is`: `.set(prev)` is a no-op; `.set({...obj})`
  *     fires even if shape is identical
  *   - writes are main-process-only in v1; renderer writes go through
  *     ordinary RPC methods on the service
+ *   - `undefined` is reserved as the "field removed" tombstone on the
+ *     wire. Use `null` (or any other sentinel) for "absent" values inside
+ *     state cells, not `undefined`. A `state<T | undefined>` whose value
+ *     becomes `undefined` will be dropped from the renderer's store.
  */
 
 /**
@@ -79,6 +85,7 @@ export class ServiceState<T> {
 
   set(next: T): void {
     if (Object.is(this._value, next)) return;
+    warnIfNotJsonSafe(next);
     this._value = next;
     this.fire();
   }
@@ -105,6 +112,51 @@ export class ServiceState<T> {
       }
     }
   }
+}
+
+/**
+ * Cheap dev-mode check for the cases that silently lose data when
+ * `JSON.stringify`'d: top-level prototype is Map/Set/Date/Error, type is
+ * BigInt/function, or any direct own-property of an object value is one
+ * of those. Skips deep traversal; circular refs and nested-Map cases
+ * will throw at `JSON.stringify` time inside `wireStateBroadcast` and
+ * land in its existing try/catch.
+ */
+function warnIfNotJsonSafe(value: unknown): void {
+  if (process.env.NODE_ENV === "production") return;
+  const desc = describeUnsafe(value);
+  if (desc !== null) {
+    console.warn(
+      `[state] set() received ${desc}; values must be JSON-serializable ` +
+        `(plain objects/arrays/primitives/null). Maps, Sets, Dates and class ` +
+        `instances stringify to {} and silently lose data on the wire.`,
+    );
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      const child = (value as Record<string, unknown>)[key];
+      const childDesc = describeUnsafe(child);
+      if (childDesc !== null) {
+        console.warn(
+          `[state] set() value has non-serializable field "${key}" (${childDesc}); ` +
+            `it will lose data on the wire.`,
+        );
+        return;
+      }
+    }
+  }
+}
+
+function describeUnsafe(value: unknown): string | null {
+  if (typeof value === "bigint") return "BigInt";
+  if (typeof value === "function") return "function";
+  if (value === null || typeof value !== "object") return null;
+  if (value instanceof Map) return "Map";
+  if (value instanceof Set) return "Set";
+  if (value instanceof Date) return "Date";
+  if (value instanceof Error) return "Error";
+  return null;
 }
 
 /**
