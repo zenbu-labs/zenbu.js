@@ -268,8 +268,18 @@ export interface Config {
   db?: string;
   uiEntrypoint: string;
   plugins: Array<Plugin | string>;
+  /**
+   * Path(s) to gitignored overlay file(s) whose default export is a
+   * plugin entry or array of entries (same shape as `plugins`). Missing
+   * files are silently ignored. Edits hot-reload like `zenbu.config.ts`.
+   * Skipped by `build:source` / `build:electron` / `publish:source`.
+   */
+  localPlugins?: string | string[];
   build?: BuildConfig;
 }
+
+/** Default export shape for a `localPlugins` file. */
+export type LocalPluginsDefault = Plugin | string | Array<Plugin | string>;
 
 export function defineConfig(config: Config): Config {
   return config;

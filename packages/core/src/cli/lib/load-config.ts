@@ -5,6 +5,7 @@ import { createRequire } from "node:module"
 import {
   resolveBuildConfig,
   type Config,
+  type LocalPluginsDefault,
   type Plugin,
   type ResolvedConfig,
   type ResolvedPlugin,
@@ -155,6 +156,11 @@ async function resolvePluginEntry(
   }
 }
 
+export interface LoadConfigOptions {
+  /** Skip `config.localPlugins`. Set by build/publish commands so dev-only overlays don't ship. */
+  skipLocalPlugins?: boolean
+}
+
 /**
  * Read `<projectDir>/zenbu.config.ts`, resolve all plugin entries (inline +
  * path), make every relative path absolute, and fill in `build` defaults.
@@ -163,7 +169,10 @@ async function resolvePluginEntry(
  * every invocation) and by CLI commands (`build:source`, `build:electron`,
  * `link`, `db generate`, `publish:source`).
  */
-export async function loadConfig(projectDir: string): Promise<{
+export async function loadConfig(
+  projectDir: string,
+  options: LoadConfigOptions = {},
+): Promise<{
   resolved: ResolvedConfig
   /** External plugin file paths the caller should hot-watch. */
   pluginSourceFiles: string[]
@@ -225,6 +234,43 @@ export async function loadConfig(projectDir: string): Promise<{
     const { resolved, sourceFile } = await resolvePluginEntry(entry, configDir)
     plugins.push(resolved)
     if (sourceFile) pluginSourceFiles.push(sourceFile)
+  }
+
+  // Optional gitignored overlay; see `Config.localPlugins`.
+  if (!options.skipLocalPlugins && config.localPlugins !== undefined) {
+    const overlayPaths = Array.isArray(config.localPlugins)
+      ? config.localPlugins
+      : [config.localPlugins]
+    for (const overlayPath of overlayPaths) {
+      if (typeof overlayPath !== "string" || overlayPath.length === 0) {
+        throw new Error(
+          `${configPath}: \`localPlugins\` entries must be non-empty strings.`,
+        )
+      }
+      const overlayAbs = path.isAbsolute(overlayPath)
+        ? overlayPath
+        : path.resolve(configDir, overlayPath)
+      // Missing file is the happy path — silently skip.
+      if (!fs.existsSync(overlayAbs)) continue
+      if (!PLUGIN_FILE_RE.test(overlayAbs)) {
+        throw new Error(
+          `${configPath}: localPlugins must point at a .ts/.js file, got ${path.basename(overlayAbs)}.`,
+        )
+      }
+      const overlayDir = path.dirname(overlayAbs)
+      const overlayDefault = await importFresh<LocalPluginsDefault>(overlayAbs)
+      const entries = Array.isArray(overlayDefault)
+        ? overlayDefault
+        : [overlayDefault]
+      // Relative paths inside the overlay anchor to the overlay's dir, not configDir.
+      for (const entry of entries) {
+        const { resolved, sourceFile } = await resolvePluginEntry(entry, overlayDir)
+        plugins.push(resolved)
+        if (sourceFile) pluginSourceFiles.push(sourceFile)
+      }
+      // Watch the overlay itself so edits to it (not just to its targets) re-resolve.
+      pluginSourceFiles.push(overlayAbs)
+    }
   }
 
   const build = resolveBuildConfig(

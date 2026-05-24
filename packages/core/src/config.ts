@@ -3,6 +3,7 @@ export {
   definePlugin,
   defineBuildConfig,
   type Config,
+  type LocalPluginsDefault,
   type ResolvedConfig,
   type Plugin,
   type PluginDependency,

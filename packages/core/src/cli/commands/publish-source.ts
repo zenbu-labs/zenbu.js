@@ -110,7 +110,7 @@ export async function runPublishSource(argv: string[]): Promise<void> {
   const projectDir = resolveProjectDir()
   const flags = parseFlags(argv)
 
-  const { resolved } = await loadConfig(projectDir)
+  const { resolved } = await loadConfig(projectDir, { skipLocalPlugins: true })
   const config = resolved.build
 
   const target = flags.target ?? config.mirror?.target

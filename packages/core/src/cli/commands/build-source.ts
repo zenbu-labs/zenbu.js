@@ -117,7 +117,7 @@ export async function runBuildSource(argv: string[]): Promise<void> {
   const projectDir = resolveProjectDir()
   const flags = parseFlags(argv)
 
-  const { resolved } = await loadConfig(projectDir)
+  const { resolved } = await loadConfig(projectDir, { skipLocalPlugins: true })
   const config = { ...resolved.build }
   if (flags.out) config.out = flags.out
 

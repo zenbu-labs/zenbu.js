@@ -357,7 +357,7 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   const flags = parseFlags(argv);
   void flags; // legacy --config flag is currently a no-op; kept for back-compat
 
-  const { resolved } = await loadConfig(projectDir);
+  const { resolved } = await loadConfig(projectDir, { skipLocalPlugins: true });
   const config = resolved.build;
 
   // The mirror is now strictly required: the launcher clones from it on
