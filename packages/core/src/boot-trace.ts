@@ -1,5 +1,5 @@
 /**
- * Boot-trace — always-on, low-overhead startup tracer.
+ * Boot-trace — opt-in, low-overhead startup tracer.
  *
  * Records spans (durations) and marks (points in time) across the main
  * process, with renderer events ingested through `addEvents()` after the
@@ -15,7 +15,7 @@
  *   - the tsx loader worker (different module graph) sees the same buffer
  *   - the user can `globalThis.__zenbu_boot_trace__.flush()` from devtools
  *
- * Silenced with `ZENBU_BOOT_TRACE=0`.
+ * Enabled with `ZENBU_BOOT_TRACE=1`.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -107,7 +107,7 @@ function init(): BootTraceState {
     nextHandleId: 1,
     projectRoot: null,
     flushed: false,
-    enabled: process.env.ZENBU_BOOT_TRACE !== "0",
+    enabled: process.env.ZENBU_BOOT_TRACE === "1",
   };
   slot[SLOT_KEY] = state;
 
