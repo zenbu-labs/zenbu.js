@@ -1,7 +1,9 @@
 import http from "node:http"
 import { randomBytes, timingSafeEqual } from "node:crypto"
+import { performance } from "node:perf_hooks"
 import { WebSocketServer } from "ws"
 import { Service, runtime } from "../runtime"
+import { bootTrace } from "../boot-trace"
 import { createLogger } from "../shared/log"
 
 const log = createLogger("server")
@@ -22,9 +24,32 @@ export class ServerService extends Service.create({ key: "server" }) {
 
   async evaluate() {
     if (!this.server) {
-      this.server = http.createServer()
-      this.wss = new WebSocketServer({ noServer: true })
-      this.server.on("upgrade", (req, socket, head) => {
+      // Adopt the pre-bound server from setup-gate when available. The
+      // bind itself is cheap (<1ms) but its callback is starved if it
+      // has to share the event loop with the default-services import
+      // chain, so setup-gate kicks it off before any of that work runs.
+      const prealloc = (globalThis as unknown as {
+        __zenbu_preallocated_server__?: {
+          server: http.Server
+          wss: WebSocketServer
+          port: number
+        }
+      }).__zenbu_preallocated_server__
+      if (prealloc) {
+        bootTrace.spanSync("server:adopt-prealloc", () => {
+          this.server = prealloc.server
+          this.wss = prealloc.wss
+          this.port = prealloc.port
+        })
+      } else {
+        bootTrace.spanSync("server:createServer", () => {
+          this.server = http.createServer()
+        })
+        bootTrace.spanSync("server:new-WebSocketServer", () => {
+          this.wss = new WebSocketServer({ noServer: true })
+        })
+      }
+      this.server!.on("upgrade", (req, socket, head) => {
         for (const handler of this.upgradeHandlers) {
           if (handler(req, socket, head)) return
         }
@@ -37,12 +62,21 @@ export class ServerService extends Service.create({ key: "server" }) {
           this.wss!.emit("connection", ws, req)
         })
       })
-      this.port = await new Promise<number>((resolve) => {
-        this.server!.listen(0, () => {
-          const addr = this.server!.address()
-          resolve(typeof addr === "object" && addr ? addr.port : 0)
+      if (!prealloc) {
+        this.port = await bootTrace.span("server:listen(0)", () => {
+          const t0 = performance.now()
+          return new Promise<number>((resolve) => {
+            this.server!.listen(0, () => {
+              const tCb = performance.now()
+              bootTrace.mark("server:listen-callback-fired", {
+                latencyMs: +(tCb - t0).toFixed(1),
+              })
+              const addr = this.server!.address()
+              resolve(typeof addr === "object" && addr ? addr.port : 0)
+            })
+          })
         })
-      })
+      }
       log.verbose(`listening on port ${this.port}`)
     }
 

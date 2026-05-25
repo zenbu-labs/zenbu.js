@@ -226,6 +226,42 @@ export function ZenbuProvider({
             ws.close();
           };
 
+          // Forward any buffered boot-trace events the renderer prelude
+          // accumulated before this WS was up. Fire-and-forget — we don't
+          // want a slow ingest to gate first render. The `?.` guards a
+          // disabled/missing tracer.
+          try {
+            const bt = (window as unknown as {
+              __zenbuBootTrace?: {
+                drain: () => unknown[];
+                timeOrigin: number;
+                mark: (name: string, meta?: Record<string, unknown>) => void;
+              };
+            }).__zenbuBootTrace;
+            if (bt) {
+              bt.mark("zenbu-provider-connected");
+              const events = bt.drain();
+              const reporter = (rpc as any)?.core?.bootTrace?.report;
+              if (typeof reporter === "function" && events.length > 0) {
+                void reporter({
+                  events,
+                  timeOrigin: bt.timeOrigin,
+                }).catch(() => {});
+              }
+              // Drain again on next tick to catch FCP / LCP marks that fire
+              // a frame or two after connect.
+              setTimeout(() => {
+                const more = bt.drain();
+                if (more.length > 0 && typeof reporter === "function") {
+                  void reporter({
+                    events: more,
+                    timeOrigin: bt.timeOrigin,
+                  }).catch(() => {});
+                }
+              }, 1200);
+            }
+          } catch {}
+
           setState({
             status: "connected",
             conn: {
@@ -650,6 +686,28 @@ export function View({
       }
     ).core.lastKnownViewRegistry.find((v) => v.type === type)?.url ?? null,
   );
+  const rpc = useRpc() as any;
+
+  // Lazy views start with an empty `url`. Fire `core.viewRegistry.ensure`
+  // to kick off the on-demand Vite server boot — the URL will appear in
+  // `lastKnownViewRegistry` once the server is listening and this hook
+  // will re-render with the real URL. Best-effort; eager views just
+  // hit the early-return path.
+  useEffect(() => {
+    if (url) return;
+    const ensure = rpc?.core?.viewRegistry?.ensure;
+    if (typeof ensure !== "function") return;
+    let cancelled = false;
+    void ensure({ type })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          console.warn(`[zenbu/View] ensure("${type}") failed:`, err);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [type, url, rpc]);
 
   // Snapshot the iframe URL on first commit and never recompute. Changes to
   // `args` after mount go via postMessage — rewriting `src` would reload

@@ -123,6 +123,15 @@ export async function runDev(argv: string[]) {
   // the app and break `app.getAppPath()` semantics inside setup-gate.
   const electronArgs = [projectDir, `--project=${projectDir}`]
 
+  // Allow attaching a CDP debugger (e.g. agent-browser, Chrome devtools)
+  // by exporting `ZENBU_CDP_PORT=9222`. Forwarded as `--remote-debugging-port`
+  // which Electron picks up natively. The port is logged to stdout by
+  // setup-gate once the renderer is ready so agents can grab it.
+  const cdpPort = process.env.ZENBU_CDP_PORT
+  if (cdpPort) {
+    electronArgs.push(`--remote-debugging-port=${cdpPort}`)
+  }
+
   if (detach) {
     const child = spawn(electron, electronArgs, {
       cwd: projectDir,

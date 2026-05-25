@@ -7,6 +7,7 @@ import {
   type AdviceSpec,
   type ContentScriptSpec,
 } from "./services/advice-config";
+import { bootTrace } from "./boot-trace";
 
 /**
  * The synthetic plugin name used for everything that ships inside
@@ -204,20 +205,20 @@ export abstract class Service {
   }
 
   /**
-   * Run `fn` and return its result. Historically reported a boot-trace span;
-   * now a thin wrapper preserved for caller ergonomics inside service
-   * `evaluate()` bodies.
+   * Wrap `fn` in a boot-trace span scoped to this service's key. The
+   * generated span's `parent` is `service:<key>`, so it nests under the
+   * service's row in the flame graph.
    */
   trace<T>(
-    _name: string,
+    name: string,
     fn: () => T | Promise<T>,
-    _meta?: Record<string, unknown>,
+    meta?: Record<string, unknown>,
   ): Promise<T> {
-    return Promise.resolve(fn());
+    return bootTrace.span(name, fn, meta);
   }
 
-  traceSync<T>(_name: string, fn: () => T, _meta?: Record<string, unknown>): T {
-    return fn();
+  traceSync<T>(name: string, fn: () => T, meta?: Record<string, unknown>): T {
+    return bootTrace.spanSync(name, fn, meta);
   }
 
   /** @internal */
@@ -700,7 +701,11 @@ export class ServiceRuntime {
 
     try {
       this.injectCtx(instance, ServiceClass);
-      await instance.evaluate();
+      // Wrap evaluate() in a boot-trace span so each service is one row
+      // in the flame. Top-level `parent` is null which puts it under
+      // whatever main-process phase the runtime was scheduled from
+      // (default-services / plugin-controller-main).
+      await bootTrace.span(`service:${key}`, () => instance.evaluate());
       slot.status = "ready";
     } catch (e) {
       slot.status = "failed";

@@ -127,6 +127,9 @@ async function resolvePluginEntry(
   entry: Plugin | string,
   configDir: string,
 ): Promise<{ resolved: ResolvedPlugin; sourceFile: string | null }> {
+  // Boot-trace via dynamic import to keep this CLI module usable
+  // outside the framework runtime (e.g. tests).
+  const { bootTrace } = await import("../../boot-trace")
   if (typeof entry === "string") {
     const absPath = path.isAbsolute(entry) ? entry : path.resolve(configDir, entry)
     if (!PLUGIN_FILE_RE.test(absPath)) {
@@ -138,7 +141,11 @@ async function resolvePluginEntry(
     if (!fs.existsSync(absPath)) {
       throw new Error(`Plugin entry "${entry}" does not exist at ${absPath}.`)
     }
-    const plugin = await importFresh<Plugin>(absPath)
+    const plugin = await bootTrace.span(
+      `import-plugin:${path.basename(absPath)}`,
+      () => importFresh<Plugin>(absPath),
+      { path: absPath },
+    )
     assertPluginShape(plugin, absPath)
     return {
       resolved: resolvePluginPaths(plugin, path.dirname(absPath)),

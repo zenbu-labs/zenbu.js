@@ -1,3 +1,4 @@
+export { BootTraceService } from "./boot-trace";
 export { ServerService } from "./server";
 export { ReloaderService } from "./reloader";
 export { RendererHostService } from "./renderer-host";

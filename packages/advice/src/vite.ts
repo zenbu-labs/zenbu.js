@@ -1,6 +1,28 @@
 import type { Plugin, TransformResult } from "vite";
+import { performance } from "node:perf_hooks";
 import { transformSync } from "@babel/core";
 import zenbuAdviceTransform from "./transform/index";
+
+/**
+ * Aggregate Babel transform stats per renderer (root path). Surfaced in
+ * the boot-trace flame so we can see how much of each Vite server's
+ * critical path is the advice plugin's Babel pass. We don't import the
+ * core boot-trace here — advice is a separate package and we want to
+ * keep the dependency direction one-way — so we stash on globalThis.
+ */
+type AdviceStat = { files: number; totalMs: number; maxMs: number };
+const STAT_KEY = "__zenbu_advice_stats__";
+function bumpStat(root: string, deltaMs: number): void {
+  const slot = (globalThis as any)[STAT_KEY] ??= new Map<string, AdviceStat>();
+  const s: AdviceStat = slot.get(root) ?? { files: 0, totalMs: 0, maxMs: 0 };
+  s.files++;
+  s.totalMs += deltaMs;
+  if (deltaMs > s.maxMs) s.maxMs = deltaMs;
+  slot.set(root, s);
+}
+export function getAdviceStats(): Map<string, AdviceStat> {
+  return (globalThis as any)[STAT_KEY] ?? new Map();
+}
 
 export interface ZenbuAdvicePluginOptions {
   root?: string;
@@ -43,6 +65,7 @@ export function zenbuAdvicePlugin(
       const parserPlugins: string[] = isTS ? ["typescript"] : [];
       if (/\.(?:jsx|tsx)$/.test(id)) parserPlugins.push("jsx");
 
+      const t0 = performance.now();
       const result = transformSync(code, {
         filename: id,
         plugins: [[zenbuAdviceTransform, { root: resolvedRoot }]],
@@ -52,6 +75,7 @@ export function zenbuAdvicePlugin(
         babelrc: false,
         compact: false,
       });
+      bumpStat(resolvedRoot, performance.now() - t0);
 
       if (!result?.code) return null;
 

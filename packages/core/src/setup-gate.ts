@@ -20,6 +20,7 @@ function registerLoader(specifier: string, opts?: { data?: unknown }) {
 import { pathToFileURL } from "node:url";
 import { register as registerTsx } from "tsx/esm/api";
 import { bootstrapEnv } from "./env-bootstrap";
+import { bootTrace } from "./boot-trace";
 import {
   parseZenbuBgEntries,
   pickZenbuBgEntry,
@@ -376,18 +377,28 @@ async function loadConfigPhase(
   tsconfig: string | false,
   projectRoot: string,
 ): Promise<LoaderData> {
-  registerTsx({ tsconfig });
+  await bootTrace.span("tsx-register", () => {
+    registerTsx({ tsconfig });
+  });
 
-  const { loadConfig } = await import("./cli/lib/load-config");
-  const { resolved, pluginSourceFiles } = await loadConfig(projectRoot);
+  const { loadConfig } = await bootTrace.span(
+    "import:cli/lib/load-config",
+    () => import("./cli/lib/load-config"),
+  );
+  const { resolved, pluginSourceFiles } = await bootTrace.span(
+    "loadConfig",
+    () => loadConfig(projectRoot),
+  );
   // Auto-link: regenerate `<app>/types/*.ts` so `useRpc()` / `useDb()` /
   // `useEvents()` resolve against the freshly-installed plugin set on
   // every launch. Content-addressed writes mean unchanged content is a
   // no-op (no working-tree mtime bumps that would trip the updater's
   // dirty-tree check). Non-fatal: link failures shouldn't block boot.
   try {
-    const { linkProject } = await import("./cli/commands/link");
-    await linkProject(projectRoot, { quiet: true });
+    await bootTrace.span("linkProject", async () => {
+      const { linkProject } = await import("./cli/commands/link");
+      await linkProject(projectRoot, { quiet: true });
+    });
   } catch (err) {
     console.warn(
       `[setup-gate] zen link failed (non-fatal): ${
@@ -430,16 +441,32 @@ async function registerLoadersPhase(
   projectRoot: string,
   loaderData: LoaderData,
 ): Promise<void> {
-  registerLoader(import.meta.resolve("@zenbujs/core/loaders/zenbu"), {
-    data: loaderData,
+  bootTrace.spanSync("register-zenbu-loader", () => {
+    registerLoader(import.meta.resolve("@zenbujs/core/loaders/zenbu"), {
+      data: loaderData,
+    });
   });
 
   process.env.ZENBU_ADVICE_ROOT = projectRoot;
-  await import("@zenbu/advice/node");
+  // Main-process advice has no public API yet — nothing in user code
+  // calls `advise()` against a main-process module today. Registering
+  // the loader anyway costs ~2200ms of blocked event loop on boot
+  // because every user `.ts` file gets parsed by babel inside the loader
+  // worker (whose `Atomics.wait()` pins the main thread). Skip the
+  // import entirely; opt in with `ZENBU_ENABLE_MAIN_ADVICE=1` once the
+  // loader is rewritten on top of swc / a precompiled native binding.
+  if (process.env.ZENBU_ENABLE_MAIN_ADVICE === "1") {
+    await bootTrace.span("register-advice", () => import("@zenbu/advice/node"));
+  } else {
+    bootTrace.mark("register-advice:skipped");
+  }
 
   const requireFromCore = createRequire(import.meta.url);
   const dynohotRegisterPath = requireFromCore.resolve("@zenbujs/hmr/register");
-  const dynohot = await import(pathToFileURL(dynohotRegisterPath).href);
+  const dynohot = await bootTrace.span(
+    "import-dynohot",
+    () => import(pathToFileURL(dynohotRegisterPath).href),
+  );
   if (typeof dynohot.register === "function") {
     // Ignore both `node_modules/` and any `dist/` directory. The latter
     // covers `@zenbujs/core` when it's `link:`'d for development — its
@@ -448,22 +475,43 @@ async function registerLoadersPhase(
     // hot-wrapped via the user's plugin barrel, once non-hot via setup-gate's
     // own dynamic imports), producing two distinct hot module URLs and
     // double-evaluating services like `ServerService`.
-    dynohot.register({ ignore: /[/\\](?:node_modules|dist)[/\\]/ });
+    bootTrace.spanSync("register-dynohot", () => {
+      dynohot.register({ ignore: /[/\\](?:node_modules|dist)[/\\]/ });
+    });
   }
 }
 
 export async function setupGate(): Promise<void> {
   // Always-on minimal startup logging. One line per major completed step
   // with elapsed-since-start, so a scrollback shows where boot time goes
-  // without needing ZENBU_VERBOSE=1.
+  // without needing ZENBU_VERBOSE=1. Mirrored into `bootTrace` for the
+  // unified flame graph.
   const t0 = Date.now();
   const ms = (): string => `+${Date.now() - t0}ms`;
   const step = (label: string): void => {
     console.log(`[zenbu] ${label} (${ms()})`);
+    bootTrace.mark(label.replace(/\s+/g, "-"));
   };
+
+  // Kick off the heavy `import("vite")` IMMEDIATELY — before even waiting
+  // for `app.whenReady()`. Vite's main bundle is ~1.4MB and the top-level
+  // evaluation takes ~1.4s of CPU (parses rollup, esbuild bindings, etc).
+  // Running it here lets that work overlap with Electron's own startup
+  // (electron-ready usually takes 80-200ms but the GPU/network helpers
+  // take longer) and with the splash/loader registration. The cached
+  // module promise is consumed later when `RendererHostService` calls
+  // `createServer` — by then it's already a cache hit.
+  const vitePrewarm = bootTrace.span("prewarm:vite-import", () =>
+    import("vite").then(() => {}).catch(() => {}),
+  );
+  void vitePrewarm;
+  (globalThis as unknown as {
+    __zenbu_vite_prewarm__?: Promise<void>;
+  }).__zenbu_vite_prewarm__ = vitePrewarm;
 
   const app = loadElectronApp();
   await app.whenReady();
+  bootTrace.mark("electron-ready");
   step("electron ready");
   bootstrapEnv();
 
@@ -551,6 +599,10 @@ export async function setupGate(): Promise<void> {
     console.log("[setup-gate] config:", configPath);
   }
 
+  // Anchor the trace to the project so `flush()` can write
+  // `<project>/traces/boot/boot-<ts>.json` at the end of boot.
+  bootTrace.setProjectRoot(projectRoot);
+
   // Pop the splash as early as possible. Only `loadConfig` is needed to
   // know `splashPath`; advice + dynohot registration is deferred until
   // after the window is on screen so the user sees pixels while those
@@ -559,7 +611,9 @@ export async function setupGate(): Promise<void> {
   // WebContentsView for the Vite-served renderer.
   let loaderData: LoaderData;
   try {
-    loaderData = await loadConfigPhase(tsconfig, projectRoot);
+    loaderData = await bootTrace.span("load-config-phase", () =>
+      loadConfigPhase(tsconfig, projectRoot),
+    );
   } catch (err) {
     if (shuttingDown) return;
     throw err;
@@ -573,7 +627,9 @@ export async function setupGate(): Promise<void> {
     // loaded into the renderer process AND the main thread has yielded
     // long enough for AppKit to composite the window. No artificial
     // setImmediate / setTimeout yield needed.
-    await spawnSplashWindow(loaderData.payload.splashPath);
+    await bootTrace.span("spawn-splash", () =>
+      spawnSplashWindow(loaderData.payload.splashPath),
+    );
   } catch (err) {
     if (shuttingDown) return;
     throw err;
@@ -582,7 +638,9 @@ export async function setupGate(): Promise<void> {
   step("splash shown");
 
   try {
-    await registerLoadersPhase(projectRoot, loaderData);
+    await bootTrace.span("register-loaders-phase", () =>
+      registerLoadersPhase(projectRoot, loaderData),
+    );
   } catch (err) {
     if (shuttingDown) return;
     throw err;
@@ -590,19 +648,61 @@ export async function setupGate(): Promise<void> {
   if (shuttingDown) return;
   step("loaders registered");
 
-  try {
-    const { defaultServices } = await import("./services/default");
-    await defaultServices();
-  } catch (err) {
-    if (shuttingDown) return;
-    throw err;
-  }
-  if (shuttingDown) return;
+  // Bind the WS/HTTP server to a port NOW, before the heavy `default-services`
+  // imports queue 100MB of tsx/dynohot/babel work onto the event loop.
+  // `http.Server.listen(0)` returns instantly but its callback is a
+  // queued task — if we let it race against the import chain, the callback
+  // is starved for 1500-2000ms (the listen syscall finishes in <1ms; the
+  // delay is pure JS scheduling). Doing it here keeps the bind on the
+  // critical path but lets it finish before everything else piles up.
+  // ServerService picks up the pre-bound server via globalThis.
+  await bootTrace.span("prealloc-http-server", async () => {
+    const http = await import("node:http");
+    const { WebSocketServer } = await import("ws");
+    const server = http.createServer();
+    const wss = new WebSocketServer({ noServer: true });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, () => {
+        const addr = server.address();
+        resolve(typeof addr === "object" && addr ? addr.port : 0);
+      });
+    });
+    (globalThis as unknown as {
+      __zenbu_preallocated_server__?: {
+        server: import("node:http").Server;
+        wss: import("ws").WebSocketServer;
+        port: number;
+      };
+    }).__zenbu_preallocated_server__ = { server, wss, port };
+  });
 
+  // (Vite prewarm fired earlier, before app.whenReady, so it overlaps
+  // with Electron's own GPU/network helper startup. By now the import
+  // is either resolved or close to it; downstream `import("vite")`
+  // calls inside reloader.ts hit the module cache instantly.)
+
+  // Kick both module-graph loads in parallel. Default-services pulls in
+  // the framework's built-in services (DB, RPC, Vite reloader, etc.) and
+  // `zenbu:plugins` loads the user's plugin barrel — they share no
+  // ordering dependency at the import level (registrations resolve in
+  // topological order at evaluate time, not at import time), so running
+  // them serially put ~600ms of the plugin-barrel transform on the
+  // critical path for no reason. The runtime won't actually start
+  // evaluating any service until both are done because
+  // `runtime.whenIdle()` below waits on every registered slot.
   const url = `zenbu:plugins?config=${encodeURIComponent(configPath)}`;
   let mod: unknown;
   try {
-    mod = await import(url, { with: { hot: "import" } });
+    const [, m] = await Promise.all([
+      bootTrace.span("default-services", async () => {
+        const { defaultServices } = await import("./services/default");
+        await defaultServices();
+      }),
+      bootTrace.span("import:zenbu-plugins", () =>
+        import(url, { with: { hot: "import" } }),
+      ),
+    ]);
+    mod = m;
   } catch (err) {
     if (shuttingDown) return;
     throw err;
@@ -611,7 +711,7 @@ export async function setupGate(): Promise<void> {
   if (isPluginModule(mod)) {
     const controller = mod.default();
     if (isPluginController(controller)) {
-      await controller.main();
+      await bootTrace.span("plugin-controller-main", () => controller.main());
     }
   }
   if (shuttingDown) return;
@@ -620,8 +720,18 @@ export async function setupGate(): Promise<void> {
   const runtime = (
     globalThis as { __zenbu_service_runtime__?: { whenIdle(): Promise<void> } }
   ).__zenbu_service_runtime__;
-  await runtime?.whenIdle();
+  await bootTrace.span("runtime-when-idle", async () => {
+    await runtime?.whenIdle();
+  });
   step("ready");
+
+  // Give the renderer a beat to deliver FCP / first-render marks via the
+  // BootTraceService RPC, then flush the unified flame to stdout + disk.
+  // We don't await this — the timeout will fire whether or not the
+  // renderer connects, and it shouldn't block service idleness.
+  setTimeout(() => {
+    bootTrace.flush({ reason: "ready" });
+  }, 1500).unref();
 
   const autoQuitMs = envMs("ZENBU_AUTO_QUIT_AFTER_IDLE_MS");
   if (autoQuitMs != null) {

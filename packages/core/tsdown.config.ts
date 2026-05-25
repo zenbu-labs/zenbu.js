@@ -16,6 +16,8 @@ export default defineConfig([
       "loaders/zenbu": "src/loaders/zenbu.ts",
       "prelude/theme-listener": "src/prelude/theme-listener.ts",
       "prelude/shortcut-bridge": "src/prelude/shortcut-bridge.ts",
+      "prelude/boot-trace": "src/prelude/boot-trace.ts",
+      "boot-trace": "src/boot-trace.ts",
       "services/index": "src/services/index.ts",
       "services/default": "src/services/default.ts",
       db: "src/db.ts",

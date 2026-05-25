@@ -62,6 +62,14 @@
       "types": "./dist/services/default.d.mts",
       "import": "./dist/services/default.mjs"
     },
+    "./boot-trace": {
+      "types": "./dist/boot-trace.d.mts",
+      "import": "./dist/boot-trace.mjs"
+    },
+    "./prelude/boot-trace": {
+      "types": "./dist/prelude/boot-trace.d.mts",
+      "import": "./dist/prelude/boot-trace.mjs"
+    },
     "./db": {
       "types": "./dist/db.d.mts",
       "import": "./dist/db.mjs"

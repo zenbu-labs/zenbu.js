@@ -20,9 +20,12 @@ export interface ViewMeta {
 
 interface ViewEntry {
   type: string;
+  /** Direct URL once Vite is up. Empty string while still lazy. */
   url: string;
+  /** Listening port once Vite is up. 0 while still lazy. */
   port: number;
   ownsServer: boolean;
+  lazy: boolean;
   meta?: ViewMeta;
 }
 
@@ -40,6 +43,16 @@ export interface RegisterViewSpec {
   root: string;
   configFile?: string | false;
   meta?: ViewMeta;
+  /**
+   * Force the Vite server to start immediately at registration time
+   * instead of on first iframe mount. The default is lazy: every plugin
+   * view's Vite server is created on-demand when the renderer's `<View>`
+   * component asks for its URL. Starting a second Vite server during the
+   * entrypoint's `loadURL` blocks the Node event loop for hundreds of ms
+   * and stalls the main iframe's modules, so eager registration is
+   * essentially never what you want for non-entrypoint views.
+   */
+  eager?: boolean;
 }
 
 /**
@@ -63,31 +76,62 @@ export class ViewRegistryService extends Service.create({
   private manifestIcons = new Map<string, string>();
 
   async register(spec: RegisterViewSpec): Promise<ViewEntry> {
-    const { type, root, configFile, meta } = spec;
-    log.verbose(`register("${type}", root="${root}", config="${configFile}")`);
+    const { type, root, configFile, meta, eager } = spec;
+    log.verbose(
+      `register("${type}", root="${root}", config="${configFile}", eager=${!!eager})`,
+    );
     const existing = this.views.get(type);
-    if (existing) {
-      log.verbose(`"${type}" already exists at ${existing.url}`);
-      return existing;
+    if (existing) return existing;
+
+    if (!eager) {
+      // Default path: declare the spec, defer the Vite startup until the
+      // first `ensure(type)` call.
+      this.ctx.reloader.registerLazy(type, root, configFile);
+      const entry: ViewEntry = {
+        type,
+        url: "",
+        port: 0,
+        ownsServer: true,
+        lazy: true,
+        meta,
+      };
+      this.views.set(type, entry);
+      void this.syncToDb();
+      return entry;
     }
 
-    log.verbose(`creating reloader for "${type}"...`);
-    const reloaderEntry = await this.ctx.reloader.create(
-      type,
-      root,
-      configFile,
-    );
-    log.verbose(`reloader created: ${reloaderEntry.url} (port ${reloaderEntry.port})`);
+    const reloaderEntry = await this.ctx.reloader.create(type, root, configFile);
     const entry: ViewEntry = {
       type,
       url: reloaderEntry.url,
       port: reloaderEntry.port,
       ownsServer: true,
+      lazy: false,
       meta,
     };
     this.views.set(type, entry);
     await this.syncToDb();
     log.verbose(`"${type}" registered at ${entry.url}`);
+    return entry;
+  }
+
+  /**
+   * Materialize a lazy view: start its Vite server if it isn't running
+   * yet, update the stored URL/port, and sync to the DB so the renderer
+   * picks up the real URL. The renderer's `<View>` component calls this
+   * automatically when an iframe is about to mount and finds an empty URL.
+   */
+  async ensure(args: { type: string }): Promise<ViewEntry | undefined> {
+    const { type } = args;
+    const entry = this.views.get(type);
+    if (!entry) return undefined;
+    if (!entry.lazy || entry.url) return entry;
+    const reloaderEntry = await this.ctx.reloader.ensure(type);
+    if (!reloaderEntry) return entry;
+    entry.url = reloaderEntry.url;
+    entry.port = reloaderEntry.port;
+    entry.lazy = false;
+    await this.syncToDb();
     return entry;
   }
 
@@ -107,6 +151,7 @@ export class ViewRegistryService extends Service.create({
       url: `${reloaderEntry.url}${pathPrefix}`,
       port: reloaderEntry.port,
       ownsServer: false,
+      lazy: false,
       meta,
     };
     this.views.set(type, entry);

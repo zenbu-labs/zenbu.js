@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
@@ -29,6 +30,7 @@ const SHORTCUT_BRIDGE_ENTRY = path.resolve(
   HERE,
   "prelude/shortcut-bridge.mjs",
 );
+const BOOT_TRACE_ENTRY = path.resolve(HERE, "prelude/boot-trace.mjs");
 
 /**
  * Virtual import specifiers used by the generated prelude module to pull
@@ -38,6 +40,7 @@ const SHORTCUT_BRIDGE_ENTRY = path.resolve(
  */
 const THEME_LISTENER_SPECIFIER = "@zenbu/core/prelude/theme-listener";
 const SHORTCUT_BRIDGE_SPECIFIER = "@zenbu/core/prelude/shortcut-bridge";
+const BOOT_TRACE_SPECIFIER = "@zenbu/core/prelude/boot-trace";
 
 /**
  * The package directory of `@zenbujs/core` itself. We expose it on the dev
@@ -125,6 +128,54 @@ function parsePreludeId(id: string): { type: string } {
 }
 
 /**
+ * Read + concat the static framework preludes (boot-trace, theme-listener,
+ * shortcut-bridge) so they can be inlined into the iframe's `<head>` as a
+ * single sync `<script>` block. Cached on first read.
+ *
+ * Inlining saves 3-4 separate Vite requests per iframe boot. On cold dev
+ * runs those requests cost ~200-500ms each because Vite has to walk the
+ * file through advice / react / tailwind transforms before serving —
+ * shifting them out of the iframe's critical path reclaims most of the
+ * 700-900ms gap we measured between `did-start-loading` and
+ * `renderer:prelude-start`.
+ */
+let cachedStaticPreludeBody: string | null = null;
+function getStaticPreludeBody(): string {
+  if (cachedStaticPreludeBody !== null) return cachedStaticPreludeBody;
+  const entries = [
+    { path: BOOT_TRACE_ENTRY, exportNames: ["installBootTraceRenderer"] },
+    { path: THEME_LISTENER_ENTRY, exportNames: ["installThemeListener"] },
+    { path: SHORTCUT_BRIDGE_ENTRY, exportNames: ["installShortcutBridge"] },
+  ];
+  const parts: string[] = [];
+  for (const entry of entries) {
+    let code: string;
+    try {
+      code = fs.readFileSync(entry.path, "utf8");
+    } catch {
+      // Built dist files missing — the inline path is best-effort; fall
+      // back by signaling "empty" and let the upstream code add normal
+      // <script src> tags as a fallback (see callers).
+      return (cachedStaticPreludeBody = "");
+    }
+    // Strip the trailing `export { ... }` line. The bundled file is the
+    // tsdown ESM output — always one line of named exports at the end.
+    code = code.replace(/\n\s*export\s*\{[^}]*\}\s*;?\s*$/m, "\n");
+    parts.push(code);
+  }
+  cachedStaticPreludeBody = parts.join("\n");
+  return cachedStaticPreludeBody;
+}
+
+/** Builds the inline `<script>` body that runs the static preludes for a view. */
+function buildInlinePreludeScript(viewType: string): string | null {
+  const body = getStaticPreludeBody();
+  if (!body) return null;
+  const safeType = JSON.stringify(viewType);
+  return `${body}\ninstallBootTraceRenderer(${safeType});\ninstallThemeListener();\ninstallShortcutBridge(${safeType});`;
+}
+
+/**
  * Generates the per-iframe prelude module. Always pulls in the host-theme
  * postMessage listener and the shortcut/focus bridge so plugin views
  * automatically follow the host's theme picker and participate in the
@@ -134,22 +185,19 @@ function parsePreludeId(id: string): { type: string } {
  * `packages/core/src/prelude/`. They're bundled into core's `dist/` by
  * tsdown and resolved here through the virtual specifiers above.
  */
+/**
+ * The dynamic prelude module (advice + content scripts) for a view.
+ * The static framework preludes are inlined separately via
+ * `transformIndexHtml` so this generator only emits the per-view
+ * dynamic bits. When a view has no advice and no content scripts the
+ * caller skips this module entirely.
+ */
 function generateAdvicePreludeCode(
   entries: ViewAdviceEntry[],
-  viewType: string,
+  _viewType: string,
 ): string {
-  const imports: string[] = [
-    `import { installThemeListener } from ${JSON.stringify(
-      THEME_LISTENER_SPECIFIER,
-    )}`,
-    `import { installShortcutBridge } from ${JSON.stringify(
-      SHORTCUT_BRIDGE_SPECIFIER,
-    )}`,
-  ];
-  const calls: string[] = [
-    `installThemeListener()`,
-    `installShortcutBridge(${JSON.stringify(viewType)})`,
-  ];
+  const imports: string[] = [];
+  const calls: string[] = [];
   if (entries.length > 0) {
     imports.push('import { replace, advise } from "@zenbu/advice/runtime"');
     entries.forEach((entry, i) => {
@@ -174,6 +222,7 @@ function generateAdvicePreludeCode(
       }
     });
   }
+  if (imports.length === 0 && calls.length === 0) return "";
   return imports.join("\n") + "\n" + calls.join("\n") + "\n";
 }
 
@@ -226,6 +275,7 @@ export function resolveAdviceRuntime(): Plugin {
       if (source === "@zenbu/advice/runtime") return ADVICE_RUNTIME_ENTRY;
       if (source === THEME_LISTENER_SPECIFIER) return THEME_LISTENER_ENTRY;
       if (source === SHORTCUT_BRIDGE_SPECIFIER) return SHORTCUT_BRIDGE_ENTRY;
+      if (source === BOOT_TRACE_SPECIFIER) return BOOT_TRACE_ENTRY;
       return null;
     },
   };
@@ -256,7 +306,10 @@ export function advicePreludePlugin(): Plugin {
       for (const scriptPath of getContentScripts(type)) {
         code += `import ${JSON.stringify(scriptPath)}\n`;
       }
-      return code || "// no advice or content scripts\n";
+      // When neither advice nor content scripts exist for this view,
+      // emit an empty module — the static preludes are inlined into
+      // the HTML separately so there's nothing to load here.
+      return code || "// empty: static preludes are inlined in HTML\n";
     },
 
     handleHotUpdate({ file, server }) {
@@ -326,10 +379,34 @@ export function advicePreludePlugin(): Plugin {
         });
       }
 
-      // 2. Always inject the prelude module — it carries the
-      //    postMessage listener that keeps the inlined `<style>`
-      //    above in sync with later host theme changes, plus any
-      //    advice / content scripts registered for this view type.
+      // 2. Inline the static framework preludes (boot-trace + theme
+      //    listener + shortcut bridge) as a sync <script> block. This
+      //    avoids 3 separate Vite requests — each of which carried
+      //    200-500ms of cold-transform latency on first-paint — and
+      //    means the renderer's first `boot-trace` mark lands in the
+      //    earliest possible position on the timeline.
+      const inlinePrelude = buildInlinePreludeScript(type);
+      if (inlinePrelude) {
+        tags.push({
+          tag: "script",
+          children: inlinePrelude,
+          injectTo: "head",
+        });
+      } else {
+        // Fallback: dist files missing (shouldn't happen in dev once
+        // `pnpm build` has run once). Use the legacy module-script
+        // path so the listeners still install, just slower.
+        tags.push({
+          tag: "script",
+          attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
+          injectTo: "head",
+        });
+      }
+
+      // 3. The dynamic per-view prelude (advice + content scripts). The
+      //    load() hook above returns an empty module for views with
+      //    neither, but we still inject the tag so HMR can pick up newly
+      //    registered advice without a navigation.
       tags.push({
         tag: "script",
         attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
@@ -387,3 +464,30 @@ export function zenbuVitePlugins(): Plugin[] {
     zenbuAdviceTransform(),
   ];
 }
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function _unused_crawlPreloadPluginDoc(): void {}
+/**
+ * (Disabled.) Walk the iframe entry's transitive import graph at
+ * server start, then splice `<link rel="modulepreload">` tags into
+ * every served index.html.
+ *
+ * Two reasons this didn't work as written:
+ *   1. `transformRequest` on a .ts file returns a transform whose
+ *      `importedModules` set in Vite's module graph includes the .html
+ *      shells of sibling views and other non-module URLs that vite's
+ *      import-analysis pass rejects. Walking the graph caused the
+ *      crawl to call `transformRequest` on .html files which then
+ *      throws "invalid JS syntax" from `vite:import-analysis`.
+ *   2. Even with preload hints emitted, browser-side import
+ *      evaluation is still serial — a child module's evaluator can't
+ *      run until the parent's evaluator finishes. Preload populates
+ *      the *fetch cache* but doesn't shorten the evaluation chain.
+ *      On our app, evaluation — not fetching — is the dominant cost
+ *      because of CSS and large optimizeDeps chunks.
+ *
+ * Keeping the comment here so the next person doesn't try the same
+ * thing without filtering for module-graph URLs that are actually
+ * JS/CSS, and without confirming that browser-side evaluation order
+ * is the bottleneck (vs. fetch order).
+ */

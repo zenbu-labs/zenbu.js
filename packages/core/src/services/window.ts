@@ -20,6 +20,7 @@ import { HttpService } from "./http";
 import { RendererHostService } from "./renderer-host";
 import { createLogger } from "../shared/log";
 import { entrypointBgColor } from "../shared/zenbu-bg";
+import { bootTrace } from "../boot-trace";
 
 const log = createLogger("window");
 
@@ -183,6 +184,21 @@ export class WindowService extends Service.create({
     contextMenu?: false | Parameters<typeof electronContextMenu>[0];
     devtoolsShortcut?: boolean;
   }): Promise<{ windowId: string }> {
+    return bootTrace.span(`openView(${args.type})`, () =>
+      this.openViewImpl(args),
+    );
+  }
+
+  private async openViewImpl(args: {
+    type: string;
+    windowId?: string;
+    query?: Record<string, string | number | boolean | null | undefined>;
+    baseWindow?: BaseWindowConstructorOptions;
+    webContentsView?: WebContentsViewConstructorOptions;
+    backgroundColor?: string;
+    contextMenu?: false | Parameters<typeof electronContextMenu>[0];
+    devtoolsShortcut?: boolean;
+  }): Promise<{ windowId: string }> {
     const entry = this.ctx.viewRegistry.get(args.type);
     if (!entry) throw new Error(`No registered view for type "${args.type}"`);
 
@@ -288,7 +304,72 @@ export class WindowService extends Service.create({
       // match content scripts to URLs).
       type: args.type,
     })}`;
-    await view.webContents.loadURL(url);
+    // Always log the renderer URL on stdout so external tooling
+    // (agent-browser, curl, devtools attach scripts) can pick it up
+    // without grepping debug noise. The CDP port (if any) is logged
+    // alongside so an automation agent can `agent-browser connect <port>`
+    // and immediately know which renderer to drive.
+    const cdpPort = process.env.ZENBU_CDP_PORT;
+    console.log(
+      `[zenbu] renderer-url type=${args.type} url=${url}${
+        cdpPort ? ` cdp=${cdpPort}` : ""
+      }`,
+    );
+    bootTrace.mark(`renderer-url:${args.type}`, { url, cdpPort });
+
+    // Trace each renderer-process milestone so the flame surfaces WHICH
+    // Electron event is actually gating `loadURL` resolution.
+    const evtMark = (name: string) =>
+      bootTrace.mark(`webContents:${args.type}:${name}`);
+    view.webContents.once("did-start-loading", () =>
+      evtMark("did-start-loading"),
+    );
+    view.webContents.once("did-stop-loading", () =>
+      evtMark("did-stop-loading"),
+    );
+    view.webContents.once("dom-ready", () => evtMark("dom-ready"));
+    view.webContents.once("did-finish-load", () =>
+      evtMark("did-finish-load"),
+    );
+    view.webContents.once(
+      "did-frame-finish-load",
+      (_e: unknown, isMainFrame: boolean) =>
+        evtMark(`did-frame-finish-load(main=${isMainFrame})`),
+    );
+    // Resolve on `dom-ready` of the main frame: this fires once per
+    // navigation, *after* the main frame's DOM is parsed, but *before*
+    // the page `load` event waits on every subresource (including nested
+    // <View> iframes loading their own bundles). On cold boot, child
+    // Vite servers may not even be up yet — making the page load event
+    // gate the splash swap stalls first paint by 1-2s for no user-visible
+    // benefit. We let Electron's loadURL keep running in the background
+    // and just don't await it.
+    await bootTrace.span(
+      `openView:loadURL(${args.type})`,
+      () =>
+        new Promise<void>((resolve, reject) => {
+          const onReady = () => {
+            view.webContents.off("did-fail-load", onFail);
+            resolve();
+          };
+          const onFail = (
+            _e: unknown,
+            errCode: number,
+            errDesc: string,
+            _url: string,
+            isMainFrame: boolean,
+          ) => {
+            if (!isMainFrame) return;
+            view.webContents.off("dom-ready", onReady);
+            reject(new Error(`loadURL failed (${errCode}): ${errDesc}`));
+          };
+          view.webContents.once("dom-ready", onReady);
+          view.webContents.on("did-fail-load", onFail);
+          // Kick off the navigation; ignore the full-load promise.
+          view.webContents.loadURL(url).catch(() => {});
+        }),
+      { url },
+    );
 
     this.mounted.set(windowId, {
       windowId,

@@ -3,6 +3,7 @@
 
 import type {
   BaseWindowService,
+  BootTraceService,
   DbService,
   HttpService,
   ReloaderService,
@@ -38,6 +39,7 @@ type ExtractRpcMethods<T> = {
 export type CoreServiceRouter = {
   core: {
     "base-window": ExtractRpcMethods<BaseWindowService>;
+    bootTrace: ExtractRpcMethods<BootTraceService>;
     db: ExtractRpcMethods<DbService>;
     http: ExtractRpcMethods<HttpService>;
     reloader: ExtractRpcMethods<ReloaderService>;

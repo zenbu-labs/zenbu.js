@@ -1,17 +1,44 @@
 /**
- * parallelize? i forgor is it serial no matter what?
+ * Import every default service. Each module's top-level side effect is
+ * `runtime.register(<Class>, import.meta)`; the actual `evaluate()`
+ * lifecycle is driven by `runtime` based on the dependency graph, so
+ * import order doesn't matter for correctness.
+ *
+ * Imports are sequential (not Promise.all). We tried parallelizing and
+ * it made boot SLOWER — the heavy services (DbService import pulls in
+ * parcel-watcher's native module + effect, ReloaderService imports the
+ * whole Vite bundle) compete for CPU and starve the `renderer-host`
+ * warmup that runs immediately after, blowing it up from ~220ms to
+ * ~1400ms. Until the warmup runs off the critical path, serial imports
+ * keep total wall-clock lower.
+ */
+/**
+ * Run every default-service module import in parallel. The runtime's
+ * registration is idempotent and dependency order is enforced by the
+ * topological evaluator, not by import order — so parallel is correct.
+ *
+ * Originally we tried this and saw the renderer-host's Vite warmup
+ * balloon from ~200ms to ~1400ms under CPU contention. That regression
+ * is gone now: `startRendererServer` does `void warmupRendererEntrypoints`
+ * (fire-and-forget), so warmup no longer sits on the critical path and
+ * concurrent imports can take the wall-clock win without paying for it
+ * downstream.
  */
 export async function defaultServices(): Promise<void> {
-  await import("./server");
-  await import("./reloader");
-  await import("./renderer-host");
-  await import("./http");
-  await import("./db");
-  await import("./base-window");
-  await import("./rpc");
-  await import("./view-registry");
-  await import("./window");
-  await import("./advice-config");
-  await import("./updater");
-  await import("./shortcuts");
+  const { bootTrace } = await import("../boot-trace");
+  await Promise.all([
+    bootTrace.span("import:./boot-trace", () => import("./boot-trace")),
+    bootTrace.span("import:./server", () => import("./server")),
+    bootTrace.span("import:./reloader", () => import("./reloader")),
+    bootTrace.span("import:./renderer-host", () => import("./renderer-host")),
+    bootTrace.span("import:./http", () => import("./http")),
+    bootTrace.span("import:./db", () => import("./db")),
+    bootTrace.span("import:./base-window", () => import("./base-window")),
+    bootTrace.span("import:./rpc", () => import("./rpc")),
+    bootTrace.span("import:./view-registry", () => import("./view-registry")),
+    bootTrace.span("import:./window", () => import("./window")),
+    bootTrace.span("import:./advice-config", () => import("./advice-config")),
+    bootTrace.span("import:./updater", () => import("./updater")),
+    bootTrace.span("import:./shortcuts", () => import("./shortcuts")),
+  ]);
 }
