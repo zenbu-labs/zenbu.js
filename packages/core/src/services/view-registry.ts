@@ -12,11 +12,23 @@ const log = createLogger("view-registry");
  * bottom-panel slot, human label). Optional everywhere; views without
  * metadata simply don't appear in the corresponding chrome.
  */
+/**
+ * View metadata is open by design. The framework attaches
+ * meaning to a small set of well-known fields (`kind`, `sidebar`,
+ * `bottomPanel`, `label`) used by built-in chrome (icon picker,
+ * sidebar slot, bottom-panel slot, human label). Everything else
+ * is userland — host applications and plugins are free to attach
+ * their own fields here (sort hints, visibility predicates, etc.)
+ * without coordinating with the framework. Unknown fields
+ * round-trip through `lastKnownViewRegistry` thanks to the schema
+ * being `.passthrough()`.
+ */
 export interface ViewMeta {
   kind?: string;
   sidebar?: boolean;
   bottomPanel?: boolean;
   label?: string;
+  [key: string]: unknown;
 }
 
 /**
@@ -99,7 +111,28 @@ export class ViewRegistryService extends Service.create({
   private views = new Map<string, ViewEntry>();
   private manifestIcons = new Map<string, string>();
 
-  async registerView(spec: RegisterViewSpec): Promise<ViewEntry> {
+  /**
+   * Register a view. Returns a synchronous dispose function;
+   * wrapping the call in `this.setup(...)` ensures unregistration
+   * runs on plugin teardown / hot reload.
+   *
+   * The actual registration work (Vite server start for `root` mode,
+   * db write, prelude wiring) is fire-and-forget under the hood:
+   * callers don't need to `await`. If you need the `ViewEntry`
+   * synchronously, call `registerViewAndAwait` instead.
+   */
+  registerView(spec: RegisterViewSpec): () => void {
+    void this.registerViewAndAwait(spec);
+    return () => {
+      void this.unregisterView(spec.type);
+    };
+  }
+
+  /**
+   * Same as `registerView` but returns the live `ViewEntry`. Use
+   * when callers care about the entry's resolved URL / port (rare).
+   */
+  async registerViewAndAwait(spec: RegisterViewSpec): Promise<ViewEntry> {
     const { type, meta } = spec;
     const existing = this.views.get(type);
     if (existing) return existing;

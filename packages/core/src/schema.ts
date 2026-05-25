@@ -72,6 +72,12 @@ const viewRegistryEntrySchema = zod.object({
    * server, no iframe, args flow as a prop.
    */
   rendering: zod.enum(["iframe", "component"]).optional(),
+  /**
+   * Open by design — see `ViewMeta` in
+   * `services/view-registry.ts`. The framework only attaches
+   * meaning to a handful of well-known fields; everything else is
+   * userland metadata that round-trips through `passthrough()`.
+   */
   meta: zod
     .object({
       kind: zod.string().optional(),
@@ -79,6 +85,7 @@ const viewRegistryEntrySchema = zod.object({
       bottomPanel: zod.boolean().optional(),
       label: zod.string().optional(),
     })
+    .passthrough()
     .optional(),
 });
 
