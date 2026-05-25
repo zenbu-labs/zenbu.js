@@ -17,6 +17,8 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
+  type ComponentType,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type ReactElement,
@@ -119,6 +121,31 @@ export function ZenbuProvider({
   const cleanupRef = useRef<(() => void) | null>(null);
   const retriesRef = useRef(0);
 
+  // Gate iframe view rendering on the first view-args message arriving.
+  // This guarantees `useViewArgs<T>(): T` is non-null at every call site:
+  // children only mount after the parent has delivered args. The
+  // entrypoint view (top-level, no parent) skips the gate — it never
+  // gets args from anyone.
+  const isIframeView =
+    typeof window !== "undefined" &&
+    window.parent !== window &&
+    !!window.__zenbuViewArgs;
+  const [viewArgsReady, setViewArgsReady] = useState<boolean>(
+    () => !isIframeView || !!window.__zenbuViewArgs?.current,
+  );
+  useEffect(() => {
+    if (viewArgsReady) return;
+    const store = window.__zenbuViewArgs;
+    if (!store) return;
+    let cancelled = false;
+    store.ready.then(() => {
+      if (!cancelled) setViewArgsReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewArgsReady]);
+
   useEffect(() => {
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -195,6 +222,61 @@ export function ZenbuProvider({
             disconnectRpc();
             ws.close();
             return;
+          }
+
+          // ----- Stale-prelude reconcile -----
+          //
+          // The per-iframe prelude is generated at first-request
+          // time. If the iframe loads BEFORE the plugin services
+          // that contribute component views or functions finish
+          // evaluating, its prelude misses those registrations.
+          //
+          // `emitReload("*")` notifies *already-connected* clients
+          // to reload, but a brand-new client still in its handshake
+          // when the event fires receives nothing — the RPC system
+          // has no subscriber to deliver to yet. We close that race
+          // hole here: after the replica syncs, compare the db
+          // snapshot of what should be registered against the
+          // in-memory registries the prelude actually populated.
+          // Mismatch → reload once. The fresh prelude registers
+          // everything synchronously before this handler runs the
+          // second time, so the check passes and we don't loop.
+          //
+          // TODO(prelude-version): replace the per-registry diff
+          // with a single `preludeGeneration` integer compared
+          // against `window.__zenbu_preludeGen` baked into the
+          // prelude. Covers advice + content scripts uniformly
+          // (which today rely on the same RPC reload event and have
+          // the same race window).
+          try {
+            // `db` is the kyju client; `readRoot()` lives on it.
+            const root = (db as unknown as { readRoot: () => unknown }).readRoot();
+            const core = (root as { core?: unknown } | undefined)?.core as
+              | {
+                  lastKnownFunctionRegistry?: Array<{ name: string }>;
+                  lastKnownViewRegistry?: Array<{ type: string; rendering?: string }>;
+                }
+              | undefined;
+            const dbFns = core?.lastKnownFunctionRegistry ?? [];
+            const dbComponentViews = (core?.lastKnownViewRegistry ?? []).filter(
+              (v) => v.rendering === "component",
+            );
+            const missingFn = dbFns.filter((f) => !functionRegistry.has(f.name));
+            const missingView = dbComponentViews.filter(
+              (v) => !viewComponentRegistry.has(v.type),
+            );
+            if (missingFn.length > 0 || missingView.length > 0) {
+              await disconnectDb();
+              disconnectRpc();
+              ws.close();
+              location.reload();
+              return;
+            }
+          } catch (err) {
+            // Reconcile is best-effort. A failure here just falls
+            // through to the live reload-event subscription below.
+            // eslint-disable-next-line no-console
+            console.warn("[zenbu/react] reconcile check failed:", err);
           }
 
           // View type is encoded in the URL by `WindowService.openView`. It
@@ -320,6 +402,18 @@ export function ZenbuProvider({
     return createElement(
       "span",
       { "data-zenbu-connecting": true },
+      fallback ?? null,
+    );
+  }
+  if (!viewArgsReady) {
+    // Connected but args haven't landed yet. In practice this window is
+    // sub-millisecond — the child posts `zenbu:view-ready` from the
+    // inline prelude and the parent replies synchronously. Rendering
+    // `fallback` keeps the visual story consistent with the connecting
+    // state for the rare case it stretches.
+    return createElement(
+      "span",
+      { "data-zenbu-view-args-pending": true },
       fallback ?? null,
     );
   }
@@ -526,7 +620,301 @@ export function useFocusContext(_id: string | string[]) {
   return { ref, active, focus };
 }
 
-// ---- <View>: child-iframe primitive ----
+// ---- Component view registry (client-side) ----
+
+/**
+ * Props received by a component-mode view. `args` mirrors what the
+ * caller passed to `<View args=...>` (or `{}` when nothing was passed).
+ *
+ * The shape is intentionally minimal: anything more elaborate (per-view
+ * metadata, slot info, etc.) lives in the server-side `ViewRegistryService`
+ * and is read out via `useDb` from `core.lastKnownViewRegistry` if the
+ * component cares.
+ */
+export type ViewComponentProps<
+  A extends Record<string, unknown> = Record<string, unknown>,
+> = {
+  args: A;
+};
+
+export type ViewComponent<
+  A extends Record<string, unknown> = Record<string, unknown>,
+> = ComponentType<ViewComponentProps<A>>;
+
+/**
+ * In-process registry of React components keyed by view `type`. Used by
+ * `<View>` when the server-side registry reports `rendering: "component"`.
+ *
+ * This is a plain client-side store — entries do not need to round-trip
+ * to the server. The server-side `ViewRegistryService.register({ type,
+ * rendering: "component", meta })` advertises the slot (icon, sidebar,
+ * label, focus integration); the component itself is pushed here from
+ * user-land at runtime.
+ */
+const viewComponentRegistry = new Map<string, ViewComponent<any>>();
+const viewComponentListeners = new Set<() => void>();
+
+function emitViewComponentChange() {
+  for (const cb of viewComponentListeners) {
+    try {
+      cb();
+    } catch {}
+  }
+}
+
+/**
+ * Register a React component to render for `<View type={type}>` when the
+ * server-side registry has the view in `"component"` rendering mode.
+ *
+ * Returns an unregister function. If a different component is already
+ * registered under `type`, it is replaced (last writer wins) so HMR and
+ * re-renders of the registering tree behave naturally.
+ */
+export function registerViewComponent<
+  A extends Record<string, unknown> = Record<string, unknown>,
+>(type: string, Component: ViewComponent<A>): () => void {
+  viewComponentRegistry.set(type, Component as ViewComponent<any>);
+  emitViewComponentChange();
+  return () => {
+    // Only clear if we still own the slot — prevents a stale unmount
+    // from blowing away a replacement registered after us.
+    if (viewComponentRegistry.get(type) === (Component as ViewComponent<any>)) {
+      viewComponentRegistry.delete(type);
+      emitViewComponentChange();
+    }
+  };
+}
+
+export function getViewComponent(type: string): ViewComponent<any> | undefined {
+  return viewComponentRegistry.get(type);
+}
+
+function subscribeViewComponents(cb: () => void) {
+  viewComponentListeners.add(cb);
+  return () => {
+    viewComponentListeners.delete(cb);
+  };
+}
+
+function useViewComponent(type: string): ViewComponent<any> | undefined {
+  return useSyncExternalStore(
+    subscribeViewComponents,
+    () => viewComponentRegistry.get(type),
+    () => viewComponentRegistry.get(type),
+  );
+}
+
+/**
+ * Convenience hook: register `Component` for `type` while the calling
+ * component is mounted. Designed as the primitive for the "sentinel"
+ * pattern — mount a tiny component anywhere in your tree that pushes
+ * itself into the registry, optionally with advice applied. Unmounting
+ * the sentinel unregisters.
+ */
+export function useRegisterViewComponent<
+  A extends Record<string, unknown> = Record<string, unknown>,
+>(type: string, Component: ViewComponent<A>): void {
+  useEffect(() => {
+    return registerViewComponent<A>(type, Component);
+  }, [type, Component]);
+}
+
+// ---- Function registry (client-side) ----
+
+/**
+ * Opaque metadata attached to a registered function. Mirrors
+ * `FunctionMeta` on the server side; consumers (`useFunctions`) can
+ * filter by any field they care about — `kind` is the conventional
+ * one (e.g. `kind: "cm.completion"`).
+ */
+export type FunctionMeta = Record<string, unknown> & {
+  kind?: string;
+  label?: string;
+};
+
+export type AnyFn = (...args: any[]) => any;
+
+/**
+ * What the registry actually stores. In practice this is usually a
+ * function, but registered values can be anything serializable from a
+ * module — e.g. a CodeMirror `Extension` (which is a value, not a
+ * function). The generic on the hooks defaults to `AnyFn` for ergonomics
+ * but you can pass any type at the call site (`useFunctions<Extension>(...)`).
+ */
+export type RegistryValue = unknown;
+
+export interface FunctionRegistryEntry<F = AnyFn> {
+  name: string;
+  fn: F;
+  meta?: FunctionMeta;
+}
+
+/**
+ * In-process registry of functions keyed by `name`. Populated either
+ * by the prelude (for service-declared source-file functions) or by
+ * `registerFunction` / `useRegisterFunction` at runtime (for
+ * React-scoped closures). Read via `useFunction` / `useFunctions`.
+ *
+ * Last-writer-wins: if both a service-declared and a React-declared
+ * function share a name, whichever registered most recently is the
+ * one consumers see. Same churn rule as the component-view registry.
+ */
+const functionRegistry = new Map<string, FunctionRegistryEntry<unknown>>();
+const functionRegistryListeners = new Set<() => void>();
+
+function emitFunctionRegistryChange() {
+  for (const cb of functionRegistryListeners) {
+    try {
+      cb();
+    } catch {}
+  }
+}
+
+/**
+ * Imperatively register a function under `name`. Returns an unregister
+ * function. If `name` is already taken, the previous entry is replaced.
+ *
+ * Identity matters — calling this with a *new* function reference on
+ * every render churns the registry and forces consumers to re-read.
+ * Wrap closures in `useCallback` / `useMemo`, or use
+ * `useRegisterFunction` which does the right thing automatically.
+ */
+export function registerFunction<F = AnyFn>(
+  name: string,
+  fn: F,
+  meta?: FunctionMeta,
+): () => void {
+  const entry: FunctionRegistryEntry<unknown> = { name, fn, meta };
+  functionRegistry.set(name, entry);
+  emitFunctionRegistryChange();
+  return () => {
+    // Only clear if we still own the slot — keep the latest
+    // registration intact when a stale dispose fires after a
+    // replacement.
+    if (functionRegistry.get(name) === entry) {
+      functionRegistry.delete(name);
+      emitFunctionRegistryChange();
+    }
+  };
+}
+
+function subscribeFunctionRegistry(cb: () => void) {
+  functionRegistryListeners.add(cb);
+  return () => {
+    functionRegistryListeners.delete(cb);
+  };
+}
+
+/**
+ * Convenience hook: register `fn` for `name` while the calling
+ * component is mounted. Re-registers when `fn` identity or `name`
+ * changes; unregisters on unmount.
+ *
+ * Wrap your function in `useCallback` so dependencies decide when
+ * to re-register — otherwise you'll churn the registry every render.
+ */
+export function useRegisterFunction<F = AnyFn>(
+  name: string,
+  fn: F,
+  meta?: FunctionMeta,
+): void {
+  // Stringify meta for the effect deps so callers don't need to
+  // memoize the meta object themselves. Cheap because meta is small.
+  const metaKey = useMemo(
+    () => (meta === undefined ? "" : JSON.stringify(meta)),
+    [meta],
+  );
+  useEffect(() => {
+    return registerFunction(name, fn, meta);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name, fn, metaKey]);
+}
+
+/**
+ * Read one registered function by `name`. Reactive: re-renders when
+ * the entry is added, replaced, or removed.
+ */
+export function useFunction<F = AnyFn>(name: string): F | undefined {
+  return useSyncExternalStore(
+    subscribeFunctionRegistry,
+    () => functionRegistry.get(name)?.fn as F | undefined,
+    () => functionRegistry.get(name)?.fn as F | undefined,
+  );
+}
+
+export type FunctionsFilter =
+  | { kind?: string; [k: string]: unknown }
+  | ((entry: FunctionRegistryEntry) => boolean);
+
+function matchesFilter(
+  entry: FunctionRegistryEntry<unknown>,
+  filter: FunctionsFilter | undefined,
+): boolean {
+  if (filter === undefined) return true;
+  if (typeof filter === "function") return filter(entry as FunctionRegistryEntry);
+  const meta = entry.meta ?? {};
+  for (const [k, v] of Object.entries(filter)) {
+    if ((meta as Record<string, unknown>)[k] !== v) return false;
+  }
+  return true;
+}
+
+/**
+ * Read every registered function, optionally filtered by `meta`
+ * fields or a predicate. Reactive: re-renders when the registry
+ * changes (entries added/removed/replaced). The returned array is a
+ * fresh reference on every change — stable across renders that
+ * don't affect the registry.
+ *
+ *   useFunctions()                          → all entries
+ *   useFunctions({ kind: "cm.completion" }) → entries whose meta.kind === "cm.completion"
+ *   useFunctions((e) => e.name.startsWith("git."))
+ */
+export function useFunctions<F = AnyFn>(
+  filter?: FunctionsFilter,
+): Array<FunctionRegistryEntry<F>> {
+  // Hold the same snapshot reference across reads that produce an
+  // equal result. `useSyncExternalStore` requires a stable snapshot
+  // identity for skipping re-renders.
+  const lastSnapshotRef = useRef<Array<FunctionRegistryEntry<F>>>([]);
+  const lastKeyRef = useRef<string>("");
+
+  const getSnapshot = () => {
+    const matches: Array<FunctionRegistryEntry<F>> = [];
+    for (const entry of functionRegistry.values()) {
+      if (matchesFilter(entry, filter)) {
+        matches.push(entry as FunctionRegistryEntry<F>);
+      }
+    }
+    // Cheap structural key — names + fn identity ordering. If both
+    // are identical to last call, return the cached array so
+    // downstream `useMemo` / effect deps don't churn.
+    const key = matches.map((m) => m.name).join("\u0000");
+    if (key === lastKeyRef.current && matches.length === lastSnapshotRef.current.length) {
+      // Identity check on each fn so a replacement of the same name
+      // still produces a fresh snapshot.
+      let same = true;
+      for (let i = 0; i < matches.length; i++) {
+        if (matches[i]!.fn !== lastSnapshotRef.current[i]!.fn) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return lastSnapshotRef.current;
+    }
+    lastKeyRef.current = key;
+    lastSnapshotRef.current = matches;
+    return matches;
+  };
+
+  return useSyncExternalStore(
+    subscribeFunctionRegistry,
+    getSnapshot,
+    getSnapshot,
+  );
+}
+
+// ---- <View>: iframe-or-component primitive ----
 
 /**
  * Mounts a registered view (separate Vite root, registered via
@@ -540,13 +928,18 @@ export function useFocusContext(_id: string | string[]) {
  *    *never updated*. Toggling `visible` only flips `style.display` —
  *    state inside the child (sockets, ghostty terminals, etc.) survives
  *    visibility changes.
- * 3. **Initial args via URL.** `args` is encoded as base64 JSON in
- *    `?args=` on first paint so the child can render without waiting on
- *    a postMessage handshake. Use `useViewArgs<T>()` inside the child
- *    to read.
- * 4. **Reactive args via postMessage.** When `args` changes after mount,
- *    we send `{ kind: "zenbu:view-args", args }` to the iframe's
- *    `contentWindow`. URL is *not* rewritten (iframe stays alive).
+ * 3. **Args via postMessage handshake.** Args are *never* serialized into
+ *    the iframe URL — they can be arbitrarily large and would blow past
+ *    URL length limits and pollute devtools. Instead, the child's inline
+ *    prelude (`installViewArgsListener`) installs a `message` listener
+ *    synchronously in `<head>` and posts `{ kind: "zenbu:view-ready" }`
+ *    to its parent. This `<View>` listens for that ping and replies with
+ *    `{ kind: "zenbu:view-args", args }`. The handshake guarantees the
+ *    first args message can't be dropped: the child only announces
+ *    readiness after its listener is attached.
+ * 4. **Reactive updates via postMessage.** When `args` changes after
+ *    mount, we re-post `{ kind: "zenbu:view-args", args }`. URL is
+ *    never rewritten (iframe stays alive).
  *
  * Child sessions die on unmount. There is no cache: if the consumer
  * unmounts the `<View>` element, any state inside it (e.g. PTY sockets)
@@ -568,7 +961,7 @@ export type ViewProps = {
 };
 
 const VIEW_ARGS_MESSAGE_KIND = "zenbu:view-args";
-const VIEW_ARGS_PARAM_LIMIT = 1500;
+const VIEW_READY_MESSAGE_KIND = "zenbu:view-ready";
 const VIEW_THEME_MESSAGE_KIND = "zenbu:view-theme";
 
 /**
@@ -604,39 +997,57 @@ const HOST_THEME_TOKENS: readonly string[] = [
   "--radius",
 ];
 
-function encodeViewArgs(args: Record<string, unknown> | undefined): string | null {
-  if (!args) return null;
-  try {
-    return btoa(unescape(encodeURIComponent(JSON.stringify(args))));
-  } catch (err) {
-    console.warn("[zenbu/View] failed to encode args:", err);
-    return null;
-  }
-}
+const VIEW_BACKGROUND_TOKEN = "--zenbu-view-background";
+const VIEW_FOREGROUND_TOKEN = "--zenbu-view-foreground";
+const VIEW_COLOR_SCHEME_TOKEN = "--zenbu-view-color-scheme";
 
-function decodeViewArgs<T>(encoded: string | null): T {
-  if (!encoded) return {} as T;
-  try {
-    return JSON.parse(decodeURIComponent(escape(atob(encoded)))) as T;
-  } catch (err) {
-    console.warn("[zenbu/View] failed to decode args:", err);
-    return {} as T;
-  }
-}
 
 /**
  * Read the configured set of host theme tokens off `:root`. Empty
  * strings are skipped — lets the host omit individual vars without
  * having to define every shadcn slot.
  */
+function isTransparentColor(value: string): boolean {
+  return (
+    value === "transparent" ||
+    value === "rgba(0, 0, 0, 0)" ||
+    value === "rgba(0,0,0,0)"
+  );
+}
+
+function inferColorScheme(rootStyle: CSSStyleDeclaration): "light" | "dark" {
+  const declared = rootStyle.colorScheme;
+  if (declared.split(/\s+/).includes("dark")) return "dark";
+  if (declared.split(/\s+/).includes("light")) return "light";
+  if (document.documentElement.classList.contains("dark")) return "dark";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 function readHostTheme(): Record<string, string> {
   if (typeof document === "undefined") return {};
-  const style = getComputedStyle(document.documentElement);
+  const rootStyle = getComputedStyle(document.documentElement);
+  const bodyStyle = document.body ? getComputedStyle(document.body) : rootStyle;
   const tokens: Record<string, string> = {};
   for (const name of HOST_THEME_TOKENS) {
-    const value = style.getPropertyValue(name).trim();
+    const value = rootStyle.getPropertyValue(name).trim();
     if (value) tokens[name] = value;
   }
+
+  const tokenBackground = tokens["--background"];
+  const bodyBackground = bodyStyle.backgroundColor.trim();
+  const rootBackground = rootStyle.backgroundColor.trim();
+  const background = tokenBackground
+    || (!isTransparentColor(bodyBackground)
+      ? bodyBackground
+      : !isTransparentColor(rootBackground)
+        ? rootBackground
+        : undefined);
+  if (background) tokens[VIEW_BACKGROUND_TOKEN] = background;
+
+  const foreground = tokens["--foreground"] || bodyStyle.color.trim() || rootStyle.color.trim();
+  if (foreground) tokens[VIEW_FOREGROUND_TOKEN] = foreground;
+  tokens[VIEW_COLOR_SCHEME_TOKEN] = inferColorScheme(rootStyle);
+
   return tokens;
 }
 
@@ -650,10 +1061,30 @@ function encodeViewTheme(tokens: Record<string, string>): string | null {
   }
 }
 
+function buildViewThemeCss(tokens: Record<string, string>): string {
+  const root =
+    ":root:root{" +
+    Object.keys(tokens)
+      .map((k) => `${k}:${tokens[k]}`)
+      .join(";") +
+    "}";
+  const background = `var(${VIEW_BACKGROUND_TOKEN}, var(--background, Canvas))`;
+  const foreground = `var(${VIEW_FOREGROUND_TOKEN}, var(--foreground, CanvasText))`;
+  const colorScheme = `var(${VIEW_COLOR_SCHEME_TOKEN}, normal)`;
+  return (
+    root +
+    `html,body,#root{width:100%;height:100%;background:${background};color:${foreground};color-scheme:${colorScheme}}` +
+    "body{margin:0}"
+  );
+}
+
+function buildPendingViewSrcDoc(tokens: Record<string, string>): string {
+  return `<!doctype html><html><head><style>${buildViewThemeCss(tokens)}</style></head><body><div id="root"></div></body></html>`;
+}
+
 function buildViewUrl(
   baseUrl: string,
   type: string,
-  encodedArgs: string | null,
   encodedTheme: string | null,
 ): string {
   const trimmed = baseUrl.replace(/\/$/, "");
@@ -664,7 +1095,8 @@ function buildViewUrl(
   if (wsPort) params.set("wsPort", wsPort);
   if (wsToken) params.set("wsToken", wsToken);
   params.set("type", type);
-  if (encodedArgs) params.set("args", encodedArgs);
+  // NOTE: args intentionally NOT included — they go over postMessage so
+  // arbitrarily large payloads can't blow past URL length limits.
   if (encodedTheme) params.set("theme", encodedTheme);
   return `${trimmed}/?${params.toString()}`;
 }
@@ -687,14 +1119,69 @@ export function View({
   fallback = null,
 }: ViewProps): ReactElement {
   // The view registry is replicated to the renderer via the core db slice.
-  const url = useDb((root) =>
+  // We read both the URL (iframe mode) and the rendering kind in one
+  // selector so the component branch doesn't have to wait on a separate
+  // round trip.
+  const entry = useDb((root) =>
     (
       root as unknown as {
-        core: { lastKnownViewRegistry: Array<{ type: string; url: string }> };
+        core: {
+          lastKnownViewRegistry: Array<{
+            type: string;
+            url: string;
+            rendering?: "iframe" | "component";
+          }>;
+        };
       }
-    ).core.lastKnownViewRegistry.find((v) => v.type === type)?.url ?? null,
+    ).core.lastKnownViewRegistry.find((v) => v.type === type) ?? null,
   );
-  const rpc = useRpc() as any;
+  const rendering = entry?.rendering ?? "iframe";
+  const url = entry?.url ?? null;
+  const ComponentImpl = useViewComponent(type);
+
+  if (rendering === "component") {
+    // Component views bypass the iframe pipeline entirely: no Vite, no
+    // theme forwarding (we share the host's CSS scope), no postMessage
+    // bridge. We still honor `visible` so callers can flip a component
+    // view in/out the same way they can an iframe view.
+    if (!ComponentImpl) {
+      return createElement(
+        "span",
+        {
+          "data-zenbu-view-pending": type,
+          style: {
+            display: visible ? style?.display ?? "contents" : "none",
+            ...style,
+          },
+          className,
+        },
+        fallback,
+      );
+    }
+    const wrapperStyle: CSSProperties = {
+      ...style,
+      display: visible ? style?.display ?? "contents" : "none",
+    };
+    return createElement(
+      "div",
+      {
+        className,
+        style: wrapperStyle,
+        "data-zenbu-view": type,
+        "data-zenbu-view-rendering": "component",
+      },
+      createElement(ComponentImpl, { args: args ?? {} }),
+    );
+  }
+
+  const rpc = useRpc() as {
+    core?: {
+      viewRegistry?: {
+        ensure?: (args: { type: string }) => Promise<unknown>;
+      };
+    };
+  };
+  // (iframe-mode path below)
 
   // Lazy views start with an empty `url`. Fire `core.viewRegistry.ensure`
   // to kick off the on-demand Vite server boot — the URL will appear in
@@ -722,48 +1209,64 @@ export function View({
   // the iframe and trash any in-flight state.
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const initialUrlRef = useRef<string | null>(null);
-  const lastArgsRef = useRef<string | null>(null);
   const lastThemeRef = useRef<Record<string, string> | null>(null);
   const loadedRef = useRef(false);
+  // Always-current args reference so the `view-ready` handshake and the
+  // args-change effect both post the freshest value. React closures over
+  // `args` would otherwise risk responding to a ready ping with a stale
+  // snapshot if the parent re-rendered before the child finished loading.
+  const argsRef = useRef<Record<string, unknown>>(args ?? {});
+  argsRef.current = args ?? {};
 
   if (initialUrlRef.current === null && url) {
-    const encodedArgs = encodeViewArgs(args);
-    if (encodedArgs && encodedArgs.length > VIEW_ARGS_PARAM_LIMIT) {
-      console.warn(
-        `[zenbu/View] args for "${type}" exceed ${VIEW_ARGS_PARAM_LIMIT} chars in URL — consider postMessage-only updates.`,
-      );
-    }
     const theme = readHostTheme();
     const encodedTheme = encodeViewTheme(theme);
-    lastArgsRef.current = encodedArgs;
     lastThemeRef.current = theme;
-    initialUrlRef.current = buildViewUrl(url, type, encodedArgs, encodedTheme);
+    initialUrlRef.current = buildViewUrl(url, type, encodedTheme);
   }
 
+  // Respond to the child's `zenbu:view-ready` ping with the current args.
+  // The child's prelude installs its listener synchronously at HTML parse
+  // time and pings us before any user code runs, so this handshake races
+  // ahead of `useViewArgs` mounting in the child and the first message is
+  // never dropped.
   useEffect(() => {
-    if (!iframeRef.current) return;
-    const encoded = encodeViewArgs(args);
-    if (shallowJSONEqual(encoded, lastArgsRef.current)) return;
-    lastArgsRef.current = encoded;
-
-    const send = () => {
-      iframeRef.current?.contentWindow?.postMessage(
-        { kind: VIEW_ARGS_MESSAGE_KIND, args: args ?? {} },
+    const handler = (event: MessageEvent) => {
+      const iframe = iframeRef.current;
+      if (!iframe) return;
+      if (event.source !== iframe.contentWindow) return;
+      const data = event.data as { kind?: string } | null;
+      if (!data || data.kind !== VIEW_READY_MESSAGE_KIND) return;
+      iframe.contentWindow?.postMessage(
+        { kind: VIEW_ARGS_MESSAGE_KIND, args: argsRef.current },
         "*",
       );
     };
-    if (loadedRef.current) {
-      send();
-    } else {
-      // Will fire from the iframe's onLoad below.
-      const iframe = iframeRef.current;
-      const onceLoaded = () => {
-        send();
-        iframe.removeEventListener("load", onceLoaded);
-      };
-      iframe.addEventListener("load", onceLoaded);
-      return () => iframe.removeEventListener("load", onceLoaded);
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  // Push reactive updates whenever args change post-mount. Before the
+  // iframe has loaded, the ready handshake above will deliver the latest
+  // `argsRef.current` once the child pings us, so we don't need a
+  // separate `load`-event branch here.
+  const lastArgsJsonRef = useRef<string | null>(null);
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    if (!loadedRef.current) return;
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(args ?? {});
+    } catch {
+      serialized = "";
     }
+    if (serialized === lastArgsJsonRef.current) return;
+    lastArgsJsonRef.current = serialized;
+    iframe.contentWindow?.postMessage(
+      { kind: VIEW_ARGS_MESSAGE_KIND, args: args ?? {} },
+      "*",
+    );
   }, [args]);
 
   // Track host theme changes and push them into the iframe so plugin
@@ -808,19 +1311,39 @@ export function View({
     };
   }, []);
 
+  if (lastThemeRef.current === null) {
+    lastThemeRef.current = readHostTheme();
+  }
+
+  const frameBackground = lastThemeRef.current?.[VIEW_BACKGROUND_TOKEN];
+  const frameColorScheme = lastThemeRef.current?.[VIEW_COLOR_SCHEME_TOKEN];
+  const frameStyle: CSSProperties = {
+    border: "none",
+    backgroundColor: frameBackground,
+    colorScheme:
+      frameColorScheme === "dark" || frameColorScheme === "light"
+        ? frameColorScheme
+        : undefined,
+    ...style,
+    display: visible ? style?.display ?? "block" : "none",
+  };
+
   if (!initialUrlRef.current) {
-    return createElement(
-      "span",
-      { "data-zenbu-view-pending": type },
-      fallback,
-    );
+    return createElement("iframe", {
+      ref: iframeRef,
+      srcDoc: buildPendingViewSrcDoc(lastThemeRef.current),
+      className,
+      style: frameStyle,
+      "data-zenbu-view-pending": type,
+      "aria-label": typeof fallback === "string" ? fallback : `Loading ${type}`,
+    });
   }
 
   return createElement("iframe", {
     ref: iframeRef,
     src: initialUrlRef.current,
     className,
-    style: { border: "none", ...style, display: visible ? style?.display ?? "block" : "none" },
+    style: frameStyle,
     onLoad: () => {
       loadedRef.current = true;
       onLoad?.();
@@ -830,28 +1353,39 @@ export function View({
 
 /**
  * Read the current view args inside a child iframe rendered by `<View>`.
- * Initial value comes from `?args=` in the iframe's URL; updates arrive
- * via `postMessage` and re-render this hook's caller.
+ *
+ * Args arrive entirely over `postMessage` — see the `<View>` doc-block
+ * for the handshake. The early `installViewArgsListener` prelude
+ * captures messages before any user code runs and stores them on
+ * `window.__zenbuViewArgs`. `<ZenbuProvider>` gates rendering on the
+ * first args message arriving, so by the time any component calls this
+ * hook the global is guaranteed to be populated. That means the return
+ * type is non-null and the consumer never has to handle a loading state.
  */
 export function useViewArgs<T extends Record<string, unknown>>(): T {
+  const store =
+    typeof window !== "undefined" ? window.__zenbuViewArgs : undefined;
+
   const [args, setArgs] = useState<T>(() => {
-    const params = new URLSearchParams(
-      typeof window !== "undefined" ? window.location.search : "",
-    );
-    return decodeViewArgs<T>(params.get("args"));
+    return (store?.current ?? ({} as Record<string, unknown>)) as T;
   });
 
   useEffect(() => {
-    const handler = (event: MessageEvent) => {
-      if (event.source !== window.parent) return;
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      if ((data as { kind?: string }).kind !== VIEW_ARGS_MESSAGE_KIND) return;
-      const next = (data as { args?: T }).args;
-      if (next && typeof next === "object") setArgs(next);
+    if (!store) return;
+    // Catch the case where args arrived between our state initializer
+    // and the subscription below (shouldn't happen if ZenbuProvider
+    // gates correctly, but cheap to guard).
+    if (store.current && store.current !== (args as unknown)) {
+      setArgs(store.current as T);
+    }
+    const listener = (next: Record<string, unknown>) => {
+      setArgs(next as T);
     };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
+    store.listeners.add(listener);
+    return () => {
+      store.listeners.delete(listener);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return args;

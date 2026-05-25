@@ -177,6 +177,63 @@ describe("runtime: advise", () => {
     expect(fn()).toBe("intercepted")
   })
 
+  it("around: passes a stable `next` identity across calls (React-Refresh-safe)", () => {
+    // Regression: the previous implementation rebuilt the closure
+    // stack on every invocation, so `next` was a fresh function
+    // identity each call. For around-advice on React components that
+    // caused React to unmount + remount the advised subtree on every
+    // parent re-render (every keystroke against a CodeMirror Composer
+    // rebuilt the EditorView). The chain is now memoized per entry.
+    const seen: Function[] = []
+    __def("m", "fn", () => 0)
+    const fn = __ref("m", "fn") as () => number
+    advise("m", "fn", "around", (next: Function) => {
+      seen.push(next)
+      return next()
+    })
+    fn(); fn(); fn()
+    expect(seen).toHaveLength(3)
+    expect(seen[0]).toBe(seen[1])
+    expect(seen[1]).toBe(seen[2])
+  })
+
+  it("around: `next` identity stays stable across impl swaps (HMR)", () => {
+    // impl/replacement changes must NOT bust the chain identity —
+    // the chain reads them live via entry.replacement ?? entry.impl.
+    const seen: Function[] = []
+    __def("m", "fn", () => "v1")
+    const fn = __ref("m", "fn") as () => string
+    advise("m", "fn", "around", (next: Function) => {
+      seen.push(next)
+      return next()
+    })
+    expect(fn()).toBe("v1")
+    __def("m", "fn", () => "v2")
+    expect(fn()).toBe("v2")
+    replace("m", "fn", () => "r1")
+    expect(fn()).toBe("r1")
+    unreplace("m", "fn")
+    expect(fn()).toBe("v2")
+    expect(seen).toHaveLength(4)
+    expect(new Set(seen).size).toBe(1)
+  })
+
+  it("around: `next` identity changes when advice is added or removed", () => {
+    // Structural advice changes MUST invalidate the cache, otherwise
+    // a newly added before/after/around would never participate.
+    const seen: Function[] = []
+    __def("m", "fn", () => 0)
+    const fn = __ref("m", "fn") as () => number
+    advise("m", "fn", "around", (next: Function) => { seen.push(next); return next() })
+    fn()
+    const remove = advise("m", "fn", "before", () => {})
+    fn()
+    expect(seen[0]).not.toBe(seen[1])
+    remove()
+    fn()
+    expect(seen[1]).not.toBe(seen[2])
+  })
+
   it("removal function removes just that advice", () => {
     const log: string[] = []
     __def("m", "fn", () => { log.push("orig") })

@@ -1,11 +1,35 @@
 import zod from "zod";
 import { createSchema, f, type InferSchemaRoot } from "@zenbu/kyju/schema";
 
+/**
+ * One entry in the function registry. The function itself lives only
+ * in the renderer (it's not serializable across processes) — this
+ * entry just describes *which* function should exist and any
+ * meta the chrome / consumers want to filter on.
+ */
+const functionRegistryEntrySchema = zod.object({
+  name: zod.string(),
+  meta: zod
+    .object({
+      kind: zod.string().optional(),
+      label: zod.string().optional(),
+    })
+    .catchall(zod.unknown())
+    .optional(),
+});
+
 const viewRegistryEntrySchema = zod.object({
   type: zod.string(),
   url: zod.string(),
   port: zod.number(),
   icon: zod.string().optional(),
+  /**
+   * How the renderer should mount this view. Defaults to `"iframe"` when
+   * omitted (existing behavior). `"component"` means the host renders a
+   * React component registered client-side under `type` — no Vite
+   * server, no iframe, args flow as a prop.
+   */
+  rendering: zod.enum(["iframe", "component"]).optional(),
   meta: zod
     .object({
       kind: zod.string().optional(),
@@ -77,6 +101,13 @@ const schema = createSchema({
    *
    * */
   lastKnownViewRegistry: f.array(viewRegistryEntrySchema).default([]),
+  /**
+   * Mirror of `lastKnownViewRegistry` for renderer-side function
+   * registrations declared by services. Holds only metadata — the
+   * actual function lives in the iframe's `@zenbujs/core/react`
+   * client registry, populated by the prelude.
+   */
+  lastKnownFunctionRegistry: f.array(functionRegistryEntrySchema).default([]),
   windowPrefs: f.record(zod.string(), windowPrefsSchema).default({}),
   /**
    * Per-shortcut binding override. The full list of available shortcuts
@@ -106,6 +137,7 @@ export default schema;
 export { schema };
 
 export type ViewRegistryEntry = zod.infer<typeof viewRegistryEntrySchema>;
+export type FunctionRegistryEntry = zod.infer<typeof functionRegistryEntrySchema>;
 export type WindowBounds = zod.infer<typeof windowBoundsSchema>;
 export type WindowPrefs = zod.infer<typeof windowPrefsSchema>;
 export type ShortcutBinding = zod.infer<typeof shortcutBindingSchema>;

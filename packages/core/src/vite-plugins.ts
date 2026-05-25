@@ -8,7 +8,13 @@ import {
   getAllTypes,
   getContentScripts,
   getAllContentScriptPaths,
+  getComponentViews,
+  getAllComponentViewPaths,
+  getFunctionSources,
+  getAllFunctionSourcePaths,
   type ViewAdviceEntry,
+  type ComponentViewEntry,
+  type FunctionSourceEntry,
 } from "./services/advice-config";
 
 /**
@@ -31,6 +37,7 @@ const SHORTCUT_BRIDGE_ENTRY = path.resolve(
   "prelude/shortcut-bridge.mjs",
 );
 const BOOT_TRACE_ENTRY = path.resolve(HERE, "prelude/boot-trace.mjs");
+const VIEW_ARGS_ENTRY = path.resolve(HERE, "prelude/view-args.mjs");
 
 /**
  * Virtual import specifiers used by the generated prelude module to pull
@@ -144,6 +151,10 @@ function getStaticPreludeBody(): string {
   if (cachedStaticPreludeBody !== null) return cachedStaticPreludeBody;
   const entries = [
     { path: BOOT_TRACE_ENTRY, exportNames: ["installBootTraceRenderer"] },
+    // View-args listener runs as early as possible so the parent's
+    // first `zenbu:view-args` message (sent in response to our
+    // `zenbu:view-ready` ping) is never dropped.
+    { path: VIEW_ARGS_ENTRY, exportNames: ["installViewArgsListener"] },
     { path: THEME_LISTENER_ENTRY, exportNames: ["installThemeListener"] },
     { path: SHORTCUT_BRIDGE_ENTRY, exportNames: ["installShortcutBridge"] },
   ];
@@ -172,7 +183,7 @@ function buildInlinePreludeScript(viewType: string): string | null {
   const body = getStaticPreludeBody();
   if (!body) return null;
   const safeType = JSON.stringify(viewType);
-  return `${body}\ninstallBootTraceRenderer(${safeType});\ninstallThemeListener();\ninstallShortcutBridge(${safeType});`;
+  return `${body}\ninstallBootTraceRenderer(${safeType});\ninstallViewArgsListener();\ninstallThemeListener();\ninstallShortcutBridge(${safeType});`;
 }
 
 /**
@@ -227,22 +238,137 @@ function generateAdvicePreludeCode(
 }
 
 /**
+ * Generate the prelude block that imports every registered component
+ * view's source module and pushes the resulting component into the
+ * iframe's `@zenbujs/core/react` client registry under the view's
+ * `type`. This block is emitted into *every* iframe's prelude (not
+ * scoped by `_viewType`) because any iframe might render a `<View
+ * type="x">` whose `rendering` is `"component"`. Each iframe is a
+ * separate JS realm, so it gets its own copy of the registry.
+ *
+ * `dedupe: ["@zenbujs/core"]` (set in `zenbuFrameworkResolve`) ensures
+ * the registry mutated here is the *same module instance* the app's
+ * `<View>` reads from — if dedupe ever drifts, registrations would
+ * silently land on a different module copy than `<View>` queries.
+ */
+/**
+ * Generate the prelude block that imports every registered function
+ * source and pushes the resulting value into the iframe's
+ * `@zenbujs/core/react` client function registry under the function's
+ * `name`. Mirrors `generateComponentViewPreludeCode` exactly — same
+ * global scope (emitted into every iframe), same dedupe assumption.
+ */
+function generateFunctionSourcePreludeCode(
+  entries: FunctionSourceEntry[],
+): string {
+  if (entries.length === 0) return "";
+  const imports: string[] = [
+    'import { registerFunction as __zb_registerFunction } from "@zenbujs/core/react"',
+  ];
+  const calls: string[] = [];
+  entries.forEach((entry, i) => {
+    const alias = `__fn${i}`;
+    if (entry.exportName === "default") {
+      imports.push(
+        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
+      );
+    } else {
+      imports.push(
+        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
+          entry.modulePath,
+        )}`,
+      );
+    }
+    // `meta` is opaque JSON; JSON.stringify both validates serializability
+    // and produces a literal we can inline directly.
+    const metaLiteral =
+      entry.meta === undefined ? "undefined" : JSON.stringify(entry.meta);
+    calls.push(
+      `__zb_registerFunction(${JSON.stringify(entry.name)}, ${alias}, ${metaLiteral})`,
+    );
+  });
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
+}
+
+function generateComponentViewPreludeCode(
+  entries: ComponentViewEntry[],
+): string {
+  if (entries.length === 0) return "";
+  const imports: string[] = [
+    'import { registerViewComponent as __zb_registerViewComponent } from "@zenbujs/core/react"',
+  ];
+  const calls: string[] = [];
+  entries.forEach((entry, i) => {
+    const alias = `__cv${i}`;
+    if (entry.exportName === "default") {
+      imports.push(
+        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
+      );
+    } else {
+      imports.push(
+        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
+          entry.modulePath,
+        )}`,
+      );
+    }
+    calls.push(
+      `__zb_registerViewComponent(${JSON.stringify(entry.type)}, ${alias})`,
+    );
+  });
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
+}
+
+/**
  * Decodes a `?theme=<base64>` query param into a CSS string that defines
  * the host's design tokens on `:root`. Returned as-is for inlining into
  * the iframe's `<head>` so the very first paint already has the host's
  * theme — no flash, no JS round-trip.
  */
-function buildInlineThemeCss(themeParam: string | null): string | null {
-  if (!themeParam) return null;
+const CSS_CUSTOM_PROPERTY_RE = /^--[a-zA-Z0-9_-]+$/;
+const VIEW_BACKGROUND_TOKEN = "--zenbu-view-background";
+const VIEW_FOREGROUND_TOKEN = "--zenbu-view-foreground";
+const VIEW_COLOR_SCHEME_TOKEN = "--zenbu-view-color-scheme";
+
+function isSafeCssValue(value: string): boolean {
+  return !/[;{}<>]/.test(value);
+}
+
+function decodeThemeTokens(themeParam: string): Record<string, string> | null {
   try {
     const json = decodeURIComponent(escape(atob(themeParam)));
-    const tokens = JSON.parse(json) as Record<string, string>;
-    const keys = Object.keys(tokens);
-    if (keys.length === 0) return null;
-    return ":root{" + keys.map((k) => `${k}:${tokens[k]}`).join(";") + "}";
+    const parsed = JSON.parse(json) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const tokens: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!CSS_CUSTOM_PROPERTY_RE.test(key)) continue;
+      if (typeof value !== "string") continue;
+      if (!isSafeCssValue(value)) continue;
+      tokens[key] = value;
+    }
+    return tokens;
   } catch {
     return null;
   }
+}
+
+function buildThemeCss(tokens: Record<string, string>): string | null {
+  const keys = Object.keys(tokens);
+  if (keys.length === 0) return null;
+  const root = ":root:root{" + keys.map((k) => `${k}:${tokens[k]}`).join(";") + "}";
+  const background = `var(${VIEW_BACKGROUND_TOKEN}, var(--background, Canvas))`;
+  const foreground = `var(${VIEW_FOREGROUND_TOKEN}, var(--foreground, CanvasText))`;
+  const colorScheme = `var(${VIEW_COLOR_SCHEME_TOKEN}, normal)`;
+  const page =
+    `html,body{background:${background};color:${foreground};color-scheme:${colorScheme}}` +
+    `body{margin:0}` +
+    `#root{background:${background};color:${foreground}}`;
+  return root + page;
+}
+
+function buildInlineThemeCss(themeParam: string | null): string | null {
+  if (!themeParam) return null;
+  const tokens = decodeThemeTokens(themeParam);
+  return tokens ? buildThemeCss(tokens) : null;
 }
 
 function extractThemeParam(originalUrl: string | undefined): string | null {
@@ -306,9 +432,15 @@ export function advicePreludePlugin(): Plugin {
       for (const scriptPath of getContentScripts(type)) {
         code += `import ${JSON.stringify(scriptPath)}\n`;
       }
-      // When neither advice nor content scripts exist for this view,
-      // emit an empty module — the static preludes are inlined into
-      // the HTML separately so there's nothing to load here.
+      // Component-view registrations are global — every iframe's
+      // prelude registers every component view so `<View type="x">`
+      // (component mode) can be rendered from any iframe. The static
+      // preludes are still inlined separately into the HTML.
+      code += generateComponentViewPreludeCode(getComponentViews());
+      // Same treatment for function-source registrations — every
+      // iframe gets every registered function in its client registry.
+      code += generateFunctionSourcePreludeCode(getFunctionSources());
+      // When nothing applies to this view, emit an empty module.
       return code || "// empty: static preludes are inlined in HTML\n";
     },
 
@@ -325,6 +457,19 @@ export function advicePreludePlugin(): Plugin {
       }
       if (!matched) {
         matched = getAllContentScriptPaths().includes(file);
+      }
+      if (!matched) {
+        // Component-view source files: editing the .tsx must reload
+        // the iframe so the prelude re-imports the fresh module and
+        // re-registers under the same `type`. Going through HMR
+        // (instead of normal Vite HMR) is correct because the
+        // registration is a side effect of the prelude script, which
+        // only runs at iframe boot.
+        matched = getAllComponentViewPaths().includes(file);
+      }
+      if (!matched) {
+        // Same story for function-source registrations.
+        matched = getAllFunctionSourcePaths().includes(file);
       }
       if (matched) {
         server.ws.send({ type: "full-reload" });

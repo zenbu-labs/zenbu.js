@@ -10,6 +10,22 @@ export interface FunctionEntry {
   replacement: Function | null
   advice: AdviceEntry[]
   wrapper?: Function
+  /**
+   * Memoized advice chain. Built lazily by `applyAdviceChain` and
+   * invalidated whenever the structure of the advice array changes
+   * (an entry added or removed). impl / replacement changes do NOT
+   * invalidate — the chain reads them live at call time.
+   *
+   * Why this matters: for around-advice on React components, the old
+   * code rebuilt the entire `composed` closure stack on every wrapper
+   * invocation. That meant the `next` (a.k.a. `__original`) passed
+   * to a React around-advice was a brand-new function identity on
+   * every render — so `<Original {...props} />` inside the advice
+   * caused React to unmount and remount the wrapped subtree on every
+   * parent re-render. Caching the composed chain keeps `next`
+   * identity stable across calls and fixes that.
+   */
+  composed?: Function
 }
 
 const registry = new Map<string, Map<string, FunctionEntry>>()
@@ -88,9 +104,12 @@ export function addAdvice(moduleId: string, name: string, type: AdviceType, fn: 
   const entry = getOrCreateEntry(moduleId, name)
   const adviceEntry: AdviceEntry = { type, fn }
   entry.advice.push(adviceEntry)
+  // Structure of the chain changed — next invocation must rebuild.
+  entry.composed = undefined
   return () => {
     const idx = entry.advice.indexOf(adviceEntry)
     if (idx >= 0) entry.advice.splice(idx, 1)
+    entry.composed = undefined
   }
 }
 

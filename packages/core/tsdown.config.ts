@@ -17,6 +17,7 @@ export default defineConfig([
       "prelude/theme-listener": "src/prelude/theme-listener.ts",
       "prelude/shortcut-bridge": "src/prelude/shortcut-bridge.ts",
       "prelude/boot-trace": "src/prelude/boot-trace.ts",
+      "prelude/view-args": "src/prelude/view-args.ts",
       "boot-trace": "src/boot-trace.ts",
       "services/index": "src/services/index.ts",
       "services/default": "src/services/default.ts",
