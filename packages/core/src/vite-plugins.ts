@@ -375,7 +375,75 @@ export function zenbuVitePlugins(): Plugin[] {
     resolveAdviceRuntime(),
     zenbuAdviceTransform(),
     pluginSourcesCssPlugin(),
+    bootReloadGuardPlugin(),
   ];
+}
+
+/* ---------- Boot-time `full-reload` guard ----------------------------------
+ *
+ * On a fresh `.vite/deps` cache, Vite's first `runOptimizer` pass fires
+ * `full-reload` once its bundle commits with a different `metadata.hash`
+ * than the previous run — by design: "the optimized deps changed, every
+ * page in flight needs to refetch with the new `?v=<hash>` URLs". On a
+ * fresh project that's effectively always, so on cold boot Vite emits
+ * one (sometimes two) `full-reload`s.
+ *
+ * The renderer is an Electron BrowserWindow whose `loadURL` races the
+ * optimizer commit. In the timing we observe today, the optimizer's
+ * first commit consistently happens BEFORE the renderer makes any
+ * request — i.e., while `server.ws.clients` is still empty. We use that
+ * exact condition as the gate: drop `full-reload` ws messages iff there
+ * are zero connected HMR clients at the moment of send.
+ *
+ * Why that's safe: the ws message is only useful as a notification to a
+ * connected client that its already-fetched bundle URLs are stale. If
+ * no client is connected, no client has fetched any URL from this
+ * server yet, so there are no stale references in any page to
+ * invalidate. The server-side bookkeeping that DOES matter —
+ * `environment.moduleGraph.invalidateAll()` — runs immediately before
+ * the ws.send (inside `fullReload()` in vite/dist/.../dep-*.js), so the
+ * next `transformRequest` from a future client returns imports stamped
+ * with the post-commit hash.
+ *
+ * Why time-based gating (`Date.now() < deadline`) is NOT safe: a client
+ * that connected during the window would have fetched main.tsx with
+ * pre-commit hashes baked into its imports; if we then suppressed a
+ * post-commit reload, that page would later dynamic-import modules
+ * stamped with the new hash and end up with two copies of e.g. `react`
+ * in memory (different module identities, hooks throw "invalid hook
+ * call"). Gating on `clients.size === 0` excludes that case by
+ * construction.
+ */
+function bootReloadGuardPlugin(): Plugin {
+  return {
+    name: "zenbu-boot-reload-guard",
+    configureServer(server) {
+      const ws = server.ws as unknown as {
+        send: (...args: unknown[]) => void;
+        clients?: { size: number };
+        __zenbuBootReloadGuard?: boolean;
+      };
+      if (ws.__zenbuBootReloadGuard) return; // idempotent across HMR
+      ws.__zenbuBootReloadGuard = true;
+      const orig = ws.send.bind(ws);
+      ws.send = ((...args: unknown[]) => {
+        const p = args[0];
+        const isFullReload =
+          p &&
+          typeof p === "object" &&
+          (p as { type?: string }).type === "full-reload";
+        if (isFullReload && (ws.clients?.size ?? 0) === 0) {
+          // No HMR client has fetched anything yet; no stale `?v=`
+          // references exist to invalidate. The server-side
+          // `moduleGraph.invalidateAll()` already ran inside
+          // `fullReload()` before this `ws.send`, so any future
+          // client transform will use the post-commit metadata.
+          return undefined as unknown as void;
+        }
+        return orig(...args);
+      }) as typeof ws.send;
+    },
+  };
 }
 
 /* ---------- Tailwind @source registry for component-mode plugins ---------- */
