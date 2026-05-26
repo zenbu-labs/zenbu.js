@@ -7,6 +7,7 @@ import {
   type AdviceSpec,
   type ContentScriptSpec,
 } from "./services/advice-config";
+import type { RegisterViewSpec } from "./services/view-registry";
 import { bootTrace } from "./boot-trace";
 
 /**
@@ -21,6 +22,47 @@ type SetupCleanup = ((reason: CleanupReason) => void | Promise<void>) | void;
 type SetupFn = () => SetupCleanup;
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
+
+/**
+ * Resolve relative paths inside a `RegisterViewSpec` against the
+ * calling plugin's directory. Mirrors the same convention
+ * `addAdvice` / `addContentScript` use for `modulePath`. Absolute
+ * paths pass through unchanged.
+ */
+function resolveViewSpecPaths(
+  spec: RegisterViewSpec,
+  pluginDir: string,
+): RegisterViewSpec {
+  const resolveRel = (p: string) =>
+    path.isAbsolute(p) ? p : path.resolve(pluginDir, p);
+
+  if (spec.rendering === "component") {
+    return {
+      ...spec,
+      source: {
+        ...spec.source,
+        modulePath: resolveRel(spec.source.modulePath),
+      },
+    };
+  }
+
+  // Iframe variant. Two shapes inside `source`: own-server (`root`) or
+  // shared (`pathPrefix`). Only own-server has any paths to resolve.
+  if ("root" in spec.source) {
+    const { root, configFile, eager } = spec.source;
+    return {
+      ...spec,
+      source: {
+        root: resolveRel(root),
+        configFile:
+          typeof configFile === "string" ? resolveRel(configFile) : configFile,
+        eager,
+      },
+    };
+  }
+
+  return spec;
+}
 
 function readShutdownTimeoutMs(): number {
   const raw = process.env.ZENBU_SHUTDOWN_TIMEOUT_MS;
@@ -168,6 +210,67 @@ export abstract class Service {
   injectContentScript(spec: ContentScriptSpec): () => void {
     const pluginDir = this.__getPluginDir("injectContentScript");
     return addContentScript(pluginDir, spec);
+  }
+
+  /**
+   * Register a view from inside a plugin service. Same plugin-root
+   * resolution rules as `this.advise(...)`: any relative `modulePath`,
+   * `root`, or `configFile` is resolved against the calling plugin's
+   * directory — no `path.resolve(import.meta.dirname, ...)` boilerplate
+   * at the call site.
+   *
+   *   // Component view
+   *   this.setup("my-view", () =>
+   *     this.registerView({
+   *       type: "my-view",
+   *       rendering: "component",
+   *       source: { modulePath: "src/views/my-view.tsx" },
+   *       meta: { ... },
+   *     }),
+   *   )
+   *
+   *   // Iframe view with dedicated Vite server
+   *   this.setup("my-iframe", () =>
+   *     this.registerView({
+   *       type: "my-iframe",
+   *       source: { root: "src/views/my-iframe" },
+   *       meta: { ... },
+   *     }),
+   *   )
+   *
+   *   // Iframe view sharing an existing Vite server
+   *   this.setup("my-shared", () =>
+   *     this.registerView({
+   *       type: "my-shared",
+   *       source: { pathPrefix: "/views/my-shared" },
+   *       meta: { ... },
+   *     }),
+   *   )
+   *
+   * Returns a synchronous dispose. Wrap in `this.setup(...)` so plugin
+   * teardown / hot reload runs the matching `unregisterView`.
+   */
+  registerView(spec: RegisterViewSpec): () => void {
+    const pluginDir = this.__getPluginDir("registerView");
+    const resolved = resolveViewSpecPaths(spec, pluginDir);
+    const slot = runtime.getSlot("viewRegistry");
+    const vr = slot?.instance as
+      | {
+          registerView: (s: RegisterViewSpec) => Promise<unknown>;
+          unregisterView: (t: string) => Promise<void>;
+        }
+      | undefined;
+    if (!vr) {
+      throw new Error(
+        `[runtime] this.registerView("${spec.type}") called but ViewRegistryService isn't ready yet. ` +
+          `Either depend on it explicitly (deps: { viewRegistry: ViewRegistryService }) so the runtime ` +
+          `resolves order, or call registerView later (e.g. from a setup() block).`,
+      );
+    }
+    void vr.registerView(resolved);
+    return () => {
+      void vr.unregisterView(resolved.type);
+    };
   }
 
   /** @internal */

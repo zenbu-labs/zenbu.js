@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
 import { zenbuAdvicePlugin } from "@zenbu/advice/vite";
-import { runtime } from "./runtime";
+import { runtime, getConfig, subscribeConfig } from "./runtime";
 import {
   readBootstrapManifest,
   enqueueRegistrationsWrite,
@@ -374,5 +374,211 @@ export function zenbuVitePlugins(): Plugin[] {
     reconcilerBootstrapPlugin(),
     resolveAdviceRuntime(),
     zenbuAdviceTransform(),
+    pluginSourcesCssPlugin(),
   ];
+}
+
+/* ---------- Tailwind @source registry for component-mode plugins ---------- */
+
+/**
+ * Backs the host-side import:
+ *
+ *     @import "@zenbujs/core/plugin-sources.css";
+ *
+ * Resolves through `@zenbujs/core`'s `package.json#exports` to a real
+ * file at `dist/plugin-sources.css`. The file's body is a list of
+ * Tailwind v4 `@source` directives, one per registered plugin,
+ * pointing at that plugin's `src/**` tree. The host's single Tailwind
+ * compilation then scans every component-mode plugin's source tree
+ * automatically, so utility classes used inside a plugin view land in
+ * the host's stylesheet without any host-side bookkeeping.
+ *
+ * Why a real file instead of a virtual module or a transform-time
+ * rewrite? Tailwind v4's vite integration resolves CSS `@import`s
+ * through `vite.createIdResolver()`, a stripped-down node resolver
+ * that does **not** run user plugin `resolveId` hooks and does **not**
+ * see other plugins' `transform` results before its own compiler
+ * walks the imports. So neither a virtual specifier nor a string
+ * rewrite reliably wins the race — the resolver fires first and
+ * errors on undeclared subpaths. An actual file with an actual
+ * `exports` entry sidesteps the whole question.
+ *
+ * This plugin keeps that file's body in sync with the live plugin
+ * registry. It writes once during `config()` (before vite serves the
+ * first request), and again on every `subscribeConfig` callback.
+ *
+ * Without this, Tailwind v4 only auto-detects sources under the
+ * closest ancestor `package.json` to the host CSS (typically
+ * `plugins/app/`), which means any class used exclusively by a
+ * sibling plugin silently no-ops unless the host happens to use it
+ * too.
+ */
+
+/** File extensions a Tailwind scan should consider when walking a
+ * plugin's source tree. JS/MJS/CJS are included for compiled
+ * plugins loaded from `node_modules`. */
+const PLUGIN_SOURCES_EXTS = "{ts,tsx,js,jsx,mts,mjs,cjs}";
+
+/** Bare specifier used by the host stylesheet:
+ *
+ *     @import "@zenbujs/core/plugin-sources.css";
+ *
+ * We intercept it per-host via `resolve.alias` and redirect each
+ * dev server's resolution to a file under that host's own
+ * `node_modules/.zenbu/`. Previously this resolved through
+ * `package.json#exports` to a single shared file in this package's
+ * `dist/`, which meant every worktree pointing at the same
+ * `@zenbujs/core` install wrote to (and watched) the same mutable
+ * sidecar — touching the file in worktree A triggered an HMR full
+ * reload in worktree B because B's vite/Tailwind had that exact
+ * path in its CSS module graph. Per-host paths fully isolate
+ * worktrees. */
+const PLUGIN_SOURCES_SPECIFIER = "@zenbujs/core/plugin-sources.css";
+
+/** Where to write the per-host sidecar. Lives under the consuming
+ * project's `node_modules/.zenbu/` so it is gitignored, ephemeral,
+ * and outside vite's default file watcher (we trigger reloads
+ * explicitly via `server.ws.send`). */
+function pluginSourcesPathFor(root: string): string {
+  return path.resolve(root, "node_modules/.zenbu/plugin-sources.css");
+}
+
+function buildPluginSourcesCss(): string {
+  const { plugins } = getConfig();
+  const lines: string[] = [
+    "/* @zenbujs/core: auto-generated @source list for plugin views.",
+    " * Do not edit — rewritten by `pluginSourcesCssPlugin` whenever",
+    " * the plugin registry changes. */",
+  ];
+  for (const plugin of plugins) {
+    // Tailwind accepts absolute paths in `@source`; forward slashes
+    // are the portable form on Windows.
+    const dir = plugin.dir.replace(/\\/g, "/");
+    lines.push(`@source "${dir}/src/**/*.${PLUGIN_SOURCES_EXTS}";`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/** Writes the current registry's `@source` list to the given
+ * per-host path. Returns `true` when the file's content actually
+ * changed (so callers can decide whether to bother triggering an
+ * HMR full-reload). */
+function writePluginSourcesFile(file: string): boolean {
+  const next = buildPluginSourcesCss();
+  let prev: string | null = null;
+  try {
+    prev = fs.readFileSync(file, "utf8");
+  } catch {
+    // File doesn't exist yet — first write of the process.
+  }
+  if (prev === next) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, next, "utf8");
+    return true;
+  } catch (err) {
+    console.warn(
+      "[zenbu] failed to write plugin-sources.css:",
+      err instanceof Error ? err.message : err,
+    );
+    return false;
+  }
+}
+
+export function pluginSourcesCssPlugin(): Plugin {
+  let unsubscribe: (() => void) | null = null;
+  // Resolved lazily from the host's vite root. Populated in
+  // `config()` (early enough to be returned in the alias entry)
+  // and refined in `configResolved()` if vite normalizes the root
+  // differently than we guessed.
+  let sourcesFile: string = pluginSourcesPathFor(process.cwd());
+
+  return {
+    name: "zenbu-plugin-sources-css",
+    enforce: "pre",
+
+    /**
+     * Sync hook that runs before vite finishes resolving its config,
+     * which itself runs before the first request is served. We:
+     *
+     *   1. Compute the per-host sidecar path from the user's vite
+     *      root (falling back to `cwd`). One host → one file.
+     *   2. Write it to disk so it exists by the time
+     *      `@tailwindcss/vite` opens it.
+     *   3. Install a `resolve.alias` that redirects the bare
+     *      specifier `@zenbujs/core/plugin-sources.css` to that
+     *      per-host path. Aliases are honored by
+     *      `vite.createIdResolver`, which is what Tailwind uses to
+     *      resolve CSS `@import`s — so this wins without needing a
+     *      user `resolveId` hook.
+     */
+    config(userConfig) {
+      const root = path.resolve(userConfig.root ?? process.cwd());
+      sourcesFile = pluginSourcesPathFor(root);
+      writePluginSourcesFile(sourcesFile);
+      return {
+        resolve: {
+          alias: [
+            { find: PLUGIN_SOURCES_SPECIFIER, replacement: sourcesFile },
+          ],
+        },
+      };
+    },
+
+    /**
+     * Vite may normalize `root` differently than we guessed in
+     * `config()` (e.g. when the user passes a relative path). Rewrite
+     * to the canonical path so the alias and the on-disk file agree.
+     */
+    configResolved(resolved) {
+      const canonical = pluginSourcesPathFor(resolved.root);
+      if (canonical !== sourcesFile) {
+        sourcesFile = canonical;
+        writePluginSourcesFile(sourcesFile);
+      }
+    },
+
+    /**
+     * Live-update path: when a plugin is registered or removed
+     * (`zenbu.config.ts` / `zenbu.plugin.ts` edits), rewrite the
+     * sidecar file and ping this server's clients so Tailwind
+     * re-walks the new source list. We deliberately do not rely on
+     * vite's chokidar to notice the write — the file lives under
+     * `node_modules/`, which vite's default watcher ignores, and
+     * that ignore is exactly what gives us cross-worktree
+     * isolation. The manual `server.ws.send` is the only reload
+     * signal.
+     */
+    configureServer(server) {
+      unsubscribe?.();
+      let primed = false;
+      unsubscribe = subscribeConfig(() => {
+        // Always rewrite the file — covers the race where `config()`
+        // ran before any plugin had been registered. Writes are
+        // content-compared and skipped when nothing changed, so this
+        // is cheap.
+        const changed = writePluginSourcesFile(sourcesFile);
+        if (!primed) {
+          // `subscribeConfig` fires once immediately on subscription;
+          // don't full-reload on that initial fire.
+          primed = true;
+          return;
+        }
+        if (changed) server.ws.send({ type: "full-reload" });
+      });
+    },
+
+    /**
+     * Production builds run through the same plugin pipeline. Make
+     * sure the file is up to date before rollup walks the CSS graph.
+     */
+    buildStart() {
+      writePluginSourcesFile(sourcesFile);
+    },
+
+    closeBundle() {
+      unsubscribe?.();
+      unsubscribe = null;
+    },
+  };
 }

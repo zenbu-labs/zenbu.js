@@ -14,6 +14,7 @@
       "types": "./dist/index.d.mts",
       "import": "./dist/index.mjs"
     },
+    "./plugin-sources.css": "./dist/plugin-sources.css",
     "./setup-gate": {
       "types": "./dist/setup-gate.d.mts",
       "import": "./dist/setup-gate.mjs"

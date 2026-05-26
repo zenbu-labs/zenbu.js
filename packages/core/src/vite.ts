@@ -1,4 +1,5 @@
 export {
+  pluginSourcesCssPlugin,
   reconcilerBootstrapPlugin,
   resolveAdviceRuntime,
   zenbuAdviceTransform,
