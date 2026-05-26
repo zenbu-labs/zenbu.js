@@ -70,6 +70,15 @@ type ConnectionState =
 
 const ConnectionContext = createContext<ConnectionState | null>(null);
 
+/**
+ * Args delivered to a component-mode `<View>`. The iframe path uses
+ * `window.__zenbuViewArgs` (populated by the prelude's postMessage
+ * listener); the in-process component path reads this context instead.
+ * `useViewArgs()` prefers the context when present so the same hook
+ * works in both rendering modes.
+ */
+const ViewArgsContext = createContext<Record<string, unknown> | null>(null);
+
 // The `Resolved*` types are conditional on `ZenbuRegister` — they resolve
 // lazily at the consumer's compilation unit (after `zen link`'s module
 // augmentation is in scope). We alias them here so core's own build
@@ -1540,7 +1549,11 @@ export function View({
         "data-zenbu-view": type,
         "data-zenbu-view-rendering": "component",
       },
-      createElement(ComponentImpl, { args: args ?? {} }),
+      createElement(
+        ViewArgsContext.Provider,
+        { value: (args ?? {}) as Record<string, unknown> },
+        createElement(ComponentImpl, { args: args ?? {} }),
+      ),
     );
   }
 
@@ -1727,14 +1740,27 @@ export function View({
  * type is non-null and the consumer never has to handle a loading state.
  */
 export function useViewArgs<T extends Record<string, unknown>>(): T {
+  // Component-mode views are wrapped in `<ViewArgsContext.Provider>` by
+  // `<View>`. Iframe-mode views don't have a parent context (different
+  // realm) and fall back to the postMessage-fed global store.
+  const ctxArgs = useContext(ViewArgsContext);
   const store =
     typeof window !== "undefined" ? window.__zenbuViewArgs : undefined;
 
   const [args, setArgs] = useState<T>(() => {
+    if (ctxArgs) return ctxArgs as T;
     return (store?.current ?? ({} as Record<string, unknown>)) as T;
   });
 
+  // When the context value changes (parent re-rendered `<View args=...>`
+  // with new args), follow it. The postMessage subscription below only
+  // runs when there's no context — i.e. iframe-mode.
   useEffect(() => {
+    if (ctxArgs) setArgs(ctxArgs as T);
+  }, [ctxArgs]);
+
+  useEffect(() => {
+    if (ctxArgs) return; // component-mode: the context path above wins.
     if (!store) return;
     // Catch the case where args arrived between our state initializer
     // and the subscription below (shouldn't happen if ZenbuProvider
@@ -1750,7 +1776,7 @@ export function useViewArgs<T extends Record<string, unknown>>(): T {
       store.listeners.delete(listener);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [ctxArgs]);
 
   return args;
 }
