@@ -16,7 +16,7 @@ import * as git from "isomorphic-git"
 import type { StatusRow } from "isomorphic-git"
 import http from "isomorphic-git/http/node"
 
-import { Service, runtime } from "../runtime"
+import { Service, runtime, getAppEntrypoint } from "../runtime"
 import { createLogger } from "../shared/log"
 import {
   detectLockfile,
@@ -119,6 +119,33 @@ function parsePackageManager(value: string | undefined): PackageManagerSpec | nu
   const version = value.slice(at + 1)
   if (type === "pnpm" || type === "npm" || type === "yarn" || type === "bun") {
     return { type, version }
+  }
+  return null
+}
+
+/**
+ * Resolve the absolute path of the `loading.html` to show during an in-app
+ * plugin update. The supervisor uses it to pop a BaseWindow before tearing
+ * the runtime down, so phase / failure events have somewhere to render.
+ *
+ * - Production: staged next to the .app's Resources/ at build time. We look
+ *   for `<resources>/loading.html` first (would require a build-config
+ *   change to actually copy it; until then this path falls through).
+ * - Dev: lives alongside `splash.html` in the project's `uiEntrypoint`
+ *   directory — the one returned by `getAppEntrypoint()`.
+ *
+ * Returns `null` when nothing is found, in which case the supervisor runs
+ * without a visible UI (legacy behavior).
+ */
+function resolveLoadingHtml(resourcesPath: string | null): string | null {
+  if (resourcesPath) {
+    const staged = path.join(resourcesPath, "loading.html")
+    if (fs.existsSync(staged)) return staged
+  }
+  const entrypoint = getAppEntrypoint()
+  if (entrypoint) {
+    const dev = path.join(entrypoint, "loading.html")
+    if (fs.existsSync(dev)) return dev
   }
   return null
 }
@@ -426,6 +453,7 @@ export class PluginUpdaterService extends Service.create({
       dependenciesChanged: check.dependenciesChanged,
       packageManager: readPackageManager(check.repo.path, appContext),
       resourcesPath: appContext?.resourcesPath ?? null,
+      loadingHtml: resolveLoadingHtml(appContext?.resourcesPath ?? null),
     }
 
     return takeOverPluginRepoUpdate(plan, {

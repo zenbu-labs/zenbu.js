@@ -1,9 +1,10 @@
-import { app, BaseWindow } from "electron";
+import { app, BaseWindow, WebContentsView } from "electron";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as git from "isomorphic-git";
 
 import { runtime } from "../runtime";
@@ -16,6 +17,13 @@ import {
 } from "./pm-install";
 
 const log = createLogger("plugin-update-supervisor");
+
+// Resolved at module load time so we can locate the framework-shipped
+// `installing-preload.cjs` regardless of how the package is consumed
+// (link:, node_modules, packaged Resources). The preload exposes the
+// same `window.zenbuInstall` API used by the cold-boot installer so the
+// loading.html page can be written once and reused for both flows.
+const SUPERVISOR_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export type PluginUpdatePhase =
   | "closing"
@@ -32,6 +40,16 @@ export interface PluginUpdatePlan {
   dependenciesChanged: boolean;
   packageManager: PackageManagerSpec;
   resourcesPath: string | null;
+  /**
+   * Absolute path to `loading.html` to show during the update. When
+   * provided, the supervisor opens a BaseWindow loading this file BEFORE
+   * destroying the app's existing windows, and routes phase / failure
+   * events to it via IPC (the framework-shipped `installing-preload.cjs`).
+   *
+   * When omitted (or the file doesn't exist) the supervisor still runs
+   * the update but does so without any visible UI.
+   */
+  loadingHtml?: string | null;
 }
 
 interface PendingPluginUpdate {
@@ -43,6 +61,125 @@ interface PendingPluginUpdate {
 export interface PluginUpdateReporter {
   phase?(phase: PluginUpdatePhase, message?: string): void;
   failed?(phase: PluginUpdatePhase, message: string): void;
+}
+
+type LoadingEvent = "step" | "message" | "progress" | "done" | "error";
+
+interface LoadingWindow {
+  win: BaseWindow;
+  send(event: LoadingEvent, payload: unknown): void;
+  /**
+   * Best-effort close. Used on the success path right before relaunch.
+   * On failure we *keep* the window open so the user can read the error.
+   */
+  close(): void;
+}
+
+function resolveInstallingPreload(resourcesPath: string | null): string | null {
+  // 1. Production: staged into Resources/ next to the .app at build time.
+  if (resourcesPath) {
+    const staged = path.join(resourcesPath, "installing-preload.cjs");
+    if (fs.existsSync(staged)) return staged;
+  }
+  // 2. Dev / link: shipped inside @zenbujs/core's dist alongside this module.
+  const sibling = path.join(SUPERVISOR_DIR, "installing-preload.cjs");
+  if (fs.existsSync(sibling)) return sibling;
+  // 3. Walk up looking for `dist/installing-preload.cjs`. Bundlers may put
+  //    `plugin-update-supervisor` into a chunk file at the dist root, in
+  //    which case (2) already matched. This handles the case where the
+  //    chunk lands in a subdir.
+  let dir = SUPERVISOR_DIR;
+  for (let i = 0; i < 5; i += 1) {
+    const candidate = path.join(dir, "installing-preload.cjs");
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+async function openLoadingWindow(
+  htmlPath: string,
+  preloadPath: string,
+): Promise<LoadingWindow> {
+  // Small modal-feeling window. The auto-updater only shows a single
+  // shimmering label (and an error block on failure), so it doesn't need
+  // splash-sized real estate. Resizable + minimizable stay off so the
+  // window can't be hidden behind something while the update runs.
+  const win = new BaseWindow({
+    width: 320,
+    height: 220,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    titleBarStyle: "hidden",
+    trafficLightPosition: { x: 10, y: 8 },
+    backgroundColor: "#f4f4f4",
+  });
+  const view = new WebContentsView({
+    webPreferences: {
+      preload: preloadPath,
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  });
+  win.contentView.addChildView(view);
+  const layout = (): void => {
+    if (win.isDestroyed()) return;
+    const { width, height } = win.getContentBounds();
+    view.setBounds({ x: 0, y: 0, width, height });
+  };
+  layout();
+  win.on("resize", layout);
+
+  // Buffer events emitted before did-finish-load — the first phase event
+  // can fire before the preload has wired up its listeners.
+  let ready = false;
+  const pending: Array<{ event: LoadingEvent; payload: unknown }> = [];
+  view.webContents.once("did-finish-load", () => {
+    ready = true;
+    for (const p of pending) {
+      try {
+        if (view.webContents.isDestroyed()) break;
+        view.webContents.send(`zenbu:install:${p.event}`, p.payload);
+      } catch {}
+    }
+    pending.length = 0;
+  });
+  view.webContents.once("did-fail-load", (_e, _code, desc) => {
+    log.error(`loading.html did-fail-load: ${desc}`);
+    pending.length = 0;
+    ready = true;
+  });
+
+  // Fire and forget — we don't want to block the update on the renderer.
+  void view.webContents.loadFile(htmlPath).catch((err) => {
+    log.error(
+      `loading.html loadFile failed: ${(err as Error).message ?? err}`,
+    );
+  });
+
+  return {
+    win,
+    send(event, payload) {
+      if (!ready) {
+        pending.push({ event, payload });
+        return;
+      }
+      try {
+        if (view.webContents.isDestroyed()) return;
+        view.webContents.send(`zenbu:install:${event}`, payload);
+      } catch {}
+    },
+    close() {
+      try {
+        if (!win.isDestroyed()) win.destroy();
+      } catch {}
+    },
+  };
 }
 
 const PENDING_FILE = path.join(
@@ -139,6 +276,15 @@ async function installDeps(plan: PluginUpdatePlan): Promise<void> {
  * The returned promise never resolves in the success case because the
  * process relaunches. It may reject only before relaunch (for example if
  * git refuses the fast-forward or install fails).
+ *
+ * About the reporter: the supplied `reporter` is called for every phase
+ * transition AND for failure. Note that we call `runtime.shutdown()`
+ * early in this function, which tears down the service runtime — anything
+ * the reporter touches must therefore not depend on services (rpc, db,
+ * window manager, etc). The supervisor itself manages a `loading.html`
+ * BaseWindow opened outside the runtime; that window receives mirrored
+ * phase / failure events via IPC and is what the user sees during the
+ * blackout between window close and relaunch.
  */
 export async function takeOverPluginRepoUpdate(
   plan: PluginUpdatePlan,
@@ -146,30 +292,106 @@ export async function takeOverPluginRepoUpdate(
 ): Promise<never> {
   await writePending(plan, "applying");
 
+  // Open the loading window FIRST, before destroying any other windows.
+  // If we opened it after closing the existing windows, macOS would
+  // briefly show no app-owned windows and the app could drop focus /
+  // hide. Opening first also gives the renderer a head start on loading
+  // the gif so the user sees something within ~1 frame of clicking.
+  let loading: LoadingWindow | null = null;
+  if (plan.loadingHtml && fs.existsSync(plan.loadingHtml)) {
+    const preloadPath = resolveInstallingPreload(plan.resourcesPath);
+    if (preloadPath) {
+      try {
+        loading = await openLoadingWindow(plan.loadingHtml, preloadPath);
+      } catch (err) {
+        log.error(
+          `failed to open loading window: ${(err as Error).message ?? err}`,
+        );
+      }
+    } else {
+      log.error(
+        "loading.html provided but installing-preload.cjs could not be located; skipping window",
+      );
+    }
+  }
+
+  // Reporter facade: the *caller's* reporter is called for phase /
+  // failure transitions, AND every event is mirrored to the loading
+  // window over IPC. We keep the caller's reporter in a try/catch
+  // because the most common consumer (PluginUpdaterService) emits via
+  // rpc — which throws after `runtime.shutdown()`. Swallowing the
+  // post-shutdown rpc error here is intentional: the loading window is
+  // the surface we actually care about once the runtime is gone.
+  const report = {
+    phase(phase: PluginUpdatePhase, message?: string): void {
+      log.verbose(`${phase}${message ? `: ${message}` : ""}`);
+      try {
+        reporter?.phase?.(phase, message);
+      } catch (err) {
+        log.verbose(
+          `reporter.phase threw (likely runtime is down): ${(err as Error).message ?? err}`,
+        );
+      }
+      loading?.send("step", { id: phase, label: message ?? phase });
+      if (message) loading?.send("message", { text: message });
+    },
+    failed(phase: PluginUpdatePhase | "check", message: string): void {
+      log.error(`failed during ${phase}: ${message}`);
+      try {
+        // The reporter's `failed` type only allows PluginUpdatePhase. The
+        // "check" variant is owned by the caller (UpdateCheck error path)
+        // and never reaches this function.
+        reporter?.failed?.(phase as PluginUpdatePhase, message);
+      } catch (err) {
+        log.verbose(
+          `reporter.failed threw (likely runtime is down): ${(err as Error).message ?? err}`,
+        );
+      }
+      loading?.send("error", { id: phase, message });
+    },
+  };
+
   let currentPhase: PluginUpdatePhase = "closing";
   try {
-    emit(reporter, currentPhase, "Closing windows");
+    report.phase(currentPhase, "Closing windows");
+    const loadingWin = loading?.win ?? null;
     for (const win of BaseWindow.getAllWindows()) {
+      // Keep the loading window open so the user has a surface to look
+      // at and so failure messages have somewhere to render.
+      if (loadingWin && win === loadingWin) continue;
       try {
         win.destroy();
       } catch {}
     }
 
     currentPhase = "shutdown";
-    emit(reporter, currentPhase, "Stopping service runtime");
+    report.phase(currentPhase, "Stopping service runtime");
+    // After this point ANY call into the service runtime (including the
+    // caller's RPC-backed reporter) will throw. `report.phase` / `report.failed`
+    // tolerate that — but don't add raw `reporter?.phase?.(...)` calls
+    // here.
     await runtime.shutdown();
 
     currentPhase = "git";
-    emit(
-      reporter,
+    report.phase(
       currentPhase,
       `Fast-forwarding ${path.basename(
         plan.repoPath,
       )} to ${plan.targetCommit.slice(0, 7)}`,
     );
-    // Use merge rather than checkout so the current local branch advances.
-    // `fastForwardOnly` keeps the destructive phase simple and safe; callers
-    // must surface diverged/conflicting states from the check phase instead.
+    // Two-step apply:
+    //   1. `git.merge({ fastForwardOnly: true })` advances the branch ref.
+    //      This validates the FF (refuses on divergence) but DOES NOT
+    //      touch the working tree or the index.
+    //   2. `git.checkout({ force: true })` then materializes the new
+    //      tree on disk + rewrites the index to match.
+    //
+    // Without step 2, HEAD points at the new commit but the files on
+    // disk are still pre-merge. The next launch then runs the OLD
+    // plugin source under the NEW commit id, and the very next
+    // `checkRepo()` flags every changed file as "dirty" — because
+    // the working tree now disagrees with HEAD — which blocks every
+    // subsequent update until the user manually resets.
     await git.merge({
       fs,
       dir: plan.repoPath,
@@ -178,10 +400,16 @@ export async function takeOverPluginRepoUpdate(
       fastForwardOnly: true,
       abortOnConflict: true,
     });
+    await git.checkout({
+      fs,
+      dir: plan.repoPath,
+      ref: plan.branch,
+      force: true,
+    });
 
     if (plan.dependenciesChanged) {
       currentPhase = "install";
-      emit(reporter, currentPhase, "Installing dependencies");
+      report.phase(currentPhase, "Installing dependencies");
       await installDeps(plan);
     }
 
@@ -189,14 +417,21 @@ export async function takeOverPluginRepoUpdate(
     await clearPending();
 
     currentPhase = "relaunch";
-    emit(reporter, currentPhase, "Relaunching");
+    report.phase(currentPhase, "Relaunching");
+    // The loading window dies with the process on `app.exit`. We don't
+    // explicitly close it first: if relaunch fails for some bizarre
+    // reason the user still has a window on screen.
     app.relaunch();
     app.exit(0);
     return await new Promise<never>(() => undefined);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    reporter?.failed?.(currentPhase, message);
-    log.error(`failed during ${currentPhase}: ${message}`);
+    report.failed(currentPhase, message);
+    // Intentionally DO NOT call `app.exit` here. The loading window
+    // stays up displaying the error so the user (and the developer
+    // debugging across machines) can read what actually went wrong.
+    // The next user action — Quit from the loading window, or a hard
+    // kill — tears down the rest.
     throw err;
   }
 }
