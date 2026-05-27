@@ -4,4 +4,10 @@ export type {
   ViewAdviceEntry,
 } from "./services/advice-config";
 
-export { readBootstrapManifest } from "./services/advice-config";
+export {
+  getAdvice,
+  getContentScripts,
+  getComponentViews,
+  getFunctionSources,
+  getAllTypes,
+} from "./services/advice-config";

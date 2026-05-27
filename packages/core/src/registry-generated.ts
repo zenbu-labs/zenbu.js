@@ -7,6 +7,7 @@ import type {
   DbService,
   FunctionRegistryService,
   HttpService,
+  PluginUpdaterService,
   ReloaderService,
   RendererHostService,
   RpcService,
@@ -44,6 +45,7 @@ export type CoreServiceRouter = {
     db: ExtractRpcMethods<DbService>;
     functionRegistry: ExtractRpcMethods<FunctionRegistryService>;
     http: ExtractRpcMethods<HttpService>;
+    pluginUpdater: ExtractRpcMethods<PluginUpdaterService>;
     reloader: ExtractRpcMethods<ReloaderService>;
     rendererHost: ExtractRpcMethods<RendererHostService>;
     rpc: ExtractRpcMethods<RpcService>;

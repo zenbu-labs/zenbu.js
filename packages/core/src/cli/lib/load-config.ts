@@ -252,7 +252,21 @@ export async function loadConfig(
       const overlayAbs = path.isAbsolute(overlayPath)
         ? overlayPath
         : path.resolve(configDir, overlayPath)
-      // Missing file is the happy path — silently skip.
+      // Always register the overlay path with the loader so its
+      // *creation* (not just its edits) triggers a config reload.
+      // dynohot's FileWatcher takes the dirname of a non-existent
+      // path and watches the parent directory for any event whose
+      // basename matches — i.e. a watch on `zenbu.local.ts` before
+      // the file exists is functionally a watch for that file to
+      // *appear*. Without this push, a plugin-installer that
+      // creates `zenbu.local.ts` mid-session has no way to make
+      // its new entry boot until the user manually touches
+      // `zenbu.config.ts`.
+      //
+      // We push BEFORE the existence check so this path is also
+      // hit when there's no file on disk to import.
+      pluginSourceFiles.push(overlayAbs)
+      // Missing file is the happy path — silently skip loading.
       if (!fs.existsSync(overlayAbs)) continue
       if (!PLUGIN_FILE_RE.test(overlayAbs)) {
         throw new Error(
@@ -270,8 +284,6 @@ export async function loadConfig(
         plugins.push(resolved)
         if (sourceFile) pluginSourceFiles.push(sourceFile)
       }
-      // Watch the overlay itself so edits to it (not just to its targets) re-resolve.
-      pluginSourceFiles.push(overlayAbs)
     }
   }
 

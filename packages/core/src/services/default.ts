@@ -12,18 +12,7 @@
  * ~1400ms. Until the warmup runs off the critical path, serial imports
  * keep total wall-clock lower.
  */
-/**
- * Run every default-service module import in parallel. The runtime's
- * registration is idempotent and dependency order is enforced by the
- * topological evaluator, not by import order — so parallel is correct.
- *
- * Originally we tried this and saw the renderer-host's Vite warmup
- * balloon from ~200ms to ~1400ms under CPU contention. That regression
- * is gone now: `startRendererServer` does `void warmupRendererEntrypoints`
- * (fire-and-forget), so warmup no longer sits on the critical path and
- * concurrent imports can take the wall-clock win without paying for it
- * downstream.
- */
+
 export async function defaultServices(): Promise<void> {
   const { bootTrace } = await import("../boot-trace");
   await Promise.all([
@@ -39,6 +28,7 @@ export async function defaultServices(): Promise<void> {
     bootTrace.span("import:./window", () => import("./window")),
     bootTrace.span("import:./advice-config", () => import("./advice-config")),
     bootTrace.span("import:./updater", () => import("./updater")),
+    bootTrace.span("import:./plugin-updater", () => import("./plugin-updater")),
     bootTrace.span("import:./shortcuts", () => import("./shortcuts")),
   ]);
 }

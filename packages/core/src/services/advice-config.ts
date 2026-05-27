@@ -1,21 +1,21 @@
 import path from "node:path"
-import * as Effect from "effect/Effect"
 import { runtime } from "../runtime"
-// NOTE: do NOT import DbService at the top of this module. This file
-// is reachable from `services/reloader.ts` through `vite-plugins.ts`,
-// and a top-level circular import means the dep class used below
-// would resolve to `undefined` during the very first eval pass. We
-// resolve `db` lazily inside the few functions that need it (after
-// all modules have finished evaluating).
+// Don't import ReloaderService / RendererHostService / RpcService at the
+// top — this file is reachable from `services/reloader.ts` via
+// `vite-plugins.ts`, and a top-level circular import would resolve the
+// dep classes to `undefined` during first eval. Look them up lazily.
+
+export interface ViewAdviceEntry {
+  moduleId: string
+  name: string
+  type: "replace" | "before" | "after" | "around"
+  modulePath: string
+  exportName: string
+}
 
 /**
- * Public spec passed to `service.advise({...})`. The plugin root is
- * resolved automatically from the calling service's slot (stamped by
- * `runtime.register` at registration time), so plugin code never has to
- * deal with `import.meta`.
- *
- * `modulePath` is normally relative to the plugin root. Absolute paths
- * are accepted as an escape hatch.
+ * Spec passed to `service.advise({...})`. `modulePath` is relative to
+ * the plugin root by default; absolute paths pass through.
  */
 export interface AdviceSpec {
   view: string
@@ -26,27 +26,54 @@ export interface AdviceSpec {
   exportName: string
 }
 
-/**
- * Public spec passed to `service.contentScript({...})`. Same
- * plugin-root resolution rules as `AdviceSpec`.
- */
+/** Spec for `service.contentScript({...})`. Same path rules as `AdviceSpec`. */
 export interface ContentScriptSpec {
   view: string
   modulePath: string
 }
 
-/**
- * Internal entry shape kept around for code that still reads advice
- * synchronously off the in-memory map (e.g. older callers). Phase-3/4
- * code reads from `db.core.registrations` instead.
- */
-export interface ViewAdviceEntry {
-  moduleId: string
-  name: string
-  type: "replace" | "before" | "after" | "around"
+/** Source spec for a component view. Same path rules as advice. */
+export interface ComponentViewSpec {
+  type: string
+  modulePath: string
+  exportName?: string
+}
+
+export interface ComponentViewEntry {
+  type: string
   modulePath: string
   exportName: string
 }
+
+/** Source spec for a registered function. Same path rules as advice. */
+export interface FunctionSourceSpec {
+  name: string
+  modulePath: string
+  exportName?: string
+  meta?: Record<string, unknown>
+}
+
+export interface FunctionSourceEntry {
+  name: string
+  modulePath: string
+  exportName: string
+  meta?: Record<string, unknown>
+}
+
+const RESOLVED_PREFIX = "\0@advice-prelude/"
+const APP_RENDERER_RELOADER_ID = "app"
+
+/** Per-view advice (matches `view` or `view: "*"`). */
+const adviceEntries = new Map<string, ViewAdviceEntry[]>()
+
+interface ContentScriptEntry { path: string }
+const contentScripts = new Map<string, ContentScriptEntry[]>()
+
+/** Component views are global — every iframe's prelude registers all of them. */
+const componentViews = new Map<string, ComponentViewEntry>()
+
+/** Function sources are global too. Last-write-wins per name. */
+const functionSources = new Map<string, FunctionSourceEntry>()
 
 function resolveAgainstPlugin(modulePath: string, pluginDir: string): string {
   if (path.isAbsolute(modulePath)) return modulePath
@@ -54,208 +81,247 @@ function resolveAgainstPlugin(modulePath: string, pluginDir: string): string {
 }
 
 /**
- * Resolve the framework's `DbService` instance lazily. The advice +
- * content-script registrars are called inside plugin service
- * `evaluate()` blocks; by that point the runtime has finished
- * resolving service deps and `db` is in the slot table.
- *
- * Returns `undefined` if the slot isn't ready yet (e.g. during boot
- * sequencing); callers fire and forget so missing writes just no-op.
+ * Invalidate the `/@advice-prelude/<type>` virtual module in the host
+ * Vite graph so the next request regenerates from the live maps.
+ * Wildcards / component-view / function changes fan out across every
+ * prelude module.
  */
-function getDb():
-  | {
-      effectClient: {
-        update: (fn: (root: any) => void) => Effect.Effect<unknown>
+function invalidatePrelude(type: string) {
+  try {
+    const reloader = runtime.getSlot("reloader")?.instance as
+      | { get(id: string): { viteServer?: any } | undefined }
+      | undefined
+    if (!reloader) return
+    const coreEntry = reloader.get(APP_RENDERER_RELOADER_ID)
+    if (!coreEntry?.viteServer) return
+    const graph = coreEntry.viteServer.moduleGraph
+    const invalidateMatching = (test: (id: string) => boolean) => {
+      const ids: string[] = []
+      for (const id of graph.idToModuleMap.keys()) {
+        if (typeof id !== "string") continue
+        if (test(id)) ids.push(id)
       }
-      client: { readRoot: () => any }
+      for (const id of ids) {
+        const mod = graph.getModuleById(id)
+        if (mod) graph.invalidateModule(mod)
+      }
     }
-  | undefined {
-  return runtime.getSlot("db")?.instance as any
-}
-
-/**
- * fixme: we need to implement queued writes internally in kyju
- */
-let writeChain: Promise<void> = Promise.resolve()
-
-/**
- * Public so `FunctionRegistryService` / `ViewRegistryService` /
- * anything else that writes to `core.registrations` can share the
- * same chain. All registrations-table writes from the main process
- * MUST go through here, not through bare `Effect.runPromise`.
- */
-export function enqueueRegistrationsWrite(
-  build: (root: any) => void,
-): Promise<void> {
-  const db = getDb()
-  if (!db) return Promise.resolve()
-  writeChain = writeChain.then(() =>
-    Effect.runPromise(db.effectClient.update(build)).then(
-      () => {},
-      (err) => {
-        console.error("[advice-config] write failed:", err)
-      },
-    ),
-  )
-  return writeChain
-}
-
-function enqueueWrite(build: (root: any) => void): void {
-  void enqueueRegistrationsWrite(build)
-}
-
-function writeRegistration(
-  matcher: (r: any) => boolean,
-  next: Record<string, unknown>,
-): void {
-  enqueueWrite((root) => {
-    const idx = root.core.registrations.findIndex(matcher)
-    if (idx >= 0) {
-      const prev = root.core.registrations[idx]
-      const rev =
-        prev.modulePath === next.modulePath
-          ? prev.rev
-          : (prev.rev ?? 0) + 1
-      root.core.registrations[idx] = { ...next, rev }
+    if (
+      type === "*" ||
+      type === "**components" ||
+      type === "**functions"
+    ) {
+      // Wildcard advice and the two global registries all affect every
+      // prelude. The `**components` / `**functions` sentinels exist so
+      // `emitReload` can distinguish them from user `view: "*"`.
+      invalidateMatching((id) => id.startsWith(RESOLVED_PREFIX))
     } else {
-      root.core.registrations.push({ ...next, rev: 0 })
+      const prefix = RESOLVED_PREFIX + type
+      invalidateMatching(
+        (id) => id === prefix || id.startsWith(prefix + "?"),
+      )
     }
-  })
+  } catch {}
 }
 
-function removeRegistration(matcher: (r: any) => boolean): void {
-  enqueueWrite((root) => {
-    const idx = root.core.registrations.findIndex(matcher)
-    if (idx >= 0) root.core.registrations.splice(idx, 1)
-  })
+/**
+ * Invalidate the prelude module(s) for `type`, then publish
+ * `core.advice.reload` so connected iframes reload. The
+ * `**components` / `**functions` sentinels collapse to `"*"` on the
+ * wire — those registrations are global.
+ */
+function emitReload(type: string) {
+  invalidatePrelude(type)
+  try {
+    const rpc = runtime.getSlot("rpc")?.instance as
+      | {
+          emit: {
+            core: { advice: { reload(payload: { type: string }): void } }
+          }
+        }
+      | undefined
+    if (!rpc) return
+    const userType =
+      type === "**components" || type === "**functions" ? "*" : type
+    rpc.emit.core.advice.reload({ type: userType })
+  } catch {}
 }
 
 // --- Advice ---
 
-/**
- * Internal advice registrar. Called by `Service#advise` after the
- * runtime has resolved the calling plugin's root directory from its
- * service slot. User code uses `service.advise({...})`.
- *
- * Returns a synchronous dispose that queues the corresponding row's
- * removal from `core.registrations`. The dispose runs from the
- * service `setup()` machinery on plugin teardown / hot reload.
- */
+/** Internal advice registrar. User code calls `service.advise({...})`. */
 export function addAdvice(pluginDir: string, spec: AdviceSpec): () => void {
-  const resolvedPath = resolveAgainstPlugin(spec.modulePath, pluginDir)
-  const matcher = (r: any) =>
-    r.kind === "advice" &&
-    r.view === spec.view &&
-    r.moduleId === spec.moduleId &&
-    r.name === spec.name &&
-    r.adviceType === spec.type &&
-    r.modulePath === resolvedPath &&
-    r.exportName === spec.exportName
-
-  writeRegistration(matcher, {
-    kind: "advice",
-    view: spec.view,
-    moduleId: spec.moduleId,
-    name: spec.name,
-    adviceType: spec.type,
-    modulePath: resolvedPath,
-    exportName: spec.exportName,
-  })
+  const { view, ...entry } = spec
+  const resolvedEntry: ViewAdviceEntry = {
+    ...entry,
+    modulePath: resolveAgainstPlugin(entry.modulePath, pluginDir),
+  }
+  const list = adviceEntries.get(view) ?? []
+  list.push(resolvedEntry)
+  adviceEntries.set(view, list)
+  emitReload(view)
 
   return () => {
-    removeRegistration(matcher)
+    const current = adviceEntries.get(view)
+    if (!current) return
+    const idx = current.indexOf(resolvedEntry)
+    if (idx >= 0) current.splice(idx, 1)
+    if (current.length === 0) adviceEntries.delete(view)
+    emitReload(view)
   }
+}
+
+/**
+ * Advice that applies to `type`. Wildcards come first so view-scoped
+ * advice wraps them in the around-chain order.
+ */
+export function getAdvice(type: string): ViewAdviceEntry[] {
+  const scoped = adviceEntries.get(type) ?? []
+  const wildcard = type !== "*" ? (adviceEntries.get("*") ?? []) : []
+  return [...wildcard, ...scoped]
+}
+
+export function getAllAdviceTypes(): string[] {
+  return [...adviceEntries.keys()]
 }
 
 // --- Content Scripts ---
 
-/**
- * Internal content-script registrar. Called by
- * `Service#contentScript` after the runtime has resolved the calling
- * plugin's root directory. User code uses
- * `service.contentScript({...})`.
- */
+/** Internal content-script registrar. User code calls `service.contentScript({...})`. */
 export function addContentScript(
   pluginDir: string,
   spec: ContentScriptSpec,
 ): () => void {
-  const resolvedPath = resolveAgainstPlugin(spec.modulePath, pluginDir)
-  const matcher = (r: any) =>
-    r.kind === "contentScript" &&
-    r.view === spec.view &&
-    r.modulePath === resolvedPath
-
-  writeRegistration(matcher, {
-    kind: "contentScript",
-    view: spec.view,
-    modulePath: resolvedPath,
-    exportName: "default",
-  })
+  const { view, modulePath } = spec
+  const resolvedPath = resolveAgainstPlugin(modulePath, pluginDir)
+  const entry: ContentScriptEntry = { path: resolvedPath }
+  const list = contentScripts.get(view) ?? []
+  list.push(entry)
+  contentScripts.set(view, list)
+  emitReload(view === "*" ? "*" : view)
 
   return () => {
-    removeRegistration(matcher)
+    const current = contentScripts.get(view)
+    if (!current) return
+    const idx = current.indexOf(entry)
+    if (idx >= 0) current.splice(idx, 1)
+    if (current.length === 0) contentScripts.delete(view)
+    emitReload(view === "*" ? "*" : view)
   }
 }
 
-// --- Reads (for the Vite plugin's manifest injection) ---
+export function getContentScripts(type: string): string[] {
+  const scoped = (contentScripts.get(type) ?? []).map(e => e.path)
+  const global = type !== "*" ? (contentScripts.get("*") ?? []).map(e => e.path) : []
+  return [...global, ...scoped]
+}
+
+export function getAllContentScriptPaths(): string[] {
+  const paths: string[] = []
+  for (const list of contentScripts.values()) {
+    for (const entry of list) paths.push(entry.path)
+  }
+  return paths
+}
+
+export function getAllTypes(): string[] {
+  const types = new Set<string>()
+  for (const k of adviceEntries.keys()) types.add(k)
+  for (const k of contentScripts.keys()) if (k !== "*") types.add(k)
+  for (const k of componentViews.keys()) types.add(k)
+  for (const k of functionSources.keys()) types.add(k)
+  return [...types]
+}
+
+// --- Component views ---
 
 /**
- * Snapshot the current advice + content-script rows for a renderer
- * about to be served. Filters by view type (mirrors the wildcard
- * semantics — `view: "*"` entries apply to every concrete view).
- *
- * Returns rows in the form the renderer-side bootstrap module
- * expects.
+ * Internal component-view registrar. Pass `pluginDir = null` to require
+ * an absolute `modulePath`.
  */
-export function readBootstrapManifest(
-  viewType: string,
-): {
-  advice: Array<{
-    moduleId: string
-    name: string
-    adviceType: "replace" | "before" | "after" | "around"
-    modulePath: string
-    exportName: string
-    rev: number
-    view: string
-  }>
-  contentScripts: Array<{ modulePath: string; rev: number; view: string }>
-} {
-  const db = getDb()
-  if (!db) return { advice: [], contentScripts: [] }
-  const root = db.client.readRoot()
-  const all = (root.core.registrations ?? []) as any[]
-  const advice = all
-    .filter(
-      (r) =>
-        r.kind === "advice" && (r.view === viewType || r.view === "*"),
-    )
-    .map((r) => ({
-      moduleId: r.moduleId,
-      name: r.name,
-      adviceType: r.adviceType,
-      modulePath: r.modulePath,
-      exportName: r.exportName ?? "default",
-      rev: r.rev ?? 0,
-      view: r.view,
-    }))
-  const contentScripts = all
-    .filter(
-      (r) =>
-        r.kind === "contentScript" &&
-        (r.view === viewType || r.view === "*"),
-    )
-    .map((r) => ({ modulePath: r.modulePath, rev: r.rev ?? 0, view: r.view }))
-  // Wildcards first so view-scoped advice wraps wildcard advice in
-  // the around-chain order (preserves the existing behavior).
-  return {
-    advice: [
-      ...advice.filter((a) => a.view === "*"),
-      ...advice.filter((a) => a.view !== "*"),
-    ],
-    contentScripts: [
-      ...contentScripts.filter((c) => c.view === "*"),
-      ...contentScripts.filter((c) => c.view !== "*"),
-    ],
+export function addComponentView(
+  pluginDir: string | null,
+  spec: ComponentViewSpec,
+): () => void {
+  const resolvedPath =
+    pluginDir != null
+      ? resolveAgainstPlugin(spec.modulePath, pluginDir)
+      : (() => {
+          if (!path.isAbsolute(spec.modulePath)) {
+            throw new Error(
+              `[viewRegistry] component view "${spec.type}" has a relative modulePath "${spec.modulePath}" but no plugin root to anchor it against. Pass an absolute path or register from inside a plugin service.`,
+            )
+          }
+          return spec.modulePath
+        })()
+  const entry: ComponentViewEntry = {
+    type: spec.type,
+    modulePath: resolvedPath,
+    exportName: spec.exportName ?? "default",
   }
+  componentViews.set(spec.type, entry)
+  emitReload("**components")
+
+  return () => {
+    // Only clear if we still own the slot — protects against stale
+    // disposes overwriting a later re-registration (HMR).
+    if (componentViews.get(spec.type) === entry) {
+      componentViews.delete(spec.type)
+      emitReload("**components")
+    }
+  }
+}
+
+export function getComponentViews(): ComponentViewEntry[] {
+  return [...componentViews.values()]
+}
+
+export function getAllComponentViewPaths(): string[] {
+  return [...componentViews.values()].map((e) => e.modulePath)
+}
+
+// --- Function sources ---
+
+/**
+ * Internal function-source registrar. Pass `pluginDir = null` to require
+ * an absolute `modulePath`.
+ */
+export function addFunctionSource(
+  pluginDir: string | null,
+  spec: FunctionSourceSpec,
+): () => void {
+  const resolvedPath =
+    pluginDir != null
+      ? resolveAgainstPlugin(spec.modulePath, pluginDir)
+      : (() => {
+          if (!path.isAbsolute(spec.modulePath)) {
+            throw new Error(
+              `[functionRegistry] function "${spec.name}" has a relative modulePath "${spec.modulePath}" but no plugin root to anchor it against. Pass an absolute path or register from inside a plugin service.`,
+            )
+          }
+          return spec.modulePath
+        })()
+  const entry: FunctionSourceEntry = {
+    name: spec.name,
+    modulePath: resolvedPath,
+    exportName: spec.exportName ?? "default",
+    meta: spec.meta,
+  }
+  functionSources.set(spec.name, entry)
+  emitReload("**functions")
+
+  return () => {
+    if (functionSources.get(spec.name) === entry) {
+      functionSources.delete(spec.name)
+      emitReload("**functions")
+    }
+  }
+}
+
+export function getFunctionSources(): FunctionSourceEntry[] {
+  return [...functionSources.values()]
+}
+
+export function getAllFunctionSourcePaths(): string[] {
+  return [...functionSources.values()].map((e) => e.modulePath)
 }

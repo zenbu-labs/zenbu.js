@@ -2,63 +2,21 @@ import zod from "zod";
 import { createSchema, f, type InferSchemaRoot } from "@zenbu/kyju/schema";
 
 /**
- * One row in `core.registrations`: a typed reference to a source
- * module the renderer should dynamically import and apply.
- *
- * Discriminated by `kind`. Common fields live on every row; kind-
- * specific fields hang off the variant. The renderer-side reconciler
- * watches this list, diffs against locally-applied state, and runs
- * kind-specific apply / cleanup on each change.
- *
- * `rev` is a monotonic counter the framework bumps when the source
- * file changes (Vite HMR path). It serves as the cache-buster on the
- * dynamic-import URL (`${modulePath}?rev=${rev}`).
- *
- * `pluginName` records the owning plugin so the framework can prune
- * stale rows that persist across restarts from plugins that are no
- * longer loaded.
+ * One entry in the function registry. The function itself lives only
+ * in the renderer (it's not serializable across processes) — this
+ * entry just describes *which* function should exist and any
+ * meta the chrome / consumers want to filter on.
  */
-const registrationBase = {
-  modulePath: zod.string(),
-  exportName: zod.string().default("default"),
-  rev: zod.number().default(0),
-  pluginName: zod.string().optional(),
-  meta: zod.record(zod.string(), zod.unknown()).optional(),
-};
-
-const functionRegistrationSchema = zod.object({
-  kind: zod.literal("function"),
+const functionRegistryEntrySchema = zod.object({
   name: zod.string(),
-  ...registrationBase,
+  meta: zod
+    .object({
+      kind: zod.string().optional(),
+      label: zod.string().optional(),
+    })
+    .catchall(zod.unknown())
+    .optional(),
 });
-
-const componentViewRegistrationSchema = zod.object({
-  kind: zod.literal("componentView"),
-  type: zod.string(),
-  ...registrationBase,
-});
-
-const adviceRegistrationSchema = zod.object({
-  kind: zod.literal("advice"),
-  view: zod.string(),
-  moduleId: zod.string(),
-  name: zod.string(),
-  adviceType: zod.enum(["before", "after", "around", "replace"]),
-  ...registrationBase,
-});
-
-const contentScriptRegistrationSchema = zod.object({
-  kind: zod.literal("contentScript"),
-  view: zod.string(),
-  ...registrationBase,
-});
-
-const registrationSchema = zod.discriminatedUnion("kind", [
-  functionRegistrationSchema,
-  componentViewRegistrationSchema,
-  adviceRegistrationSchema,
-  contentScriptRegistrationSchema,
-]);
 
 const viewRegistryEntrySchema = zod.object({
   type: zod.string(),
@@ -143,26 +101,20 @@ const focusStateSchema = zod.object({
 
 const schema = createSchema({
   /**
-   *
-   * this needs to be changed, and we probably
-   * should have an api for reading in memory state
-   * on the service so we don't need to do these hacks
-   *
-   * */
+   * Snapshot of the in-memory view registry, written by
+   * `ViewRegistryService.syncToDb` whenever the in-memory map
+   * changes. The renderer reads this to resolve `<View type="x">` to
+   * a URL (iframe mode) or to discover component-mode entries for
+   * chrome (sidebar slot, bottom-panel slot, label).
+   */
   lastKnownViewRegistry: f.array(viewRegistryEntrySchema).default([]),
   /**
-   * Single source of truth for all renderer-loaded plugin
-   * registrations: functions, component views, advice, content
-   * scripts. The renderer's reconciler watches this list, diffs
-   * against its locally-applied state, and dynamic-imports + applies
-   * new or changed entries (and cleans up removals). See
-   * `registrationSchema` for the discriminated union.
-   *
-   * Iframe views are *not* in here — they don't load a module into
-   * the renderer realm, they get rendered as `<iframe src=URL>`.
-   * `lastKnownViewRegistry` continues to track those.
+   * Mirror of `lastKnownViewRegistry` for renderer-side function
+   * registrations declared by services. Holds only metadata — the
+   * actual function lives in the iframe's `@zenbujs/core/react`
+   * client registry, populated by the prelude codegen.
    */
-  registrations: f.array(registrationSchema).default([]),
+  lastKnownFunctionRegistry: f.array(functionRegistryEntrySchema).default([]),
   windowPrefs: f.record(zod.string(), windowPrefsSchema).default({}),
   /**
    * Per-shortcut binding override. The full list of available shortcuts
@@ -192,11 +144,7 @@ export default schema;
 export { schema };
 
 export type ViewRegistryEntry = zod.infer<typeof viewRegistryEntrySchema>;
-export type Registration = zod.infer<typeof registrationSchema>;
-export type FunctionRegistration = zod.infer<typeof functionRegistrationSchema>;
-export type ComponentViewRegistration = zod.infer<typeof componentViewRegistrationSchema>;
-export type AdviceRegistration = zod.infer<typeof adviceRegistrationSchema>;
-export type ContentScriptRegistration = zod.infer<typeof contentScriptRegistrationSchema>;
+export type FunctionRegistryEntry = zod.infer<typeof functionRegistryEntrySchema>;
 export type WindowBounds = zod.infer<typeof windowBoundsSchema>;
 export type WindowPrefs = zod.infer<typeof windowPrefsSchema>;
 export type ShortcutBinding = zod.infer<typeof shortcutBindingSchema>;

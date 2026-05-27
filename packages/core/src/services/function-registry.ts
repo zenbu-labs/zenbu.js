@@ -1,33 +1,32 @@
+import * as Effect from "effect/Effect";
 import { Service, runtime } from "../runtime";
 import { DbService } from "./db";
-import { enqueueRegistrationsWrite } from "./advice-config";
+import { addFunctionSource } from "./advice-config";
 import { createLogger } from "../shared/log";
 
 const log = createLogger("function-registry");
 
 /**
- * Opaque, JSON-serializable metadata attached to a registered function.
- * Surfaced verbatim to the renderer via `core.registrations`; the
- * renderer's `useFunctions` hook uses `meta` to filter \u2014 e.g.
- * `useFunctions({ kind: "cm.completion" })`. Conventions for keys are
- * up to the subsystem that defined the function point.
+ * Opaque, JSON metadata attached to a registered function. Surfaced via
+ * `core.lastKnownFunctionRegistry`; consumers filter on it via
+ * `useFunctions({ kind: "..." })`.
  */
 export type FunctionMeta = Record<string, unknown> & {
   kind?: string;
   label?: string;
 };
 
+interface FunctionEntry {
+  name: string;
+  meta?: FunctionMeta;
+  /** Removes the prelude registration + triggers a reload. */
+  disposeSource: () => void;
+}
+
 /**
- * Spec for registering a renderer-side function. The function itself
- * lives in a source file (`modulePath`); the renderer-side reconciler
- * dynamically imports it and pushes the export into the in-renderer
- * `@zenbujs/core/react` function registry under `name`.
- *
- * `modulePath` must be absolute (same convention as
- * `ViewRegistry.register`'s `root` and component-view sources).
- *
- * `exportName` defaults to `"default"`. `meta` is opaque JSON that
- * consumers can filter on via `useFunctions({ kind: "..." })`.
+ * Spec for registering a renderer-side function. Every iframe's
+ * prelude imports `modulePath` and pushes the export into the client
+ * function registry under `name`. `modulePath` must be absolute.
  */
 export interface RegisterFunctionSpec {
   name: string;
@@ -37,87 +36,75 @@ export interface RegisterFunctionSpec {
 }
 
 /**
- * Server-side registry for renderer functions.
- *
- * The function itself is a runtime value that only exists in the
- * renderer realm; this service just writes a row into
- * `core.registrations` describing *which* module to load and how to
- * apply it. The renderer's reconciler picks it up, dynamic-imports
- * the source, and pushes the export into the in-process function
- * registry that `useFunction` / `useFunctions` read.
- *
- * No prelude codegen, no `emitReload` RPC event. Live add/remove and
- * source-file HMR all flow through the same db patch.
+ * Server-side registry for renderer functions. Source modules go through
+ * the prelude pipeline; metadata mirrors to
+ * `core.lastKnownFunctionRegistry` for discovery.
  */
 export class FunctionRegistryService extends Service.create({
   key: "functionRegistry",
   deps: { db: DbService },
 }) {
-  /**
-   * Last-write-wins per `name`. Re-registering replaces the existing
-   * row in `core.registrations`.
-   */
-  async register(spec: RegisterFunctionSpec): Promise<void> {
+  private fns = new Map<string, FunctionEntry>();
+
+  register(spec: RegisterFunctionSpec): FunctionEntry {
     const { name, modulePath, exportName, meta } = spec;
     log.verbose(
       `register("${name}", modulePath="${modulePath}", export="${exportName ?? "default"}")`,
     );
-    await enqueueRegistrationsWrite((root) => {
-      const existing = root.core.registrations.findIndex(
-        (r: any) => r.kind === "function" && r.name === name,
-      );
-      const next = {
-        kind: "function" as const,
-        name,
-        modulePath,
-        exportName: exportName ?? "default",
-        rev: 0,
-        meta,
-      };
-      if (existing >= 0) {
-        next.rev = root.core.registrations[existing]!.rev;
-        if (root.core.registrations[existing]!.modulePath !== modulePath) {
-          next.rev = next.rev + 1;
-        }
-        root.core.registrations[existing] = next;
-      } else {
-        root.core.registrations.push(next);
-      }
+    // Re-registration replaces: dispose the old source so its prelude
+    // entry drops before we emit the new one.
+    const existing = this.fns.get(name);
+    if (existing) existing.disposeSource();
+
+    const disposeSource = addFunctionSource(null, {
+      name,
+      modulePath,
+      exportName,
+      meta,
     });
+    const entry: FunctionEntry = { name, meta, disposeSource };
+    this.fns.set(name, entry);
+    void this.syncToDb();
+    return entry;
   }
 
-  async unregister(name: string): Promise<void> {
-    log.verbose(`unregister("${name}")`);
-    await enqueueRegistrationsWrite((root) => {
-      const idx = root.core.registrations.findIndex(
-        (r: any) => r.kind === "function" && r.name === name,
-      );
-      if (idx >= 0) root.core.registrations.splice(idx, 1);
-    });
+  unregister(name: string): void {
+    const entry = this.fns.get(name);
+    if (!entry) return;
+    entry.disposeSource();
+    this.fns.delete(name);
+    void this.syncToDb();
   }
 
-  /**
-   * Read the current registration for `name`, if any. Sync via
-   * `client.readRoot()` \u2014 used by the Vite plugin's
-   * `handleHotUpdate` to find which rows to bump on a file change.
-   */
-  get(name: string) {
-    const root = this.ctx.db.client.readRoot();
-    return root.core.registrations.find(
-      (r) => r.kind === "function" && r.name === name,
-    );
+  get(name: string): FunctionEntry | undefined {
+    return this.fns.get(name);
   }
 
   evaluate() {
-    this.setup("function-registry-cleanup", () => () => {
-      // Drop every function row owned by this process when the service
-      // tears down (full restart or hot-reload).
-      void enqueueRegistrationsWrite((root) => {
-        root.core.registrations = root.core.registrations.filter(
-          (r: any) => r.kind !== "function",
-        );
-      });
+    // Wipe stale rows on boot, dispose source registrations on teardown.
+    void this.syncToDb();
+    this.setup("function-registry-cleanup", () => {
+      return async () => {
+        for (const entry of this.fns.values()) {
+          entry.disposeSource();
+        }
+        this.fns.clear();
+        await this.syncToDb();
+      };
     });
+  }
+
+  private async syncToDb(): Promise<void> {
+    const client = this.ctx.db.effectClient;
+    const snapshot = [...this.fns.values()].map((e) => ({
+      name: e.name,
+      meta: e.meta,
+    }));
+    await Effect.runPromise(
+      client.update((root) => {
+        root.core.lastKnownFunctionRegistry = snapshot;
+      }),
+    ).catch(() => {});
   }
 }
 

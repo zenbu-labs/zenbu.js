@@ -3,37 +3,37 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
 import { zenbuAdvicePlugin } from "@zenbu/advice/vite";
-import { runtime, getConfig, subscribeConfig } from "./runtime";
+import { getConfig, subscribeConfig } from "./runtime";
 import {
-  readBootstrapManifest,
-  enqueueRegistrationsWrite,
+  getAdvice,
+  getAllTypes,
+  getContentScripts,
+  getAllContentScriptPaths,
+  getComponentViews,
+  getAllComponentViewPaths,
+  getFunctionSources,
+  getAllFunctionSourcePaths,
+  type ViewAdviceEntry,
+  type ComponentViewEntry,
+  type FunctionSourceEntry,
 } from "./services/advice-config";
 
 /**
- * Renderer-side Vite plugins that wire the framework's per-renderer
- * extras into every Zenbu view. Auto-injected by `ReloaderService` —
- * users don't need to import these in their own `vite.config.ts`.
+ * Per-renderer Vite plugins, auto-injected by `ReloaderService`. Wires
+ * three things into every Zenbu view's `<head>`:
  *
- * What this wires up, per renderer:
- *
- *   1. Theme tokens inlined into `<head>` as a synchronous `<style>`
- *      so first paint matches the host theme.
- *   2. Static framework preludes (boot-trace, view-args listener,
- *      theme listener, shortcut bridge) inlined as a single sync
- *      `<script>` block.
- *   3. The reconciler bootstrap: an inline JSON manifest with this
- *      view type's advice + content-script registrations, plus a
- *      fixed `<script type="module" src="/@zenbu/bootstrap">` that
- *      reads the manifest, dynamic-imports each entry, applies it,
- *      and `await`s — blocking the app's own entry script until
- *      advice + content scripts are in place. Functions and
- *      component views are resolved post-mount by the live
- *      reconciler subscribed to `db.core.registrations`.
- *
- * The old per-view prelude codegen (`/@advice-prelude/<type>`) is
- * gone. All four kinds of plugin registration live in
- * `db.core.registrations` and flow through the reconciler.
+ *   1. Inline theme tokens (first paint matches host theme).
+ *   2. Inline static preludes (boot-trace, view-args, theme, shortcuts).
+ *   3. Per-view advice prelude at `/@advice-prelude/<type>` — a virtual
+ *      module generated from the maps in `advice-config.ts` (advice,
+ *      content scripts, component views, function sources). Loaded as
+ *      a normal `<script type="module">` so everything lands in the
+ *      iframe's initial dependency graph and evaluates before
+ *      `main.tsx`.
  */
+
+const PRELUDE_PREFIX = "/@advice-prelude/";
+const RESOLVED_PREFIX = "\0@advice-prelude/";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ADVICE_RUNTIME_ENTRY = path.resolve(HERE, "advice-runtime.mjs");
@@ -48,15 +48,6 @@ const VIEW_ARGS_ENTRY = path.resolve(HERE, "prelude/view-args.mjs");
 const THEME_LISTENER_SPECIFIER = "@zenbu/core/prelude/theme-listener";
 const SHORTCUT_BRIDGE_SPECIFIER = "@zenbu/core/prelude/shortcut-bridge";
 const BOOT_TRACE_SPECIFIER = "@zenbu/core/prelude/boot-trace";
-
-/**
- * Virtual module URL for the reconciler bootstrap. Resolved + loaded
- * by `reconcilerBootstrapPlugin` below. Always points at the same
- * fixed JS body; only the inline JSON manifest in the HTML changes.
- */
-const BOOTSTRAP_URL = "/@zenbu/bootstrap";
-const BOOTSTRAP_RESOLVED = "\0@zenbu/bootstrap";
-const BOOTSTRAP_MANIFEST_ID = "zenbu-bootstrap-manifest";
 
 const CORE_PACKAGE_ROOT = path.resolve(HERE, "..");
 
@@ -82,6 +73,7 @@ function getTypeFromPath(urlPath: string): string | null {
   return m ? m[1]! : null;
 }
 
+/** Resolve view type from `/views/<type>/...` path or `?type=<name>` query. */
 function resolveType(
   urlPath: string,
   originalUrl: string | undefined,
@@ -95,6 +87,13 @@ function resolveType(
   return params.get("type");
 }
 
+function parsePreludeId(id: string): { type: string } {
+  const rest = id.slice(RESOLVED_PREFIX.length);
+  const queryIdx = rest.indexOf("?");
+  if (queryIdx < 0) return { type: rest };
+  return { type: rest.slice(0, queryIdx) };
+}
+
 /* ---------- Static framework preludes (inlined into HTML) ---------- */
 
 let cachedStaticPreludeBody: string | null = null;
@@ -102,6 +101,9 @@ function getStaticPreludeBody(): string {
   if (cachedStaticPreludeBody !== null) return cachedStaticPreludeBody;
   const entries = [
     { path: BOOT_TRACE_ENTRY, exportNames: ["installBootTraceRenderer"] },
+    // View-args listener runs as early as possible so the parent's
+    // first `zenbu:view-args` message (sent in response to our
+    // `zenbu:view-ready` ping) is never dropped.
     { path: VIEW_ARGS_ENTRY, exportNames: ["installViewArgsListener"] },
     { path: THEME_LISTENER_ENTRY, exportNames: ["installThemeListener"] },
     { path: SHORTCUT_BRIDGE_ENTRY, exportNames: ["installShortcutBridge"] },
@@ -126,6 +128,111 @@ function buildInlinePreludeScript(viewType: string): string | null {
   if (!body) return null;
   const safeType = JSON.stringify(viewType);
   return `${body}\ninstallBootTraceRenderer(${safeType});\ninstallViewArgsListener();\ninstallThemeListener();\ninstallShortcutBridge(${safeType});`;
+}
+
+/* ---------- Per-view advice prelude codegen ---------- */
+
+/** `replace` / `advise` imports for every entry that applies to this view. */
+function generateAdvicePreludeCode(
+  entries: ViewAdviceEntry[],
+  _viewType: string,
+): string {
+  const imports: string[] = [];
+  const calls: string[] = [];
+  if (entries.length > 0) {
+    imports.push('import { replace, advise } from "@zenbu/advice/runtime"');
+    entries.forEach((entry, i) => {
+      const alias = `__r${i}`;
+      imports.push(
+        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
+          entry.modulePath,
+        )}`,
+      );
+      if (entry.type === "replace") {
+        calls.push(
+          `replace(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
+            entry.name,
+          )}, ${alias})`,
+        );
+      } else {
+        calls.push(
+          `advise(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
+            entry.name,
+          )}, ${JSON.stringify(entry.type)}, ${alias})`,
+        );
+      }
+    });
+  }
+  if (imports.length === 0 && calls.length === 0) return "";
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
+}
+
+/**
+ * Imports every component-view source and pushes it into the renderer's
+ * client registry. Emitted into every iframe (any iframe might render
+ * a `<View type="x" rendering="component">`). Relies on
+ * `dedupe: ["@zenbujs/core"]` so the registry mutated here is the same
+ * module instance `<View>` reads from.
+ */
+function generateComponentViewPreludeCode(
+  entries: ComponentViewEntry[],
+): string {
+  if (entries.length === 0) return "";
+  const imports: string[] = [
+    'import { registerViewComponent as __zb_registerViewComponent } from "@zenbujs/core/react"',
+  ];
+  const calls: string[] = [];
+  entries.forEach((entry, i) => {
+    const alias = `__cv${i}`;
+    if (entry.exportName === "default") {
+      imports.push(
+        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
+      );
+    } else {
+      imports.push(
+        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
+          entry.modulePath,
+        )}`,
+      );
+    }
+    calls.push(
+      `__zb_registerViewComponent(${JSON.stringify(entry.type)}, ${alias})`,
+    );
+  });
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
+}
+
+/** Same as component-view codegen but for the function registry. */
+function generateFunctionSourcePreludeCode(
+  entries: FunctionSourceEntry[],
+): string {
+  if (entries.length === 0) return "";
+  const imports: string[] = [
+    'import { registerFunction as __zb_registerFunction } from "@zenbujs/core/react"',
+  ];
+  const calls: string[] = [];
+  entries.forEach((entry, i) => {
+    const alias = `__fn${i}`;
+    if (entry.exportName === "default") {
+      imports.push(
+        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
+      );
+    } else {
+      imports.push(
+        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
+          entry.modulePath,
+        )}`,
+      );
+    }
+    // `meta` is opaque JSON; JSON.stringify both validates serializability
+    // and produces a literal we can inline directly.
+    const metaLiteral =
+      entry.meta === undefined ? "undefined" : JSON.stringify(entry.meta);
+    calls.push(
+      `__zb_registerFunction(${JSON.stringify(entry.name)}, ${alias}, ${metaLiteral})`,
+    );
+  });
+  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
 }
 
 /* ---------- Inline theme tokens ---------- */
@@ -201,88 +308,81 @@ export function resolveAdviceRuntime(): Plugin {
   };
 }
 
-/* ---------- Reconciler bootstrap ---------- */
+/* ---------- Per-iframe prelude plugin ---------- */
 
 /**
- * The fixed bootstrap script the iframe loads via
- * `<script type="module" src="/@zenbu/bootstrap">`. It reads the
- * inline JSON manifest from `<script type="application/json"
- * id="zenbu-bootstrap-manifest">`, then for each entry:
- *
- *   - dynamic-imports `${modulePath}?rev=${rev}` (cache-busted),
- *   - applies it via the kind-specific applier in
- *     `@zenbujs/core/react`'s `__applyBootstrapRegistrations`,
- *   - stores the resulting cleanup so a later removal can undo it.
- *
- * Because this is a `<script type="module">` with a top-level
- * `await`, subsequent module scripts in the same document — notably
- * the app's main entry — wait for our `await` to settle. By the time
- * `main.tsx` runs, advice and content scripts that were in the
- * manifest at HTML-serve time are already in place.
- *
- * Functions and component views are NOT in the manifest. They're
- * picked up by the live reconciler after `ZenbuProvider` connects.
+ * Virtual prelude module at `/@advice-prelude/<type>`. Body is generated
+ * on demand from the maps in `advice-config.ts`. Registration changes
+ * call `emitReload(view)` → invalidate the module + ping the iframe via
+ * `core.advice.reload` so it `location.reload()`s with a fresh prelude.
  */
-const BOOTSTRAP_CODE = `import { __applyBootstrapRegistrations } from "@zenbujs/core/react"
-
-const manifestEl = document.getElementById(${JSON.stringify(
-  BOOTSTRAP_MANIFEST_ID,
-)})
-if (manifestEl && manifestEl.textContent) {
-  try {
-    const manifest = JSON.parse(manifestEl.textContent)
-    await __applyBootstrapRegistrations(manifest)
-  } catch (err) {
-    console.error("[zenbu/bootstrap] failed:", err)
-  }
-}
-`;
-
-export function reconcilerBootstrapPlugin(): Plugin {
+export function advicePreludePlugin(): Plugin {
   return {
-    name: "zenbu-reconciler-bootstrap",
+    name: "zenbu-advice-prelude",
     enforce: "pre",
 
     resolveId(source) {
-      if (source === BOOTSTRAP_URL) return BOOTSTRAP_RESOLVED;
+      if (source.startsWith(PRELUDE_PREFIX)) {
+        return RESOLVED_PREFIX + source.slice(PRELUDE_PREFIX.length);
+      }
       return null;
     },
 
     load(id) {
-      if (id === BOOTSTRAP_RESOLVED) return BOOTSTRAP_CODE;
-      return null;
+      if (!id.startsWith(RESOLVED_PREFIX)) return null;
+      const { type } = parsePreludeId(id);
+      let code = generateAdvicePreludeCode(getAdvice(type), type);
+      for (const scriptPath of getContentScripts(type)) {
+        code += `import ${JSON.stringify(scriptPath)}\n`;
+      }
+      // Component views + functions are global — every iframe gets both.
+      code += generateComponentViewPreludeCode(getComponentViews());
+      code += generateFunctionSourcePreludeCode(getFunctionSources());
+      return code || "// empty: static preludes are inlined in HTML\n";
     },
 
-    /**
-     * Source-file change \u2192 bump `rev` on every matching row in
-     * `db.core.registrations`. The reconciler treats a `rev` change
-     * as "replace": cleanup the previous applied state, dynamic-
-     * import the new `?rev=N` URL, run the applier again. No page
-     * reload for any of the four kinds.
-     */
     handleHotUpdate({ file, server }) {
-      const dbSlot = runtime.getSlot("db")?.instance as
-        | { client: { readRoot: () => any } }
-        | undefined;
-      if (!dbSlot) return undefined;
-      const root = dbSlot.client.readRoot();
-      const matches = root.core.registrations.some(
-        (r: { modulePath: string }) => r.modulePath === file,
-      );
-      if (!matches) return undefined;
-
-      void enqueueRegistrationsWrite((root: any) => {
-        for (const reg of root.core.registrations) {
-          if (reg.modulePath === file) {
-            reg.rev = (reg.rev ?? 0) + 1;
+      let matched = false;
+      for (const type of getAllTypes()) {
+        for (const entry of getAdvice(type)) {
+          if (file === entry.modulePath) {
+            matched = true;
+            break;
           }
         }
+        if (matched) break;
+      }
+      // Editing any of these source files needs a full reload — the
+      // registration is a side effect of the prelude script, which
+      // only runs at iframe boot.
+      if (!matched) matched = getAllContentScriptPaths().includes(file);
+      if (!matched) matched = getAllComponentViewPaths().includes(file);
+      if (!matched) matched = getAllFunctionSourcePaths().includes(file);
+      if (matched) {
+        server.ws.send({ type: "full-reload" });
+        return [];
+      }
+      return undefined;
+    },
+
+    configureServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        const url = req.url ?? "";
+        if (!url.startsWith(PRELUDE_PREFIX)) return next();
+        try {
+          const result = await server.transformRequest(url);
+          if (result) {
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/javascript");
+            res.setHeader("Cache-Control", "no-cache");
+            res.end(result.code);
+            return;
+          }
+        } catch (e) {
+          console.error("[advice-prelude] transform error:", e);
+        }
+        next();
       });
-      try {
-        const mod = server.moduleGraph.getModuleById(file);
-        if (mod) server.moduleGraph.invalidateModule(mod);
-      } catch {}
-      return [];
     },
 
     transformIndexHtml(html, ctx) {
@@ -296,7 +396,7 @@ export function reconcilerBootstrapPlugin(): Plugin {
         injectTo: "head" | "head-prepend" | "body" | "body-prepend";
       }> = [];
 
-      // 1. Inline theme tokens \u2014 first paint matches host theme.
+      // 1. Inline theme tokens — first paint matches host theme.
       const themeCss = buildInlineThemeCss(extractThemeParam(ctx.originalUrl));
       if (themeCss) {
         tags.push({
@@ -316,21 +416,22 @@ export function reconcilerBootstrapPlugin(): Plugin {
           children: inlinePrelude,
           injectTo: "head",
         });
+      } else {
+        // Fallback: dist files missing (shouldn't happen in dev once
+        // `pnpm build` has run once). Fall back to the legacy module-
+        // script path so the listeners still install, just slower.
+        tags.push({
+          tag: "script",
+          attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
+          injectTo: "head",
+        });
       }
 
-      // 3. The reconciler bootstrap. Inline manifest (advice + content
-      //    scripts for this view type at HTML-serve time) plus the
-      //    fixed bootstrap module that reads it and applies.
-      const manifest = readBootstrapManifest(type);
+      // 3. Per-view advice prelude. Always injected so future
+      //    registrations can invalidate + reload via the same URL.
       tags.push({
         tag: "script",
-        attrs: { type: "application/json", id: BOOTSTRAP_MANIFEST_ID },
-        children: JSON.stringify(manifest),
-        injectTo: "head",
-      });
-      tags.push({
-        tag: "script",
-        attrs: { type: "module", src: BOOTSTRAP_URL },
+        attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
         injectTo: "head",
       });
 
@@ -339,11 +440,7 @@ export function reconcilerBootstrapPlugin(): Plugin {
   };
 }
 
-/**
- * Wraps `@zenbu/advice/vite`'s babel transform so the include filter
- * is scoped to the renderer's resolved root. Keeps advice moduleIds
- * canonical (each renderer transforms its own files).
- */
+/** Scoped wrapper around `@zenbu/advice/vite`'s babel transform. */
 export function zenbuAdviceTransform(): Plugin {
   let inner: any = null;
   return {
@@ -371,7 +468,7 @@ export function zenbuAdviceTransform(): Plugin {
 export function zenbuVitePlugins(): Plugin[] {
   return [
     zenbuFrameworkResolve(),
-    reconcilerBootstrapPlugin(),
+    advicePreludePlugin(),
     resolveAdviceRuntime(),
     zenbuAdviceTransform(),
     pluginSourcesCssPlugin(),
@@ -379,40 +476,13 @@ export function zenbuVitePlugins(): Plugin[] {
   ];
 }
 
-/* ---------- Boot-time `full-reload` guard ----------------------------------
- *
- * On a fresh `.vite/deps` cache, Vite's first `runOptimizer` pass fires
- * `full-reload` once its bundle commits with a different `metadata.hash`
- * than the previous run — by design: "the optimized deps changed, every
- * page in flight needs to refetch with the new `?v=<hash>` URLs". On a
- * fresh project that's effectively always, so on cold boot Vite emits
- * one (sometimes two) `full-reload`s.
- *
- * The renderer is an Electron BrowserWindow whose `loadURL` races the
- * optimizer commit. In the timing we observe today, the optimizer's
- * first commit consistently happens BEFORE the renderer makes any
- * request — i.e., while `server.ws.clients` is still empty. We use that
- * exact condition as the gate: drop `full-reload` ws messages iff there
- * are zero connected HMR clients at the moment of send.
- *
- * Why that's safe: the ws message is only useful as a notification to a
- * connected client that its already-fetched bundle URLs are stale. If
- * no client is connected, no client has fetched any URL from this
- * server yet, so there are no stale references in any page to
- * invalidate. The server-side bookkeeping that DOES matter —
- * `environment.moduleGraph.invalidateAll()` — runs immediately before
- * the ws.send (inside `fullReload()` in vite/dist/.../dep-*.js), so the
- * next `transformRequest` from a future client returns imports stamped
- * with the post-commit hash.
- *
- * Why time-based gating (`Date.now() < deadline`) is NOT safe: a client
- * that connected during the window would have fetched main.tsx with
- * pre-commit hashes baked into its imports; if we then suppressed a
- * post-commit reload, that page would later dynamic-import modules
- * stamped with the new hash and end up with two copies of e.g. `react`
- * in memory (different module identities, hooks throw "invalid hook
- * call"). Gating on `clients.size === 0` excludes that case by
- * construction.
+/**
+ * Drop Vite's cold-boot `full-reload` ws message when no HMR client is
+ * connected yet. The optimizer's first commit races Electron's
+ * `loadURL`; the ws message is only useful to clients with already-
+ * fetched bundle URLs, and `moduleGraph.invalidateAll()` already ran
+ * server-side. Gating on `clients.size === 0` keeps later edits
+ * working normally.
  */
 function bootReloadGuardPlugin(): Plugin {
   return {
@@ -433,11 +503,7 @@ function bootReloadGuardPlugin(): Plugin {
           typeof p === "object" &&
           (p as { type?: string }).type === "full-reload";
         if (isFullReload && (ws.clients?.size ?? 0) === 0) {
-          // No HMR client has fetched anything yet; no stale `?v=`
-          // references exist to invalidate. The server-side
-          // `moduleGraph.invalidateAll()` already ran inside
-          // `fullReload()` before this `ws.send`, so any future
-          // client transform will use the post-commit metadata.
+          // No client connected → no stale URLs to invalidate.
           return undefined as unknown as void;
         }
         return orig(...args);
@@ -446,67 +512,19 @@ function bootReloadGuardPlugin(): Plugin {
   };
 }
 
-/* ---------- Tailwind @source registry for component-mode plugins ---------- */
-
-/**
- * Backs the host-side import:
+/* ---------- Tailwind @source registry for component-mode plugins ----
  *
- *     @import "@zenbujs/core/plugin-sources.css";
- *
- * Resolves through `@zenbujs/core`'s `package.json#exports` to a real
- * file at `dist/plugin-sources.css`. The file's body is a list of
- * Tailwind v4 `@source` directives, one per registered plugin,
- * pointing at that plugin's `src/**` tree. The host's single Tailwind
- * compilation then scans every component-mode plugin's source tree
- * automatically, so utility classes used inside a plugin view land in
- * the host's stylesheet without any host-side bookkeeping.
- *
- * Why a real file instead of a virtual module or a transform-time
- * rewrite? Tailwind v4's vite integration resolves CSS `@import`s
- * through `vite.createIdResolver()`, a stripped-down node resolver
- * that does **not** run user plugin `resolveId` hooks and does **not**
- * see other plugins' `transform` results before its own compiler
- * walks the imports. So neither a virtual specifier nor a string
- * rewrite reliably wins the race — the resolver fires first and
- * errors on undeclared subpaths. An actual file with an actual
- * `exports` entry sidesteps the whole question.
- *
- * This plugin keeps that file's body in sync with the live plugin
- * registry. It writes once during `config()` (before vite serves the
- * first request), and again on every `subscribeConfig` callback.
- *
- * Without this, Tailwind v4 only auto-detects sources under the
- * closest ancestor `package.json` to the host CSS (typically
- * `plugins/app/`), which means any class used exclusively by a
- * sibling plugin silently no-ops unless the host happens to use it
- * too.
+ * Backs `@import "@zenbujs/core/plugin-sources.css"`. Writes a list of
+ * Tailwind v4 `@source` directives — one per registered plugin's
+ * `src/**` tree — to a per-host sidecar file under `node_modules/.zenbu/`.
+ * Aliased via vite `resolve.alias` so each worktree gets its own file
+ * (sharing one in core's dist caused cross-worktree HMR reloads).
  */
 
-/** File extensions a Tailwind scan should consider when walking a
- * plugin's source tree. JS/MJS/CJS are included for compiled
- * plugins loaded from `node_modules`. */
 const PLUGIN_SOURCES_EXTS = "{ts,tsx,js,jsx,mts,mjs,cjs}";
 
-/** Bare specifier used by the host stylesheet:
- *
- *     @import "@zenbujs/core/plugin-sources.css";
- *
- * We intercept it per-host via `resolve.alias` and redirect each
- * dev server's resolution to a file under that host's own
- * `node_modules/.zenbu/`. Previously this resolved through
- * `package.json#exports` to a single shared file in this package's
- * `dist/`, which meant every worktree pointing at the same
- * `@zenbujs/core` install wrote to (and watched) the same mutable
- * sidecar — touching the file in worktree A triggered an HMR full
- * reload in worktree B because B's vite/Tailwind had that exact
- * path in its CSS module graph. Per-host paths fully isolate
- * worktrees. */
 const PLUGIN_SOURCES_SPECIFIER = "@zenbujs/core/plugin-sources.css";
 
-/** Where to write the per-host sidecar. Lives under the consuming
- * project's `node_modules/.zenbu/` so it is gitignored, ephemeral,
- * and outside vite's default file watcher (we trigger reloads
- * explicitly via `server.ws.send`). */
 function pluginSourcesPathFor(root: string): string {
   return path.resolve(root, "node_modules/.zenbu/plugin-sources.css");
 }
@@ -519,18 +537,12 @@ function buildPluginSourcesCss(): string {
     " * the plugin registry changes. */",
   ];
   for (const plugin of plugins) {
-    // Tailwind accepts absolute paths in `@source`; forward slashes
-    // are the portable form on Windows.
     const dir = plugin.dir.replace(/\\/g, "/");
     lines.push(`@source "${dir}/src/**/*.${PLUGIN_SOURCES_EXTS}";`);
   }
   return lines.join("\n") + "\n";
 }
 
-/** Writes the current registry's `@source` list to the given
- * per-host path. Returns `true` when the file's content actually
- * changed (so callers can decide whether to bother triggering an
- * HMR full-reload). */
 function writePluginSourcesFile(file: string): boolean {
   const next = buildPluginSourcesCss();
   let prev: string | null = null;
@@ -555,31 +567,12 @@ function writePluginSourcesFile(file: string): boolean {
 
 export function pluginSourcesCssPlugin(): Plugin {
   let unsubscribe: (() => void) | null = null;
-  // Resolved lazily from the host's vite root. Populated in
-  // `config()` (early enough to be returned in the alias entry)
-  // and refined in `configResolved()` if vite normalizes the root
-  // differently than we guessed.
   let sourcesFile: string = pluginSourcesPathFor(process.cwd());
 
   return {
     name: "zenbu-plugin-sources-css",
     enforce: "pre",
 
-    /**
-     * Sync hook that runs before vite finishes resolving its config,
-     * which itself runs before the first request is served. We:
-     *
-     *   1. Compute the per-host sidecar path from the user's vite
-     *      root (falling back to `cwd`). One host → one file.
-     *   2. Write it to disk so it exists by the time
-     *      `@tailwindcss/vite` opens it.
-     *   3. Install a `resolve.alias` that redirects the bare
-     *      specifier `@zenbujs/core/plugin-sources.css` to that
-     *      per-host path. Aliases are honored by
-     *      `vite.createIdResolver`, which is what Tailwind uses to
-     *      resolve CSS `@import`s — so this wins without needing a
-     *      user `resolveId` hook.
-     */
     config(userConfig) {
       const root = path.resolve(userConfig.root ?? process.cwd());
       sourcesFile = pluginSourcesPathFor(root);
@@ -593,11 +586,6 @@ export function pluginSourcesCssPlugin(): Plugin {
       };
     },
 
-    /**
-     * Vite may normalize `root` differently than we guessed in
-     * `config()` (e.g. when the user passes a relative path). Rewrite
-     * to the canonical path so the alias and the on-disk file agree.
-     */
     configResolved(resolved) {
       const canonical = pluginSourcesPathFor(resolved.root);
       if (canonical !== sourcesFile) {
@@ -606,29 +594,12 @@ export function pluginSourcesCssPlugin(): Plugin {
       }
     },
 
-    /**
-     * Live-update path: when a plugin is registered or removed
-     * (`zenbu.config.ts` / `zenbu.plugin.ts` edits), rewrite the
-     * sidecar file and ping this server's clients so Tailwind
-     * re-walks the new source list. We deliberately do not rely on
-     * vite's chokidar to notice the write — the file lives under
-     * `node_modules/`, which vite's default watcher ignores, and
-     * that ignore is exactly what gives us cross-worktree
-     * isolation. The manual `server.ws.send` is the only reload
-     * signal.
-     */
     configureServer(server) {
       unsubscribe?.();
       let primed = false;
       unsubscribe = subscribeConfig(() => {
-        // Always rewrite the file — covers the race where `config()`
-        // ran before any plugin had been registered. Writes are
-        // content-compared and skipped when nothing changed, so this
-        // is cheap.
         const changed = writePluginSourcesFile(sourcesFile);
         if (!primed) {
-          // `subscribeConfig` fires once immediately on subscription;
-          // don't full-reload on that initial fire.
           primed = true;
           return;
         }
@@ -636,10 +607,6 @@ export function pluginSourcesCssPlugin(): Plugin {
       });
     },
 
-    /**
-     * Production builds run through the same plugin pipeline. Make
-     * sure the file is up to date before rollup walks the CSS graph.
-     */
     buildStart() {
       writePluginSourcesFile(sourcesFile);
     },

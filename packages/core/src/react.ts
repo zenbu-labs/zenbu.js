@@ -48,6 +48,10 @@ import type {
   ResolvedServiceRouter,
   ResolvedEvents,
 } from "./registry";
+import type {
+  PluginRepoRef,
+  UpdateCheck,
+} from "./services/plugin-updater";
 
 type AnyRpc = RouterProxy<
   Record<string, Record<string, Record<string, (...args: any[]) => any>>>
@@ -233,37 +237,61 @@ export function ZenbuProvider({
             return;
           }
 
-          // ----- Registration reconciler -----
-          //
-          // Watches `db.core.registrations` and keeps the in-process
-          // registries (functions, and later component views /
-          // advice / content scripts) in sync. No page reload for
-          // additions, removals, or source-file edits.
-          const dbProxy = db as unknown as {
-            readRoot: () => unknown;
-            core: {
-              registrations: {
-                subscribe: (cb: (next: RegistrationLike[]) => void) => () => void;
-              };
-            };
-          };
-          const stopReconciler = startRegistrationReconciler(
-            { readRoot: dbProxy.readRoot.bind(dbProxy) },
-            (cb) => dbProxy.core.registrations.subscribe(cb),
-          );
+          // Close the race where the iframe's prelude was generated
+          // before late-registering services contributed their
+          // functions / component views. Compare db snapshot to the
+          // in-memory registries the prelude populated; mismatch
+          // → reload once. Fresh prelude has everything, second run
+          // passes the check, no loop.
+          try {
+            const root = (db as unknown as { readRoot: () => unknown }).readRoot();
+            const core = (root as { core?: unknown } | undefined)?.core as
+              | {
+                  lastKnownFunctionRegistry?: Array<{ name: string }>;
+                  lastKnownViewRegistry?: Array<{ type: string; rendering?: string }>;
+                }
+              | undefined;
+            const dbFns = core?.lastKnownFunctionRegistry ?? [];
+            const dbComponentViews = (core?.lastKnownViewRegistry ?? []).filter(
+              (v) => v.rendering === "component",
+            );
+            const missingFn = dbFns.filter((f) => !functionRegistry.has(f.name));
+            const missingView = dbComponentViews.filter(
+              (v) => !viewComponentRegistry.has(v.type),
+            );
+            if (missingFn.length > 0 || missingView.length > 0) {
+              await disconnectDb();
+              disconnectRpc();
+              ws.close();
+              location.reload();
+              return;
+            }
+          } catch (err) {
+            // Best-effort; fall through to the live reload subscription.
+            // eslint-disable-next-line no-console
+            console.warn("[zenbu/react] reconcile check failed:", err);
+          }
 
-          // View type is encoded in the URL by `WindowService.openView`.
-          // We keep it around for any future reload-trigger needs;
-          // currently nothing subscribes to a global reload event
-          // because every registration kind flows through the reconciler.
+          // View type lives at `/views/<type>/...` or `?type=<name>`.
+          // Mirrors `resolveType()` in `vite-plugins.ts`.
           const viewMatch = window.location.pathname.match(/^\/views\/([^/]+)\//);
           const viewType =
             viewMatch?.[1] ??
             new URLSearchParams(window.location.search).get("type");
-          void viewType;
+          let unsubReload: (() => void) | null = null;
+          if (viewType) {
+            const adviceReload = (events as any)?.core?.advice?.reload;
+            if (adviceReload?.subscribe) {
+              unsubReload = adviceReload.subscribe((data: { type?: string }) => {
+                if (data?.type === "*" || data?.type === viewType) {
+                  location.reload();
+                }
+              });
+            }
+          }
 
           cleanupRef.current = () => {
-            stopReconciler();
+            unsubReload?.();
             disconnectDb();
             disconnectRpc();
             ws.close();
@@ -421,6 +449,23 @@ export type { ZenbuRegister } from "./registry";
 
 export function useRpc(): RouterProxy<RegisteredServiceRouter> {
   return useConnection().rpc as unknown as RouterProxy<RegisteredServiceRouter>;
+}
+
+type PluginUpdaterRpc = {
+  listRepos(): Promise<PluginRepoRef[]>;
+  checkRepo(args: { path: string }): Promise<UpdateCheck>;
+  checkAll(): Promise<UpdateCheck[]>;
+  applyRepo(args: {
+    path: string;
+    targetCommit?: string;
+    requireFastForward?: boolean;
+  }): Promise<never>;
+};
+
+/** Convenience wrapper around `rpc.core.pluginUpdater`. */
+export function useUpdater(): PluginUpdaterRpc {
+  const rpc = useRpc() as unknown as { core: { pluginUpdater: PluginUpdaterRpc } };
+  return useMemo(() => rpc.core.pluginUpdater, [rpc]);
 }
 
 export type DbClient = {
@@ -873,424 +918,6 @@ export function useFunctions<F = AnyFn>(
     getSnapshot,
     getSnapshot,
   );
-}
-
-// ---- Registration reconciler -----------------------------------------
-//
-// The renderer-side half of `core.registrations`. Watches the live db
-// slice and keeps the in-process function / component-view / advice /
-// content-script registries in sync. Boot, live add/remove, and
-// source-file HMR all flow through here — one mechanism, no page
-// reload.
-//
-// Two entry points share the same `appliedRegistrations` map:
-//
-//   - `__applyBootstrapRegistrations(entries)` is called from the
-//     `/@zenbu/bootstrap` module *before* the app's main script
-//     evaluates. It seeds advice + content-script entries so they're
-//     in place before any target module is touched.
-//
-//   - `startRegistrationReconciler(db, subscribe)` runs after
-//     `ZenbuProvider` connects. It diffs `db.core.registrations`
-//     against `appliedRegistrations` and applies / cleans up as
-//     needed. Subsequent db patches (live add, live remove,
-//     source-file `rev` bumps) re-trigger the diff. Functions and
-//     component views land here, and so do any advice / content
-//     scripts registered after the renderer was served.
-//
-// The applied map is module-scope (one per JS realm) so both entry
-// points see the same state — the bootstrap's entries don't get
-// double-applied when the reconciler kicks in.
-
-type RegistrationKind = "function" | "componentView" | "advice" | "contentScript";
-
-type RegistrationLike = {
-  kind: RegistrationKind;
-  modulePath: string;
-  exportName?: string;
-  rev?: number;
-  meta?: Record<string, unknown>;
-  // kind-specific fields, accessed only inside the applier for that kind
-  [k: string]: unknown;
-};
-
-type AppliedState = {
-  /** Snapshot of the registration as it was last applied. Used for diff. */
-  entry: RegistrationLike;
-  /** Optional cleanup the applier returned. Run on remove or replace. */
-  cleanup?: () => void | Promise<void>;
-};
-
-/**
- * Stable identity key for diffing. Different `rev` on the same key
- * means "replace." Different key means "separate row."
- */
-function registrationKey(r: RegistrationLike): string {
-  switch (r.kind) {
-    case "function":
-      // One function per `name` — last-writer-wins.
-      return `fn:${String(r.name)}`;
-    case "componentView":
-      // One component per view `type`.
-      return `cv:${String(r.type)}`;
-    case "advice":
-      // Many plugins may advise the same (view, moduleId, name,
-      // adviceType) — the underlying advice runtime supports
-      // stacking them. The dedupe key must therefore distinguish
-      // each *attachment*, so it includes `modulePath` +
-      // `exportName`.
-      return `ad:${String(r.view)}:${String(r.moduleId)}:${String(r.name)}:${String(r.adviceType)}:${String(r.modulePath)}:${String(r.exportName ?? "default")}`;
-    case "contentScript":
-      return `cs:${String(r.view)}:${String(r.modulePath)}`;
-  }
-}
-
-/**
- * Compare just the fields that matter for "do we need to re-apply".
- * `rev`, `modulePath`, `exportName`, and `meta` cover all cases for
- * phase 1; we'll extend this when the other kinds land.
- */
-function sameAppliedShape(a: RegistrationLike, b: RegistrationLike): boolean {
-  if (a.kind !== b.kind) return false;
-  if (a.modulePath !== b.modulePath) return false;
-  if ((a.exportName ?? "default") !== (b.exportName ?? "default")) return false;
-  if ((a.rev ?? 0) !== (b.rev ?? 0)) return false;
-  // meta isn't load-affecting but consumers may filter on it; treat as
-  // a shape difference so the registry updates and re-notifies.
-  try {
-    if (JSON.stringify(a.meta ?? null) !== JSON.stringify(b.meta ?? null)) {
-      return false;
-    }
-  } catch {
-    // Non-serializable meta. Treat as different to be safe.
-    return false;
-  }
-  return true;
-}
-
-type Applier = {
-  apply: (
-    mod: Record<string, unknown>,
-    entry: RegistrationLike,
-  ) => void | (() => void) | Promise<void | (() => void)>;
-};
-
-// `@zenbu/advice/runtime` is the singleton registry the babel-
-// transformed code looks up wrappers in (it lives on globalThis).
-// We use a dynamic import inside the applier to avoid bundling
-// advice into core when the applier never fires (e.g. on the main
-// side where the reconciler doesn't run). The bare specifier is
-// resolved on the renderer side by vite-plugins.ts'
-// `resolveAdviceRuntime` and uses globalThis-backed singleton state.
-type AdviceRuntime = {
-  advise: (
-    moduleId: string,
-    name: string,
-    type: "before" | "after" | "around",
-    fn: Function,
-  ) => () => void;
-  replace: (moduleId: string, name: string, fn: Function) => void;
-  unreplace: (moduleId: string, name: string) => void;
-};
-let adviceRuntimeCache: AdviceRuntime | null = null;
-async function getAdviceRuntime(): Promise<AdviceRuntime> {
-  if (adviceRuntimeCache) return adviceRuntimeCache;
-  const mod = (await import(/* @vite-ignore */ "@zenbu/advice/runtime")) as AdviceRuntime;
-  adviceRuntimeCache = mod;
-  return mod;
-}
-
-const APPLIERS: Record<RegistrationKind, Applier | undefined> = {
-  function: {
-    apply: (mod, entry) => {
-      const exportName = (entry.exportName as string) ?? "default";
-      const value = mod[exportName];
-      if (value === undefined) {
-        console.warn(
-          `[zenbu/reconciler] function "${String(entry.name)}" — module "${entry.modulePath}" has no export "${exportName}"`,
-        );
-        return;
-      }
-      registerFunction(
-        entry.name as string,
-        value,
-        entry.meta as FunctionMeta | undefined,
-      );
-      return () => {
-        if (functionRegistry.get(entry.name as string)?.fn === value) {
-          functionRegistry.delete(entry.name as string);
-          emitFunctionRegistryChange();
-        }
-      };
-    },
-  },
-  componentView: {
-    apply: (mod, entry) => {
-      const exportName = (entry.exportName as string) ?? "default";
-      const value = mod[exportName];
-      if (value === undefined) {
-        console.warn(
-          `[zenbu/reconciler] componentView "${String(entry.type)}" — module "${entry.modulePath}" has no export "${exportName}"`,
-        );
-        return;
-      }
-      registerViewComponent(
-        entry.type as string,
-        value as ViewComponent<Record<string, unknown>>,
-      );
-      return () => {
-        if (
-          viewComponentRegistry.get(entry.type as string) ===
-          (value as ViewComponent<Record<string, unknown>>)
-        ) {
-          viewComponentRegistry.delete(entry.type as string);
-          emitViewComponentChange();
-        }
-      };
-    },
-  },
-  advice: {
-    apply: (mod, entry) => {
-      const exportName = (entry.exportName as string) ?? "default";
-      const fn = mod[exportName] as Function | undefined;
-      if (typeof fn !== "function") {
-        console.warn(
-          `[zenbu/reconciler] advice "${String(entry.moduleId)}.${String(entry.name)}" — module "${entry.modulePath}" has no callable export "${exportName}"`,
-        );
-        return;
-      }
-      const moduleId = entry.moduleId as string;
-      const name = entry.name as string;
-      const adviceType = entry.adviceType as
-        | "before"
-        | "after"
-        | "around"
-        | "replace";
-      return getAdviceRuntime().then((rt) => {
-        if (adviceType === "replace") {
-          rt.replace(moduleId, name, fn);
-          return () => rt.unreplace(moduleId, name);
-        }
-        // `rt.advise` returns a function that removes this specific
-        // advice entry from the chain. Components re-rendering after
-        // cleanup pick up the absence; existing in-flight invocations
-        // already-bound to the old chain finish without it.
-        return rt.advise(moduleId, name, adviceType, fn);
-      });
-    },
-  },
-  contentScript: {
-    apply: (mod, entry) => {
-      // Content-script convention: default-export a setup function
-      // that optionally returns a cleanup. Plain side-effect modules
-      // (no default export, or a non-function default) are accepted
-      // — they install whatever they install at import time and we
-      // can't unload them.
-      const setup = mod.default;
-      if (typeof setup !== "function") {
-        return; // Side effects ran on import; nothing to clean up.
-      }
-      try {
-        const result = setup();
-        if (result && typeof (result as { then?: unknown }).then === "function") {
-          // Async setup. Resolve in the background; if it returns a
-          // cleanup we still need to store one but we already
-          // committed the applied state. For now, await synchronously
-          // by returning a Promise.
-          return (result as Promise<unknown>).then((r) =>
-            typeof r === "function" ? (r as () => void) : undefined,
-          );
-        }
-        if (typeof result === "function") return result as () => void;
-      } catch (err) {
-        console.error(
-          `[zenbu/reconciler] content-script setup "${entry.modulePath}" threw:`,
-          err,
-        );
-      }
-      // No cleanup contract — if someone later removes this
-      // registration, log a warning.
-      return () => {
-        console.warn(
-          `[zenbu/reconciler] content-script at "${entry.modulePath}" was removed but its setup didn't return a cleanup; its side effects remain installed in this iframe until reload.`,
-        );
-      };
-    },
-  },
-};
-
-function importUrlFor(entry: RegistrationLike): string {
-  // `?rev=N` cache-busts the browser's per-URL module instance cache.
-  // Vite invalidates its own server-side transform cache on the file
-  // change; this query string makes sure the BROWSER fetches the new
-  // version. Production builds default to `rev: 0` and the URL is
-  // stable, so module caching works as normal.
-  const rev = entry.rev ?? 0;
-  return `${entry.modulePath}?rev=${rev}`;
-}
-
-/**
- * Module-scope applied state. Shared between the bootstrap
- * (`__applyBootstrapRegistrations`) and the live reconciler
- * (`startRegistrationReconciler`) so they don't double-apply.
- */
-const appliedRegistrations = new Map<string, AppliedState>();
-
-let reconciling = false;
-let queuedNext: RegistrationLike[] | null = null;
-
-/**
- * Diff `next` against `appliedRegistrations`, apply additions /
- * replacements, run cleanups for removals. Serialized: dynamic
- * imports are async and a re-entrant call during an in-flight
- * reconcile would race; queued requests are tail-called.
- */
-async function reconcileRegistrations(next: RegistrationLike[]): Promise<void> {
-  if (reconciling) {
-    queuedNext = next;
-    return;
-  }
-  reconciling = true;
-  try {
-    const wanted = new Map<string, RegistrationLike>();
-    for (const entry of next) {
-      if (!APPLIERS[entry.kind]) continue;
-      wanted.set(registrationKey(entry), entry);
-    }
-
-    // Removals first: drop entries that aren't in the new set,
-    // freeing their slots before we apply new ones.
-    for (const key of [...appliedRegistrations.keys()]) {
-      if (!wanted.has(key)) {
-        const prev = appliedRegistrations.get(key)!;
-        try {
-          await prev.cleanup?.();
-        } catch (err) {
-          console.error(`[zenbu/reconciler] cleanup for ${key} threw:`, err);
-        }
-        appliedRegistrations.delete(key);
-      }
-    }
-
-    // Additions / replacements.
-    for (const [key, entry] of wanted) {
-      const prev = appliedRegistrations.get(key);
-      if (prev && sameAppliedShape(prev.entry, entry)) continue;
-      if (prev) {
-        try {
-          await prev.cleanup?.();
-        } catch (err) {
-          console.error(
-            `[zenbu/reconciler] cleanup-on-replace for ${key} threw:`,
-            err,
-          );
-        }
-      }
-      try {
-        const url = importUrlFor(entry);
-        const mod = (await import(/* @vite-ignore */ url)) as Record<
-          string,
-          unknown
-        >;
-        const applier = APPLIERS[entry.kind]!;
-        const cleanup = await applier.apply(mod, entry);
-        appliedRegistrations.set(key, {
-          entry,
-          cleanup: typeof cleanup === "function" ? cleanup : undefined,
-        });
-      } catch (err) {
-        console.error(
-          `[zenbu/reconciler] applying ${key} (path=${entry.modulePath} rev=${entry.rev ?? 0}) threw:`,
-          err,
-        );
-        appliedRegistrations.delete(key);
-      }
-    }
-  } finally {
-    reconciling = false;
-    if (queuedNext) {
-      const followUp = queuedNext;
-      queuedNext = null;
-      void reconcileRegistrations(followUp);
-    }
-  }
-}
-
-/**
- * Called from the `/@zenbu/bootstrap` module before the app's main
- * script evaluates. Applies the inline-manifest entries (advice +
- * content scripts for this view type) synchronously enough that the
- * advice runtime's lookup map is populated before any advised target
- * is first invoked.
- *
- * The bootstrap module is `<script type="module">` with a top-level
- * `await` on this call, so subsequent module scripts (including the
- * app's entry) block until this resolves.
- */
-export async function __applyBootstrapRegistrations(
-  entries: {
-    advice?: Array<Record<string, unknown>>;
-    contentScripts?: Array<Record<string, unknown>>;
-  } | Array<RegistrationLike>,
-): Promise<void> {
-  // Accept either the manifest shape (`{ advice, contentScripts }`)
-  // emitted by `readBootstrapManifest`, or a flat array (used in
-  // tests).
-  let flat: RegistrationLike[];
-  if (Array.isArray(entries)) {
-    flat = entries;
-  } else {
-    flat = [
-      ...(entries.advice ?? []).map(
-        (a) => ({ ...a, kind: "advice" }) as RegistrationLike,
-      ),
-      ...(entries.contentScripts ?? []).map(
-        (c) => ({ ...c, kind: "contentScript" }) as RegistrationLike,
-      ),
-    ];
-  }
-  await reconcileRegistrations(flat);
-}
-
-/**
- * Start the live reconciler against a kyju client. Returns a teardown
- * that removes every locally-applied registration (called when the
- * WebSocket disconnects).
- *
- * Initial reconciliation merges the db's current `core.registrations`
- * with whatever the bootstrap already applied: bootstrap entries
- * persist as-is, db-only entries are dynamic-imported and applied,
- * removed entries are cleaned up.
- */
-function startRegistrationReconciler(
-  db: { readRoot: () => unknown },
-  subscribeRegistrations: (cb: (next: RegistrationLike[]) => void) => () => void,
-): () => void {
-  try {
-    const root = db.readRoot() as {
-      core?: { registrations?: RegistrationLike[] };
-    };
-    void reconcileRegistrations(root.core?.registrations ?? []);
-  } catch (err) {
-    console.error("[zenbu/reconciler] initial read failed:", err);
-  }
-  const unsub = subscribeRegistrations((next) => {
-    void reconcileRegistrations(next);
-  });
-
-  return () => {
-    unsub();
-    // Tear down everything applied in this realm so a reconnect
-    // starts from a clean slate. The bootstrap entries get re-applied
-    // on the next iframe boot (or, in dev, on the next reconnect via
-    // the bootstrap's separate path).
-    for (const [, state] of appliedRegistrations) {
-      try {
-        state.cleanup?.();
-      } catch {}
-    }
-    appliedRegistrations.clear();
-  };
 }
 
 // ---- <View>: iframe-or-component primitive ----

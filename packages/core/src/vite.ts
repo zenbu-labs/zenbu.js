@@ -1,6 +1,6 @@
 export {
+  advicePreludePlugin,
   pluginSourcesCssPlugin,
-  reconcilerBootstrapPlugin,
   resolveAdviceRuntime,
   zenbuAdviceTransform,
   zenbuFrameworkResolve,

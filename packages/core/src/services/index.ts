@@ -10,6 +10,7 @@ export { ViewRegistryService } from "./view-registry";
 export { FunctionRegistryService } from "./function-registry";
 export { WindowService } from "./window";
 export { UpdaterService } from "./updater";
+export { PluginUpdaterService } from "./plugin-updater";
 export {
   ShortcutsService,
   type ShortcutDef,
