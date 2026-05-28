@@ -203,13 +203,12 @@ export class WindowService extends Service.create({
     if (!entry) throw new Error(`No registered view for type "${args.type}"`);
 
     const windowId = args.windowId ?? MAIN_WINDOW_ID;
-    let win = this.ctx.baseWindow.windows.get(windowId);
-    if (!win) {
-      win = this.ctx.baseWindow.createWindow({
-        windowId,
-        baseWindow: args.baseWindow,
-      }).win;
-    }
+    // Patchable diffs apply via setters; immutable diffs recreate and
+    // reparent children. `onRecreate` below rebinds the resize listener.
+    let { win } = this.ctx.baseWindow.ensureWindow({
+      windowId,
+      baseWindow: args.baseWindow,
+    });
 
     const existing = this.mounted.get(windowId);
     if (existing) {
@@ -281,14 +280,34 @@ export class WindowService extends Service.create({
       view.webContents.on("before-input-event", handleInput);
     }
 
+    // `currentWin` reassigns on recreate so layout always targets the
+    // live BaseWindow hosting our view.
+    let currentWin = win;
     const layout = () => {
-      const { width, height } = win.getContentBounds();
+      const { width, height } = currentWin.getContentBounds();
       view.setBounds({ x: 0, y: 0, width, height });
     };
+    const bindResize = (w: typeof currentWin) => {
+      w.on("resize", layout);
+      return () => {
+        try { w.off("resize", layout); } catch {}
+      };
+    };
+    let unbindResize = bindResize(currentWin);
     layout();
-    win.on("resize", layout);
+
+    const unsubscribeRecreate = this.ctx.baseWindow.onRecreate((e) => {
+      if (e.windowId !== windowId) return;
+      // View has already been reparented onto e.newWin by recreateWindow.
+      unbindResize();
+      currentWin = e.newWin;
+      unbindResize = bindResize(currentWin);
+      layout();
+    });
+
     view.webContents.once("destroyed", () => {
-      win.off("resize", layout);
+      unbindResize();
+      unsubscribeRecreate();
       try {
         disposeContextMenu();
       } catch {}
@@ -393,8 +412,9 @@ export class WindowService extends Service.create({
       view,
       disposeContextMenu,
     });
-    if (!win.isVisible()) win.show();
-    win.focus();
+    // currentWin, not win, in case recreate fired during loadURL.
+    if (!currentWin.isVisible()) currentWin.show();
+    currentWin.focus();
     log.verbose(`mounted "${args.type}" in window "${windowId}"`);
 
     return { windowId };
