@@ -124,27 +124,32 @@ function parsePackageManager(value: string | undefined): PackageManagerSpec | nu
 }
 
 /**
- * Resolve the absolute path of the `loading.html` to show during an in-app
+ * Resolve the absolute path of the `updating.html` to show during an in-app
  * plugin update. The supervisor uses it to pop a BaseWindow before tearing
  * the runtime down, so phase / failure events have somewhere to render.
  *
- * - Production: staged next to the .app's Resources/ at build time. We look
- *   for `<resources>/loading.html` first (would require a build-config
- *   change to actually copy it; until then this path falls through).
+ * Distinct from `installing.html` on purpose: that one is the cold-boot
+ * launcher's first-run window (clone + first `pnpm install`); this one is
+ * the in-app updater's window (git fast-forward + dep refresh). They share
+ * the `installing-preload.cjs` API surface but live in separate HTML files
+ * so each flow can present its own copy / sizing.
+ *
+ * - Production: staged into the .app's Resources/ at build time by
+ *   `zen build:electron` when `<uiEntrypoint>/updating.html` exists.
  * - Dev: lives alongside `splash.html` in the project's `uiEntrypoint`
  *   directory — the one returned by `getAppEntrypoint()`.
  *
  * Returns `null` when nothing is found, in which case the supervisor runs
  * without a visible UI (legacy behavior).
  */
-function resolveLoadingHtml(resourcesPath: string | null): string | null {
+function resolveUpdatingHtml(resourcesPath: string | null): string | null {
   if (resourcesPath) {
-    const staged = path.join(resourcesPath, "loading.html")
+    const staged = path.join(resourcesPath, "updating.html")
     if (fs.existsSync(staged)) return staged
   }
   const entrypoint = getAppEntrypoint()
   if (entrypoint) {
-    const dev = path.join(entrypoint, "loading.html")
+    const dev = path.join(entrypoint, "updating.html")
     if (fs.existsSync(dev)) return dev
   }
   return null
@@ -453,7 +458,7 @@ export class PluginUpdaterService extends Service.create({
       dependenciesChanged: check.dependenciesChanged,
       packageManager: readPackageManager(check.repo.path, appContext),
       resourcesPath: appContext?.resourcesPath ?? null,
-      loadingHtml: resolveLoadingHtml(appContext?.resourcesPath ?? null),
+      updatingHtml: resolveUpdatingHtml(appContext?.resourcesPath ?? null),
     }
 
     return takeOverPluginRepoUpdate(plan, {

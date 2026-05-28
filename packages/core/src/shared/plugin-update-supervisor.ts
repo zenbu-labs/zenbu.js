@@ -21,8 +21,9 @@ const log = createLogger("plugin-update-supervisor");
 // Resolved at module load time so we can locate the framework-shipped
 // `installing-preload.cjs` regardless of how the package is consumed
 // (link:, node_modules, packaged Resources). The preload exposes the
-// same `window.zenbuInstall` API used by the cold-boot installer so the
-// loading.html page can be written once and reused for both flows.
+// same `window.zenbuInstall` API used by the cold-boot installer so
+// `installing.html` and `updating.html` can share one preload script
+// (same five-event API surface) while staying separate HTML files.
 const SUPERVISOR_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export type PluginUpdatePhase =
@@ -41,15 +42,23 @@ export interface PluginUpdatePlan {
   packageManager: PackageManagerSpec;
   resourcesPath: string | null;
   /**
-   * Absolute path to `loading.html` to show during the update. When
+   * Absolute path to `updating.html` to show during the update. When
    * provided, the supervisor opens a BaseWindow loading this file BEFORE
    * destroying the app's existing windows, and routes phase / failure
-   * events to it via IPC (the framework-shipped `installing-preload.cjs`).
+   * events to it via IPC (the framework-shipped `installing-preload.cjs`,
+   * which exposes `window.zenbuInstall`).
    *
    * When omitted (or the file doesn't exist) the supervisor still runs
    * the update but does so without any visible UI.
+   *
+   * Naming: this is intentionally `updating.html`, NOT `installing.html`
+   * — the cold-boot launcher uses installing.html for first-launch clone
+   * + install, this file is the *in-app update* counterpart. Keeping the
+   * filenames distinct lets the two flows diverge visually (e.g. the
+   * install screen is splash-sized because it hands off to the splash;
+   * the update screen is a small modal-feeling window).
    */
-  loadingHtml?: string | null;
+  updatingHtml?: string | null;
 }
 
 interface PendingPluginUpdate {
@@ -65,7 +74,7 @@ export interface PluginUpdateReporter {
 
 type LoadingEvent = "step" | "message" | "progress" | "done" | "error";
 
-interface LoadingWindow {
+interface UpdatingWindow {
   win: BaseWindow;
   send(event: LoadingEvent, payload: unknown): void;
   /**
@@ -99,10 +108,10 @@ function resolveInstallingPreload(resourcesPath: string | null): string | null {
   return null;
 }
 
-async function openLoadingWindow(
+async function openUpdatingWindow(
   htmlPath: string,
   preloadPath: string,
-): Promise<LoadingWindow> {
+): Promise<UpdatingWindow> {
   // Small modal-feeling window. The auto-updater only shows a single
   // shimmering label (and an error block on failure), so it doesn't need
   // splash-sized real estate. Resizable + minimizable stay off so the
@@ -150,7 +159,7 @@ async function openLoadingWindow(
     pending.length = 0;
   });
   view.webContents.once("did-fail-load", (_e, _code, desc) => {
-    log.error(`loading.html did-fail-load: ${desc}`);
+    log.error(`updating.html did-fail-load: ${desc}`);
     pending.length = 0;
     ready = true;
   });
@@ -158,7 +167,7 @@ async function openLoadingWindow(
   // Fire and forget — we don't want to block the update on the renderer.
   void view.webContents.loadFile(htmlPath).catch((err) => {
     log.error(
-      `loading.html loadFile failed: ${(err as Error).message ?? err}`,
+      `updating.html loadFile failed: ${(err as Error).message ?? err}`,
     );
   });
 
@@ -281,7 +290,7 @@ async function installDeps(plan: PluginUpdatePlan): Promise<void> {
  * transition AND for failure. Note that we call `runtime.shutdown()`
  * early in this function, which tears down the service runtime — anything
  * the reporter touches must therefore not depend on services (rpc, db,
- * window manager, etc). The supervisor itself manages a `loading.html`
+ * window manager, etc). The supervisor itself manages an `updating.html`
  * BaseWindow opened outside the runtime; that window receives mirrored
  * phase / failure events via IPC and is what the user sees during the
  * blackout between window close and relaunch.
@@ -292,35 +301,35 @@ export async function takeOverPluginRepoUpdate(
 ): Promise<never> {
   await writePending(plan, "applying");
 
-  // Open the loading window FIRST, before destroying any other windows.
+  // Open the updating window FIRST, before destroying any other windows.
   // If we opened it after closing the existing windows, macOS would
   // briefly show no app-owned windows and the app could drop focus /
   // hide. Opening first also gives the renderer a head start on loading
-  // the gif so the user sees something within ~1 frame of clicking.
-  let loading: LoadingWindow | null = null;
-  if (plan.loadingHtml && fs.existsSync(plan.loadingHtml)) {
+  // the asset so the user sees something within ~1 frame of clicking.
+  let updating: UpdatingWindow | null = null;
+  if (plan.updatingHtml && fs.existsSync(plan.updatingHtml)) {
     const preloadPath = resolveInstallingPreload(plan.resourcesPath);
     if (preloadPath) {
       try {
-        loading = await openLoadingWindow(plan.loadingHtml, preloadPath);
+        updating = await openUpdatingWindow(plan.updatingHtml, preloadPath);
       } catch (err) {
         log.error(
-          `failed to open loading window: ${(err as Error).message ?? err}`,
+          `failed to open updating window: ${(err as Error).message ?? err}`,
         );
       }
     } else {
       log.error(
-        "loading.html provided but installing-preload.cjs could not be located; skipping window",
+        "updating.html provided but installing-preload.cjs could not be located; skipping window",
       );
     }
   }
 
   // Reporter facade: the *caller's* reporter is called for phase /
-  // failure transitions, AND every event is mirrored to the loading
+  // failure transitions, AND every event is mirrored to the updating
   // window over IPC. We keep the caller's reporter in a try/catch
   // because the most common consumer (PluginUpdaterService) emits via
   // rpc — which throws after `runtime.shutdown()`. Swallowing the
-  // post-shutdown rpc error here is intentional: the loading window is
+  // post-shutdown rpc error here is intentional: the updating window is
   // the surface we actually care about once the runtime is gone.
   const report = {
     phase(phase: PluginUpdatePhase, message?: string): void {
@@ -332,8 +341,8 @@ export async function takeOverPluginRepoUpdate(
           `reporter.phase threw (likely runtime is down): ${(err as Error).message ?? err}`,
         );
       }
-      loading?.send("step", { id: phase, label: message ?? phase });
-      if (message) loading?.send("message", { text: message });
+      updating?.send("step", { id: phase, label: message ?? phase });
+      if (message) updating?.send("message", { text: message });
     },
     failed(phase: PluginUpdatePhase | "check", message: string): void {
       log.error(`failed during ${phase}: ${message}`);
@@ -347,18 +356,18 @@ export async function takeOverPluginRepoUpdate(
           `reporter.failed threw (likely runtime is down): ${(err as Error).message ?? err}`,
         );
       }
-      loading?.send("error", { id: phase, message });
+      updating?.send("error", { id: phase, message });
     },
   };
 
   let currentPhase: PluginUpdatePhase = "closing";
   try {
     report.phase(currentPhase, "Closing windows");
-    const loadingWin = loading?.win ?? null;
+    const updatingWin = updating?.win ?? null;
     for (const win of BaseWindow.getAllWindows()) {
-      // Keep the loading window open so the user has a surface to look
+      // Keep the updating window open so the user has a surface to look
       // at and so failure messages have somewhere to render.
-      if (loadingWin && win === loadingWin) continue;
+      if (updatingWin && win === updatingWin) continue;
       try {
         win.destroy();
       } catch {}
@@ -418,7 +427,7 @@ export async function takeOverPluginRepoUpdate(
 
     currentPhase = "relaunch";
     report.phase(currentPhase, "Relaunching");
-    // The loading window dies with the process on `app.exit`. We don't
+    // The updating window dies with the process on `app.exit`. We don't
     // explicitly close it first: if relaunch fails for some bizarre
     // reason the user still has a window on screen.
     app.relaunch();
@@ -427,10 +436,10 @@ export async function takeOverPluginRepoUpdate(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     report.failed(currentPhase, message);
-    // Intentionally DO NOT call `app.exit` here. The loading window
+    // Intentionally DO NOT call `app.exit` here. The updating window
     // stays up displaying the error so the user (and the developer
     // debugging across machines) can read what actually went wrong.
-    // The next user action — Quit from the loading window, or a hard
+    // The next user action — Quit from the updating window, or a hard
     // kill — tears down the rest.
     throw err;
   }

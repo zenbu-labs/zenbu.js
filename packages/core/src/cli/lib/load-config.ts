@@ -245,6 +245,15 @@ export async function loadConfig(
   const installingPath = fs.existsSync(installingCandidate)
     ? installingCandidate
     : undefined
+  // Optional: `updating.html` next to splash + installing. When present,
+  // `zen build:electron` stages it into Resources/ so the in-app plugin
+  // updater can show a window during the git fast-forward + dep refresh
+  // (see `plugin-update-supervisor.ts`). Not used in dev directly here;
+  // the supervisor resolves it at runtime via `getAppEntrypoint()`.
+  const updatingCandidate = path.join(uiEntrypointPath, "updating.html")
+  const updatingPath = fs.existsSync(updatingCandidate)
+    ? updatingCandidate
+    : undefined
 
   const plugins: ResolvedPlugin[] = []
   const pluginSourceFiles: string[] = []
@@ -351,6 +360,7 @@ export async function loadConfig(
       uiEntrypointPath,
       splashPath,
       installingPath,
+      updatingPath,
       plugins,
       build,
     },

@@ -44,8 +44,11 @@ interface AppConfigJson {
   installingHtml?: string;
   /**
    * Path (relative to the .app's `Resources/` dir) of the framework's
-   * built-in preload that exposes `window.zenbuInstall`. Always set when
-   * `installingHtml` is set.
+   * built-in preload that exposes `window.zenbuInstall`. Set whenever
+   * EITHER `installingHtml` OR a staged `updating.html` is present
+   * (both flows use the same preload surface). The launcher only reads
+   * it for the cold-boot install window; the plugin-update supervisor
+   * resolves the preload itself at runtime.
    */
   installingPreload?: string;
 }
@@ -330,26 +333,44 @@ async function copyFile(src: string, dest: string): Promise<void> {
 }
 
 /**
- * Stage the user's `installing.html` plus the framework's built-in
- * `installing-preload.cjs` into the bundle dir. The launcher loads both
- * from the .app's `Resources/` (next to `toolchain/`) before the user's
- * source has been cloned. Only the two canonical files; sibling assets
- * (CSS, fonts, images referenced from installing.html) are the user's
- * responsibility via their own `electron-builder.json#extraResources`.
+ * Stage the user's boot-time HTML(s) plus the framework's built-in
+ * `installing-preload.cjs` into the bundle dir.
+ *
+ * Both `installing.html` (cold-boot install, loaded by `launcher.ts`) and
+ * `updating.html` (in-app plugin update, loaded by the plugin-update
+ * supervisor at runtime) share the same preload — `window.zenbuInstall`
+ * — so we only stage one copy regardless of which / both pages are
+ * present. Each `*Src` is optional; pass `null` to skip.
+ *
+ * Sibling assets (CSS, fonts, images referenced from the HTML) are the
+ * user's responsibility via their own `electron-builder.json#extraResources`.
  */
 async function stageInstallingArtifacts(args: {
   projectDir: string;
-  installingSrc: string;
+  installingSrc: string | null;
+  updatingSrc: string | null;
   installingHtmlOut: string;
+  updatingHtmlOut: string;
   installingPreloadOut: string;
-}): Promise<true> {
-  await copyFile(args.installingSrc, args.installingHtmlOut);
-  const preloadSrc = resolveCoreDistFile(
-    args.projectDir,
-    "installing-preload.cjs",
-  );
-  await copyFile(preloadSrc, args.installingPreloadOut);
-  return true;
+}): Promise<{ installing: boolean; updating: boolean }> {
+  let installing = false;
+  let updating = false;
+  if (args.installingSrc) {
+    await copyFile(args.installingSrc, args.installingHtmlOut);
+    installing = true;
+  }
+  if (args.updatingSrc) {
+    await copyFile(args.updatingSrc, args.updatingHtmlOut);
+    updating = true;
+  }
+  if (installing || updating) {
+    const preloadSrc = resolveCoreDistFile(
+      args.projectDir,
+      "installing-preload.cjs",
+    );
+    await copyFile(preloadSrc, args.installingPreloadOut);
+  }
+  return { installing, updating };
 }
 
 export async function runBuildElectron(argv: string[]): Promise<void> {
@@ -419,6 +440,7 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   const appConfigOut = path.join(bundleDir, "app-config.json");
   const mergedConfigPath = path.join(bundleDir, "electron-builder.merged.json");
   const installingHtmlOut = path.join(bundleDir, "installing.html");
+  const updatingHtmlOut = path.join(bundleDir, "updating.html");
   const installingPreloadOut = path.join(bundleDir, "installing-preload.cjs");
 
   const sourceSha = currentSourceSha(projectDir);
@@ -442,24 +464,38 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   const launcherSrc = resolveLauncher(projectDir);
   await copyFile(launcherSrc, launcherOut);
 
-  // Stage the optional installing.html + the framework's built-in preload.
-  // Only the canonical files; sibling assets (CSS, images, fonts) are the
-  // user's responsibility via their own electron-builder.json#extraResources.
-  const stagedInstalling = resolved.installingPath
-    ? await stageInstallingArtifacts({
-        projectDir,
-        installingSrc: resolved.installingPath,
-        installingHtmlOut,
-        installingPreloadOut,
-      })
-    : null;
-  if (stagedInstalling) {
+  // Stage the optional installing.html / updating.html + the framework's
+  // built-in preload. Only the canonical files; sibling assets (CSS,
+  // images, fonts) are the user's responsibility via their own
+  // electron-builder.json#extraResources.
+  const staged =
+    resolved.installingPath || resolved.updatingPath
+      ? await stageInstallingArtifacts({
+          projectDir,
+          installingSrc: resolved.installingPath ?? null,
+          updatingSrc: resolved.updatingPath ?? null,
+          installingHtmlOut,
+          updatingHtmlOut,
+          installingPreloadOut,
+        })
+      : { installing: false, updating: false };
+  if (staged.installing) {
     console.log(
       `  → staging installing.html (${path.relative(
         projectDir,
         resolved.installingPath!,
       )})`,
     );
+  }
+  if (staged.updating) {
+    console.log(
+      `  → staging updating.html (${path.relative(
+        projectDir,
+        resolved.updatingPath!,
+      )})`,
+    );
+  }
+  if (staged.installing || staged.updating) {
     console.log(`  → staging installing-preload.cjs`);
   }
 
@@ -482,7 +518,11 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
     branch: mirrorBranch,
     version: appVersion,
     packageManager,
-    ...(stagedInstalling
+    // `installingHtml` / `installingPreload` are read by the launcher
+    // ONLY for the cold-boot install window. We don't expose updating.html
+    // here — the supervisor resolves `<Resources>/updating.html` by
+    // hardcoded name at runtime.
+    ...(staged.installing
       ? {
           installingHtml: "installing.html",
           installingPreload: "installing-preload.cjs",
@@ -514,11 +554,25 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   const overlayExtraResources: Array<{ from: string; to: string }> = [
     { from: toolchainDir, to: "toolchain" },
   ];
-  if (stagedInstalling) {
-    overlayExtraResources.push(
-      { from: installingHtmlOut, to: "installing.html" },
-      { from: installingPreloadOut, to: "installing-preload.cjs" },
-    );
+  if (staged.installing) {
+    overlayExtraResources.push({
+      from: installingHtmlOut,
+      to: "installing.html",
+    });
+  }
+  if (staged.updating) {
+    overlayExtraResources.push({
+      from: updatingHtmlOut,
+      to: "updating.html",
+    });
+  }
+  // One preload, shared by both pages. Only staged when at least one
+  // HTML is shipped (decided by `stageInstallingArtifacts`).
+  if (staged.installing || staged.updating) {
+    overlayExtraResources.push({
+      from: installingPreloadOut,
+      to: "installing-preload.cjs",
+    });
   }
 
   const merged = mergeElectronBuilderConfig(userConfig, {
@@ -546,10 +600,17 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   console.log(
     `      extraResources    += { from: <bundle>/toolchain, to: toolchain }`,
   );
-  if (stagedInstalling) {
+  if (staged.installing) {
     console.log(
       `      extraResources    += { from: installing.html, to: installing.html }`,
     );
+  }
+  if (staged.updating) {
+    console.log(
+      `      extraResources    += { from: updating.html, to: updating.html }`,
+    );
+  }
+  if (staged.installing || staged.updating) {
     console.log(
       `      extraResources    += { from: installing-preload.cjs, to: installing-preload.cjs }`,
     );

@@ -312,6 +312,19 @@ export interface ResolvedConfig {
    * doesn't clone or install.
    */
   installingPath?: string;
+  /**
+   * Absolute path to `updating.html` inside the entrypoint directory, if
+   * the user provided one. Optional. Shown by the plugin-update supervisor
+   * (`packages/core/src/shared/plugin-update-supervisor.ts`) when an in-app
+   * update is applied at runtime — git fast-forward + optional dep refresh
+   * + relaunch. Shares the `installing-preload.cjs` API surface with
+   * `installing.html` so the page only needs to listen to one event
+   * (`error`) to surface failures.
+   *
+   * Used in both dev (resolved via `getAppEntrypoint()`) and prod (staged
+   * into Resources/ by `zen build:electron`).
+   */
+  updatingPath?: string;
   plugins: ResolvedPlugin[];
   /** Resolved build config; defaults filled in even when user omits. */
   build: ResolvedBuildConfig;
