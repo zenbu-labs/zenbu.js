@@ -371,6 +371,22 @@ export class WindowService extends Service.create({
       { url },
     );
 
+    // Evict any boot leftovers (splash from setup-gate, installing view
+    // from launcher) now that the renderer is dom-ready and painting on
+    // top. Leaving them attached leaks a renderer process and unions their
+    // drag rects into the window — e.g. a full-width splash drag strip
+    // overrides `no-drag` carve-outs in the renderer's title bar.
+    for (const child of [...win.contentView.children]) {
+      if (child === view) continue;
+      try {
+        win.contentView.removeChildView(child);
+      } catch {}
+      const wc = (child as { webContents?: WebContents }).webContents;
+      try {
+        wc?.close();
+      } catch {}
+    }
+
     this.mounted.set(windowId, {
       windowId,
       type: args.type,
