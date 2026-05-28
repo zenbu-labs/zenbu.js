@@ -12,6 +12,10 @@ import {
   type WebContentsViewConstructorOptions,
 } from "electron";
 import electronContextMenu from "electron-context-menu";
+import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { URLSearchParams } from "node:url";
 import { runtime, Service } from "../runtime";
 import { BaseWindowService, MAIN_WINDOW_ID } from "./base-window";
@@ -23,6 +27,27 @@ import { entrypointBgColor } from "../shared/zenbu-bg";
 import { bootTrace } from "../boot-trace";
 
 const log = createLogger("window");
+
+/**
+ * Boot-time snapshot of how the host was launched.
+ *
+ * Captured at module load so HMR can't desync these between the
+ * `WindowService` instance and the real Electron process state.
+ * `respawnSelf` re-uses these to start an isolated child instance
+ * of the same app in either dev or prod:
+ *
+ *  - **Dev**: `execPath` is `node_modules/electron/.../Electron`
+ *    and `bootArgv` starts with the project directory (whose
+ *    `package.json#main` is `setup-gate.mjs`).
+ *  - **Prod**: `execPath` is the bundled binary inside `.app/` and
+ *    `bootArgv` is the bundled entry path. Either way, spawning
+ *    `execPath` with `bootArgv + extras` re-launches the same
+ *    code path the user double-clicked.
+ */
+const BOOT_EXEC_PATH: string = process.execPath;
+const BOOT_ARGV: ReadonlyArray<string> = Object.freeze(
+  process.argv.slice(1),
+);
 
 type MountedView = {
   windowId: string;
@@ -421,6 +446,145 @@ export class WindowService extends Service.create({
 
   async openExternal(url: string): Promise<void> {
     await shell.openExternal(url);
+  }
+
+  /**
+   * Spawn a fresh instance of the running host with extra flags.
+   *
+   * Used by tooling plugins that want to "test in a clean copy of
+   * the app" — e.g. `plugin-dev`'s **Run in Dev** button, which
+   * appends `--plugin=<manifest>` so the user's in-progress plugin
+   * loads alongside the configured set.
+   *
+   * The framework owns the spawn primitive (not the caller) for
+   * three reasons:
+   *
+   *  1. **Mode-agnostic**: `BOOT_EXEC_PATH` + `BOOT_ARGV` were
+   *     captured at boot and give us the right command in dev
+   *     and in production without callers having to branch.
+   *  2. **Isolation**: a naive `spawn(process.execPath, argv)`
+   *     deadlocks on Electron's `SingletonLock` and corrupts the
+   *     parent's kyju DB because both processes hammer the same
+   *     `userDataDir` / DB path. With `isolateUserData: true` we
+   *     mint a per-run tmpdir, pass `--user-data-dir=<tmp>` so
+   *     Electron is happy, and pass `--zen-db-path=<tmp>/db` so
+   *     the framework's existing DB-path flag points the child at
+   *     a sandbox. (See `shared/db-registry.ts#resolveDbPath`.)
+   *  3. **Argv hygiene**: we strip prior `--plugin=` /
+   *     `--user-data-dir=` / `--zen-db-path=` flags from the
+   *     parent's argv before re-applying them, so respawning a
+   *     respawned instance doesn't accumulate them.
+   *
+   * Returns the raw `ChildProcess`. The caller is responsible for
+   * wiring stdio (the default is `["ignore", "pipe", "pipe"]` so
+   * stdout / stderr stream back), reaping on exit, and converting
+   * failures into user-visible state.
+   */
+  respawnSelf(args: {
+    /** Extra argv appended after the parent's boot argv. The
+     * caller is responsible for the value; the framework strips
+     * known overrides (see above) before re-application. */
+    extraArgv?: ReadonlyArray<string>;
+    /** Extra env merged on top of `process.env`. */
+    extraEnv?: NodeJS.ProcessEnv;
+    /** Working directory for the child. Defaults to the parent's
+     * cwd, which in practice is the project root. */
+    cwd?: string;
+    /** When true, the child gets its own `--user-data-dir` and
+     * `--zen-db-path` pointing at a freshly-created tmpdir, so
+     * the two instances don't fight over Electron's singleton
+     * lock or kyju's DB lock. */
+    isolateUserData?: boolean;
+    /** Override stdio. Defaults to capturing stdout / stderr. */
+    stdio?: "pipe" | "inherit" | "ignore";
+    /** Pre-position the child's main window. Forwarded as
+     * `--zen-x` / `--zen-y` / `--zen-width` / `--zen-height` so
+     * `BaseWindowService` picks them up on first window creation.
+     * Any subset is fine; unspecified dimensions fall through to
+     * Electron's defaults. */
+    windowBounds?: {
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+    };
+  } = {}): {
+    child: ChildProcess;
+    execPath: string;
+    argv: string[];
+    sandboxDir: string | null;
+  } {
+    const stripPrefixes = [
+      "--plugin=",
+      "--user-data-dir=",
+      "--zen-db-path=",
+      "--zen-x=",
+      "--zen-y=",
+      "--zen-width=",
+      "--zen-height=",
+    ];
+    const base = BOOT_ARGV.filter(
+      (a) => !stripPrefixes.some((p) => a.startsWith(p)),
+    );
+
+    let sandboxDir: string | null = null;
+    const isolationArgv: string[] = [];
+    if (args.isolateUserData) {
+      sandboxDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "zenbu-respawn-"),
+      );
+      const userData = path.join(sandboxDir, "user-data");
+      const dbPath = path.join(sandboxDir, "db");
+      fs.mkdirSync(userData, { recursive: true });
+      fs.mkdirSync(dbPath, { recursive: true });
+      isolationArgv.push(
+        `--user-data-dir=${userData}`,
+        `--zen-db-path=${dbPath}`,
+      );
+    }
+
+    const windowArgv: string[] = [];
+    if (args.windowBounds) {
+      const { x, y, width, height } = args.windowBounds;
+      if (x !== undefined) windowArgv.push(`--zen-x=${x}`);
+      if (y !== undefined) windowArgv.push(`--zen-y=${y}`);
+      if (width !== undefined) windowArgv.push(`--zen-width=${width}`);
+      if (height !== undefined) windowArgv.push(`--zen-height=${height}`);
+    }
+
+    const argv = [
+      ...base,
+      ...isolationArgv,
+      ...windowArgv,
+      ...(args.extraArgv ?? []),
+    ];
+
+    const stdio = args.stdio ?? "pipe";
+    const stdioConfig: Array<"ignore" | "pipe" | "inherit"> =
+      stdio === "pipe"
+        ? ["ignore", "pipe", "pipe"]
+        : stdio === "inherit"
+          ? ["ignore", "inherit", "inherit"]
+          : ["ignore", "ignore", "ignore"];
+
+    const child = spawn(BOOT_EXEC_PATH, argv, {
+      cwd: args.cwd ?? process.cwd(),
+      env: { ...process.env, ...(args.extraEnv ?? {}) },
+      stdio: stdioConfig,
+      // Don't `detached: true`: we want the OS to keep the child
+      // associated with the parent so the user's `Cmd+Q` /
+      // workspace teardown reaps the dev instance. Callers that
+      // want a true background process can set
+      // `child.unref()` themselves after the spawn returns.
+    });
+
+    log.verbose(
+      `respawnSelf pid=${child.pid ?? "?"} sandbox=${
+        sandboxDir ?? "none"
+      } argv=${argv.join(" ")}`,
+    );
+
+    return { child, execPath: BOOT_EXEC_PATH, argv, sandboxDir };
   }
 
   async openPath(filePath: string): Promise<void> {

@@ -5,6 +5,17 @@ import path from "node:path";
 const internalDir = path.join(os.homedir(), ".zenbu", ".internal");
 const pathsJson = path.join(internalDir, "paths.json");
 
+export type BundledPaths = {
+  cacheRoot: string;
+  binDir: string;
+  bunInstall: string;
+  bunPath: string;
+  pnpmHome: string;
+  pnpmPath: string;
+  gitPath: string;
+  writtenAt: number;
+};
+
 function userCacheRoot(): string {
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Caches");
@@ -15,7 +26,7 @@ function userCacheRoot(): string {
   return process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache");
 }
 
-function computePaths() {
+function computePaths(): BundledPaths {
   const cacheRoot = path.join(userCacheRoot(), "Zenbu");
   const binDir = path.join(cacheRoot, "bin");
   return {
@@ -64,4 +75,37 @@ export function bootstrapEnv() {
   } catch {}
 
   return { paths, needsToolchainDownload: !toolchainReady };
+}
+
+/**
+ * Read the bundled-toolchain paths file (`~/.zenbu/.internal/paths.json`)
+ * that the launcher writes during `bootstrapEnv()` on every boot.
+ *
+ * Intended for plugins that need to invoke the bundled package manager or
+ * git so they don't depend on what the user happens to have on `$PATH`.
+ *
+ * Falls back to the synchronous, in-process `computePaths()` result if the
+ * file is missing or unreadable, so this never throws — it always returns
+ * a well-formed shape. Callers should still check `fs.existsSync` on the
+ * individual binary path before spawning, since the launcher only writes
+ * the file once it confirms the toolchain is installed.
+ */
+export function getBundledPaths(): BundledPaths {
+  try {
+    const raw = fs.readFileSync(pathsJson, "utf8");
+    const parsed = JSON.parse(raw) as Partial<BundledPaths>;
+    const fallback = computePaths();
+    return {
+      cacheRoot: parsed.cacheRoot ?? fallback.cacheRoot,
+      binDir: parsed.binDir ?? fallback.binDir,
+      bunInstall: parsed.bunInstall ?? fallback.bunInstall,
+      bunPath: parsed.bunPath ?? fallback.bunPath,
+      pnpmHome: parsed.pnpmHome ?? fallback.pnpmHome,
+      pnpmPath: parsed.pnpmPath ?? fallback.pnpmPath,
+      gitPath: parsed.gitPath ?? fallback.gitPath,
+      writtenAt: parsed.writtenAt ?? fallback.writtenAt,
+    };
+  } catch {
+    return computePaths();
+  }
 }

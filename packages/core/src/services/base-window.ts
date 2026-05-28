@@ -23,10 +23,16 @@ export class BaseWindowService extends Service.create({
   private set bootWindows(v: BootWindow[]) { (globalThis as any).__zenbu_boot_windows__ = v }
 
   private getZenWidth(): number | undefined {
-    const flag = process.argv.find((a) => a.startsWith("--zen-width="))
-    if (!flag) return undefined
-    const n = parseInt(flag.slice("--zen-width=".length), 10)
-    return isNaN(n) ? undefined : n
+    return readIntArg("--zen-width=")
+  }
+  private getZenHeight(): number | undefined {
+    return readIntArg("--zen-height=")
+  }
+  private getZenX(): number | undefined {
+    return readIntArg("--zen-x=")
+  }
+  private getZenY(): number | undefined {
+    return readIntArg("--zen-y=")
   }
 
   getWindowId(win: BaseWindow): string | undefined {
@@ -41,9 +47,19 @@ export class BaseWindowService extends Service.create({
     baseWindow?: BaseWindowConstructorOptions
   }): { win: BaseWindow; windowId: string } {
     const windowId = opts?.windowId ?? nanoid()
+    // `--zen-x` / `--zen-y` / `--zen-width` / `--zen-height` let a
+    // parent process pre-position a spawned child instance. Used by
+    // `WindowService.respawnSelf` so the dev-test window doesn't
+    // open exactly on top of the parent. `undefined` falls through
+    // to Electron's default behaviour (last-known bounds or OS
+    // centering).
+    const cliX = this.getZenX()
+    const cliY = this.getZenY()
     const defaults: BaseWindowConstructorOptions = {
       width: this.getZenWidth() ?? 1100,
-      height: 750,
+      height: this.getZenHeight() ?? 750,
+      ...(cliX !== undefined ? { x: cliX } : {}),
+      ...(cliY !== undefined ? { y: cliY } : {}),
       show: true,
       titleBarStyle: "hidden",
       // Traffic lights sit on top of our 36px orchestrator title bar.
@@ -127,6 +143,13 @@ export class BaseWindowService extends Service.create({
 
     log.verbose(`ready (${this.windows.size} windows)`)
   }
+}
+
+function readIntArg(prefix: string): number | undefined {
+  const flag = process.argv.find((a) => a.startsWith(prefix))
+  if (!flag) return undefined
+  const n = parseInt(flag.slice(prefix.length), 10)
+  return Number.isNaN(n) ? undefined : n
 }
 
 runtime.register(BaseWindowService, import.meta)

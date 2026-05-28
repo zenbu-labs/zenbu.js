@@ -23,6 +23,22 @@ const CONFIG_NAMES = [
 
 const PLUGIN_FILE_RE = /\.(?:ts|mts|js|mjs|cjs)$/
 
+/**
+ * Parse repeatable `--plugin=<path>` flags from an argv array.
+ * Exposed for testability; in production the caller is `loadConfig`.
+ */
+export function collectArgvPlugins(argv: readonly string[]): string[] {
+  const out: string[] = []
+  for (const arg of argv) {
+    if (typeof arg !== "string") continue
+    if (arg.startsWith("--plugin=")) {
+      const v = arg.slice("--plugin=".length)
+      if (v.length > 0) out.push(v)
+    }
+  }
+  return out
+}
+
 export function findConfigPath(projectDir: string): string {
   for (const name of CONFIG_NAMES) {
     const candidate = path.join(projectDir, name)
@@ -284,6 +300,39 @@ export async function loadConfig(
         plugins.push(resolved)
         if (sourceFile) pluginSourceFiles.push(sourceFile)
       }
+    }
+  }
+
+  // Argv-driven plugin entries: any number of `--plugin=<path>` flags on
+  // process.argv. Treated the same as a string entry in `config.plugins`
+  // (resolved relative to `process.cwd()`, must exist, must be .ts/.js,
+  // hot-watched via `pluginSourceFiles`).
+  //
+  // Intentionally simpler than `localPlugins`: there's no overlay file to
+  // watch for *creation*, since the user passes the path explicitly when
+  // launching the dev instance. If the path doesn't exist we fail fast
+  // here instead of silently skipping — the whole point of the flag is
+  // "load THIS plugin", so a missing file is a configuration error, not
+  // a no-op.
+  if (!options.skipLocalPlugins) {
+    const argvPlugins = collectArgvPlugins(process.argv)
+    for (const argvPath of argvPlugins) {
+      const abs = path.isAbsolute(argvPath)
+        ? argvPath
+        : path.resolve(process.cwd(), argvPath)
+      if (!fs.existsSync(abs)) {
+        throw new Error(
+          `--plugin=${argvPath}: file does not exist (resolved to ${abs}).`,
+        )
+      }
+      if (!PLUGIN_FILE_RE.test(abs)) {
+        throw new Error(
+          `--plugin=${argvPath}: must point at a .ts/.js file (got ${path.basename(abs)}).`,
+        )
+      }
+      const { resolved, sourceFile } = await resolvePluginEntry(abs, configDir)
+      plugins.push(resolved)
+      if (sourceFile) pluginSourceFiles.push(sourceFile)
     }
   }
 
