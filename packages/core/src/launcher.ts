@@ -239,14 +239,23 @@ async function maybeOpenInstallingWindow(
   }
 
   const backgroundColor = readBgColor(htmlPath, "#F4F4F4");
-  // Match the splash window dimensions / chrome so the handoff is seamless
-  // (setup-gate's spawnSplashWindow adopts this BaseWindow as-is).
+  // Installer-shaped window: small, fixed size, centered. The cold-boot
+  // install screen has nothing to interact with (one shimmering label +
+  // an error block on failure), so splash-sized real estate would just
+  // look empty. setup-gate's `spawnSplashWindow` resizes this BaseWindow
+  // to splash dimensions during the handoff so the actual app doesn't
+  // inherit the installer footprint.
   const win = new BaseWindow({
-    width: 1100,
-    height: 750,
+    width: 480,
+    height: 320,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
     titleBarStyle: "hidden",
-    trafficLightPosition: { x: 14, y: 10 },
+    trafficLightPosition: { x: 10, y: 8 },
     backgroundColor,
+    center: true,
   });
   const view = new WebContentsView({
     webPreferences: {

@@ -206,6 +206,12 @@ type ElectronWindowing = {
     getContentBounds(): { width: number; height: number };
     show(): void;
     setBackgroundColor(color: string): void;
+    setResizable(resizable: boolean): void;
+    setMinimizable(minimizable: boolean): void;
+    setMaximizable(maximizable: boolean): void;
+    setFullScreenable(fullScreenable: boolean): void;
+    setContentSize(width: number, height: number, animate?: boolean): void;
+    center(): void;
     on(event: string, cb: (...args: unknown[]) => void): void;
   };
   WebContentsView: new (opts?: Record<string, unknown>) => {
@@ -279,6 +285,21 @@ async function spawnSplashWindow(
     // painting shows splash's intended color, not installing's.
     try {
       win.setBackgroundColor(backgroundColor);
+    } catch {}
+    // The launcher opens the install window at installer dimensions
+    // (~480x320, non-resizable) so the cold-boot screen doesn't look
+    // empty. The actual app needs splash-sized real estate though, so
+    // resize back up + recenter + restore window chrome attributes here
+    // before swapping in the splash view. Wrapped in try/catch because
+    // BaseWindow may have been destroyed if the launcher errored out
+    // between handoff() and us reaching this point.
+    try {
+      win.setResizable(true);
+      win.setMinimizable(true);
+      win.setMaximizable(true);
+      win.setFullScreenable(true);
+      win.setContentSize(1100, 750);
+      win.center();
     } catch {}
     // Tear down the installing window's child view(s); we'll re-fill with
     // the splash view below.

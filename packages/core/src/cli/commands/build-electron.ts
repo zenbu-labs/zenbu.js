@@ -334,7 +334,8 @@ async function copyFile(src: string, dest: string): Promise<void> {
 
 /**
  * Stage the user's boot-time HTML(s) plus the framework's built-in
- * `installing-preload.cjs` into the bundle dir.
+ * `installing-preload.cjs` (and, by convention, the sibling `icon.png`)
+ * into the bundle dir.
  *
  * Both `installing.html` (cold-boot install, loaded by `launcher.ts`) and
  * `updating.html` (in-app plugin update, loaded by the plugin-update
@@ -342,19 +343,27 @@ async function copyFile(src: string, dest: string): Promise<void> {
  * — so we only stage one copy regardless of which / both pages are
  * present. Each `*Src` is optional; pass `null` to skip.
  *
- * Sibling assets (CSS, fonts, images referenced from the HTML) are the
- * user's responsibility via their own `electron-builder.json#extraResources`.
+ * Convention: if `<uiEntrypoint>/icon.png` exists, it is staged to
+ * `Resources/icon.png` whenever any HTML is staged. Both the install
+ * and update screens reference `./icon.png` by convention (matching
+ * splash.html), so this is the minimum sibling asset needed for the
+ * default templates to render correctly. Other sibling assets (CSS,
+ * fonts, additional images) are still the user's responsibility via
+ * their own `electron-builder.json#extraResources`.
  */
 async function stageInstallingArtifacts(args: {
   projectDir: string;
+  entrypointDir: string;
   installingSrc: string | null;
   updatingSrc: string | null;
   installingHtmlOut: string;
   updatingHtmlOut: string;
   installingPreloadOut: string;
-}): Promise<{ installing: boolean; updating: boolean }> {
+  iconOut: string;
+}): Promise<{ installing: boolean; updating: boolean; icon: boolean }> {
   let installing = false;
   let updating = false;
+  let icon = false;
   if (args.installingSrc) {
     await copyFile(args.installingSrc, args.installingHtmlOut);
     installing = true;
@@ -369,8 +378,15 @@ async function stageInstallingArtifacts(args: {
       "installing-preload.cjs",
     );
     await copyFile(preloadSrc, args.installingPreloadOut);
+    // Sibling icon, by convention. Silent skip if absent — the HTML's
+    // <img src="./icon.png"> will simply render as the alt text.
+    const iconSrc = path.join(args.entrypointDir, "icon.png");
+    if (fs.existsSync(iconSrc)) {
+      await copyFile(iconSrc, args.iconOut);
+      icon = true;
+    }
   }
-  return { installing, updating };
+  return { installing, updating, icon };
 }
 
 export async function runBuildElectron(argv: string[]): Promise<void> {
@@ -442,6 +458,7 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   const installingHtmlOut = path.join(bundleDir, "installing.html");
   const updatingHtmlOut = path.join(bundleDir, "updating.html");
   const installingPreloadOut = path.join(bundleDir, "installing-preload.cjs");
+  const iconOut = path.join(bundleDir, "icon.png");
 
   const sourceSha = currentSourceSha(projectDir);
 
@@ -472,13 +489,15 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
     resolved.installingPath || resolved.updatingPath
       ? await stageInstallingArtifacts({
           projectDir,
+          entrypointDir: resolved.uiEntrypointPath,
           installingSrc: resolved.installingPath ?? null,
           updatingSrc: resolved.updatingPath ?? null,
           installingHtmlOut,
           updatingHtmlOut,
           installingPreloadOut,
+          iconOut,
         })
-      : { installing: false, updating: false };
+      : { installing: false, updating: false, icon: false };
   if (staged.installing) {
     console.log(
       `  → staging installing.html (${path.relative(
@@ -497,6 +516,9 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   }
   if (staged.installing || staged.updating) {
     console.log(`  → staging installing-preload.cjs`);
+  }
+  if (staged.icon) {
+    console.log(`  → staging icon.png (sibling of *.html)`);
   }
 
   console.log(`  → provisioning bundled toolchain (bun + ${pmLabel})`);
@@ -574,6 +596,16 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
       to: "installing-preload.cjs",
     });
   }
+  // Sibling icon.png next to the HTML files. Both default templates
+  // reference `./icon.png`; staging it as a sibling of installing.html
+  // makes that path resolve in Resources/ at first launch (before any
+  // source has been cloned).
+  if (staged.icon) {
+    overlayExtraResources.push({
+      from: iconOut,
+      to: "icon.png",
+    });
+  }
 
   const merged = mergeElectronBuilderConfig(userConfig, {
     appDir: bundleDir,
@@ -613,6 +645,11 @@ export async function runBuildElectron(argv: string[]): Promise<void> {
   if (staged.installing || staged.updating) {
     console.log(
       `      extraResources    += { from: installing-preload.cjs, to: installing-preload.cjs }`,
+    );
+  }
+  if (staged.icon) {
+    console.log(
+      `      extraResources    += { from: icon.png, to: icon.png }`,
     );
   }
   console.log(
