@@ -7,12 +7,11 @@ import type {
   DbService,
   HttpService,
   PluginUpdaterService,
-  ReloaderService,
-  RendererHostService,
   RpcService,
   ServerService,
   ShortcutsService,
   UpdaterService,
+  ViteService,
   WindowService,
 } from "@zenbujs/core/services"
 import type { Events as Events_core } from "@zenbujs/core/events"
@@ -43,12 +42,11 @@ export type CoreServiceRouter = {
     db: ExtractRpcMethods<DbService>;
     http: ExtractRpcMethods<HttpService>;
     pluginUpdater: ExtractRpcMethods<PluginUpdaterService>;
-    reloader: ExtractRpcMethods<ReloaderService>;
-    rendererHost: ExtractRpcMethods<RendererHostService>;
     rpc: ExtractRpcMethods<RpcService>;
     server: ExtractRpcMethods<ServerService>;
     shortcuts: ExtractRpcMethods<ShortcutsService>;
     updater: ExtractRpcMethods<UpdaterService>;
+    vite: ExtractRpcMethods<ViteService>;
     window: ExtractRpcMethods<WindowService>;
   };
 }

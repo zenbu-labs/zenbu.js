@@ -131,46 +131,10 @@ export abstract class Service {
 
   /**
    * Inject a named module export into the renderer's injection
-   * registry. The one primitive plugins use to extend the app.
-   *
-   * The Vite prelude pipeline imports `modulePath` before `main.tsx`
-   * runs and registers its export under `name`. Consumers find it
-   * via `useInjection(name)` (single) or `useInjections({ kind })`
-   * (filtered). `<View name="…" />` is the canonical reader for
-   * "render this injection as a React component".
-   *
-   *   this.setup("footer-item", () =>
-   *     this.inject({
-   *       name: "my-plugin/vim-mode",
-   *       modulePath: "./src/footer-item.tsx",
-   *       meta: { kind: "footer.item", order: 10, position: "right" },
-   *     }),
-   *   )
-   *
-   * Convention: scope `name` with your plugin id, e.g.
-   * `"my-plugin/footer-item"`. Last registration with the same name
-   * wins.
-   *
-   * Common shapes (`meta.kind`):
-   *   - `"view"` / `"left-sidebar"` / `"right-sidebar"` / `"bottom-panel"` /
-   *     `"workspace-rail"` / `"title-bar"` / `"footer.item"` — host
-   *     slot conventions, discovered by the host's slot hooks.
-   *   - `"cm.composer-extension"` / `"cm.composer-extension-editable"` —
-   *     CodeMirror extensions the composer merges in.
-   *   - No `kind` — the module is imported for side effects only
-   *     (the old "content script" pattern: mount a hidden React root
-   *     that uses `useRegisterInjection` to publish reactive values).
-   *
-   * If the owning plugin's manifest has `icons[name]`, the SVG is
-   * auto-attached as `meta.icon` so slot hooks render it without
-   * the registration site repeating the markup.
-   *
-   * Returns a synchronous dispose; wrap in `this.setup(...)` so
-   * plugin teardown / hot reload removes the prelude entry cleanly.
-   *
-   * For renderer-side reactive injections (value depends on db /
-   * component state), use `useRegisterInjection` from
-   * `@zenbujs/core/react` — it writes into the same registry.
+   * registry. Read via `useInjection(name)` / `useInjections({ kind })`
+   * or rendered via `<View name="…" />`. No `meta` = side-effect-only
+   * (old content-script pattern). Returns a sync dispose; wrap in
+   * `this.setup(...)`.
    */
   inject(spec: InjectionSpec): () => void {
     const pluginDir = this.__getPluginDir("inject");
@@ -191,21 +155,9 @@ export abstract class Service {
   }
 
   /**
-   * Sugar for wrapping another module's export. Equivalent to an
-   * injection with `meta.kind: "advice"` plus the wrap target and
-   * shape — the Vite prelude routes advice entries through
-   * `@zenbu/advice/runtime` instead of the in-renderer injection
-   * registry.
-   *
-   *   this.setup("wrap-counter", () =>
-   *     this.advise({
-   *       moduleId: "App.tsx",
-   *       name: "Counter",
-   *       type: "around",
-   *       modulePath: "./src/content/wrap-counter.tsx",
-   *       exportName: "WrapCounter",
-   *     }),
-   *   )
+   * Wrap another module's export. Sugar over `inject` with
+   * `meta.kind: "advice"`; the prelude routes advice entries through
+   * `@zenbu/advice/runtime` instead of the injection registry.
    */
   advise(spec: AdviceSpec): () => void {
     const pluginDir = this.__getPluginDir("advise");

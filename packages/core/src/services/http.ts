@@ -3,8 +3,7 @@ import type { WebSocket } from "ws"
 import { nanoid } from "nanoid"
 import { Service, runtime } from "../runtime"
 import { ServerService } from "./server"
-import { ReloaderService } from "./reloader"
-import { APP_RENDERER_RELOADER_ID } from "./renderer-host"
+import { ViteService } from "./vite"
 import { createLogger } from "../shared/log"
 import type { Duplex } from "stream"
 
@@ -17,7 +16,7 @@ type RequestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => v
 
 export class HttpService extends Service.create({
   key: "http",
-  deps: { server: ServerService, reloader: ReloaderService },
+  deps: { server: ServerService, vite: ViteService },
 }) {
   connectedCallbacks: ConnectedCallback[] = []
   disconnectedCallbacks: DisconnectedCallback[] = []
@@ -62,14 +61,13 @@ export class HttpService extends Service.create({
           }
         }
 
-        const coreEntry = this.ctx.reloader.get(APP_RENDERER_RELOADER_ID)
-        if (!coreEntry) {
+        const viteUrl = this.ctx.vite.url
+        if (!viteUrl) {
           res.writeHead(503)
           res.end("Vite server not ready")
           return
         }
-        const reloaderUrl = coreEntry.url.replace(/\/$/, "")
-        const target = new URL(url, reloaderUrl)
+        const target = new URL(url, viteUrl.replace(/\/$/, ""))
         const proxyHeaders = { ...req.headers, host: target.host }
         const proxyReq = http.request(
           target,
@@ -98,13 +96,13 @@ export class HttpService extends Service.create({
         const protocols = req.headers["sec-websocket-protocol"]
         if (!protocols || !protocols.includes("vite-hmr")) return false
 
-        const coreEntry = this.ctx.reloader.get(APP_RENDERER_RELOADER_ID)
-        if (!coreEntry) {
+        const viteUrl = this.ctx.vite.url
+        if (!viteUrl) {
           socket.destroy()
           return true
         }
 
-        const target = new URL(coreEntry.url)
+        const target = new URL(viteUrl)
         const proxyReq = http.request({
           hostname: target.hostname,
           port: target.port,

@@ -11,19 +11,11 @@ import {
 } from "./services/advice-config";
 
 /**
- * Per-renderer Vite plugins. Wires three things into the host
- * renderer's `<head>`:
- *
- *   1. Inline theme tokens (first paint matches host theme).
- *   2. Inline static preludes (boot-trace, view-args, theme,
- *      shortcuts) — framework runtime bootstrap.
- *   3. The injection prelude at `/@injections-prelude` — a virtual
- *      module generated from the injection registry in
- *      `advice-config.ts`. Imports every registered module, then
- *      dispatches by `meta.kind`: advice entries land in
- *      `@zenbu/advice/runtime`, everything else in the in-memory
- *      injection registry that `useInjection` / `useInjections`
- *      read from.
+ * Wires two things into the host renderer's `<head>`:
+ *   1. Inline boot-trace prelude.
+ *   2. The injection prelude at `/@injections-prelude` — a virtual
+ *      module regenerated from the injection registry on every
+ *      registration change.
  */
 
 const PRELUDE_PREFIX = "/@injections-prelude";
@@ -86,20 +78,14 @@ function buildInlinePreludeScript(): string | null {
 /* ---------- Injection prelude codegen ---------- */
 
 /**
- * Emit one import + one dispatch per injection. Advice entries
- * (kind === "advice") go through `@zenbu/advice/runtime`; everything
- * else lands in the in-renderer injection registry that `useInjection`
- * / `useInjections` subscribe to.
+ * One import + one dispatch per injection. Advice -> @zenbu/advice/runtime;
+ * no-meta / `kind: "bootstrap"` -> bare side-effect import (the module
+ * usually has no default export); everything else -> in-renderer
+ * `registerInjection(name, value, meta)`.
  */
 function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   if (entries.length === 0) return "";
 
-  // An injection without `meta` is the old "content script" pattern:
-  // import the module for its side effects (which is how userland
-  // mounts hidden React roots etc.) but read no value back. Same for
-  // `meta.kind: "bootstrap"`. We can't `import default from ...` for
-  // those because the module typically has no default export — that
-  // throws synchronously and crashes the whole prelude.
   const isBootstrap = (e: InjectionEntry): boolean =>
     e.meta === undefined || e.meta?.kind === "bootstrap";
   const isAdvice = (e: InjectionEntry): boolean =>
@@ -122,10 +108,7 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
 
   const calls: string[] = [];
   entries.forEach((entry, i) => {
-    // Side-effect-only injections — emit a bare `import` so the
-    // module runs (its side effects, e.g. mounting a hidden React
-    // root, do the actual work) without binding a default export
-    // that might not exist.
+    // Side-effect-only: bare `import` (no default binding to fail on).
     if (isBootstrap(entry)) {
       imports.push(`import ${JSON.stringify(entry.modulePath)}`);
       return;
@@ -151,8 +134,7 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
       const adviceType = entry.meta?.adviceType as
         | "replace" | "before" | "after" | "around" | undefined;
       if (!wraps || !adviceType) {
-        // Misconfigured advice meta — skip the dispatch but keep the
-        // import so the side-effecting module still runs.
+        // Misconfigured — keep the import side-effect, skip dispatch.
         return;
       }
       if (adviceType === "replace") {
@@ -171,8 +153,6 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
       return;
     }
 
-    // Value injection. `meta` is opaque JSON; JSON.stringify both
-    // validates serializability and produces a literal we can inline.
     const metaLiteral = JSON.stringify(entry.meta);
     calls.push(
       `__zb_registerInjection(${JSON.stringify(entry.name)}, ${alias}, ${metaLiteral})`,
@@ -194,14 +174,11 @@ export function resolveAdviceRuntime(): Plugin {
   };
 }
 
-/* ---------- Per-iframe prelude plugin ---------- */
+/* ---------- Injection prelude virtual module ---------- */
 
-/**
- * Virtual prelude module at `/@advice-prelude/<type>`. Body is generated
- * on demand from the maps in `advice-config.ts`. Registration changes
- * call `emitReload(view)` → invalidate the module + ping the iframe via
- * `core.advice.reload` so it `location.reload()`s with a fresh prelude.
- */
+// Body regenerated on demand from the injection registry.
+// Registration changes call `emitReload()` which invalidates this
+// module and reloads the renderer.
 export function advicePreludePlugin(): Plugin {
   return {
     name: "zenbu-injections-prelude",
@@ -221,9 +198,8 @@ export function advicePreludePlugin(): Plugin {
     },
 
     handleHotUpdate({ file, server }) {
-      // Any edit to an injection source module needs a full reload
-      // — the registration is a side effect of the prelude script,
-      // which only runs at boot.
+      // Injection source edits need a full reload — registration is a
+      // side effect of the prelude script that only runs at boot.
       if (getAllInjectionPaths().includes(file)) {
         server.ws.send({ type: "full-reload" });
         return [];

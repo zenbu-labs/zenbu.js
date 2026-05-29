@@ -1,33 +1,16 @@
 import path from "node:path"
 import { runtime } from "../runtime"
-// Don't import ReloaderService / RendererHostService / RpcService at the
-// top — this file is reachable from `services/reloader.ts` via
-// `vite-plugins.ts`, and a top-level circular import would resolve the
-// dep classes to `undefined` during first eval. Look them up lazily.
+// Avoid top-level imports of services that pull this file in via
+// `vite-plugins.ts`; we look them up lazily inside the emit path.
 
-/**
- * The injection registry — the one primitive plugins use to push
- * module exports into the renderer.
- *
- * Each injection is a `{ name, modulePath, exportName, meta }` record.
- * The Vite prelude pipeline imports every registered module before
- * `main.tsx` runs, and dispatches based on `meta.kind`:
- *
- *   - `meta.kind === "advice"` (with `meta.wraps` + `meta.adviceType`)
- *     wires up wrap/replace/before/after via `@zenbu/advice/runtime`.
- *
- *   - Anything else (or no kind) lands in the in-memory injection
- *     registry under `name`, where `useInjection(name)` /
- *     `useInjections({ kind })` can find it. `<View name="…">` is the
- *     canonical reader for "render this injection as a React component".
- *
- * A registration with no `meta` and no consumer is the old "content
- * script" pattern: the module is imported for side effects (which is
- * typically how userland mounts hidden React roots that themselves
- * call `useRegisterInjection`).
- */
+// The injection registry. Source of truth for everything that flows
+// through the Vite prelude pipeline. The codegen in `vite-plugins.ts`
+// reads `getInjections()` and dispatches per entry:
+//   - `meta.kind === "advice"` -> @zenbu/advice/runtime
+//   - no `meta` / `meta.kind === "bootstrap"` -> side-effect import
+//   - anything else -> registerInjection(name, value, meta) in the
+//     renderer's in-memory map.
 
-/** Public spec for `this.inject({...})`. */
 export interface InjectionSpec {
   name: string
   modulePath: string
@@ -36,19 +19,10 @@ export interface InjectionSpec {
 }
 
 /**
- * Opaque, JSON-serializable metadata attached to an injection. The
- * codegen JSON.stringifies this verbatim, so every leaf has to round-
- * trip through `JSON.parse(JSON.stringify(...))`.
- *
- * Conventional keys plugin authors use:
- *   - `kind`: slot key (`"view"`, `"left-sidebar"`, `"footer.item"`, …).
- *             Discovery: `useInjections({ kind: "…" })`.
- *   - `label`: human-readable name.
- *   - `icon`: SVG markup. Auto-attached by `this.inject(...)` from the
- *             owning plugin's manifest if `plugin.icons[name]` exists.
- *
- * Advice-specific:
- *   - `kind: "advice"` + `wraps: { moduleId, name }` + `adviceType`.
+ * Opaque JSON metadata. JSON.stringify'd verbatim by the codegen.
+ * Conventional: `kind` (slot key, discovery via `useInjections`),
+ * `label`, `icon` (auto-attached from plugin manifest if any).
+ * Advice entries also carry `wraps` + `adviceType`.
  */
 export type InjectionMeta = Record<string, unknown> & {
   kind?: string
@@ -65,42 +39,26 @@ export interface InjectionEntry {
   meta?: InjectionMeta
 }
 
-/**
- * Sugar spec for `this.advise({...})`. Translated into an injection
- * with `meta.kind: "advice"` plus the target / wrap-type meta.
- */
+/** Sugar spec for `this.advise(...)`. */
 export interface AdviceSpec {
-  /**
-   * Module whose export is being wrapped. Matched as a suffix against
-   * the importing module's id, so file-extension agnostic
-   * (`"App.tsx"` matches `/abs/path/App.tsx` and the .ts variant).
-   */
+  /** Suffix-matched against the target module's id. */
   moduleId: string
   /** Name of the export to advise. */
   name: string
-  /** Wrap shape — same vocabulary as `@zenbu/advice/runtime`. */
+  /** Wrap shape — same vocab as `@zenbu/advice/runtime`. */
   type: "replace" | "before" | "after" | "around"
-  /** Module containing the wrapper. Relative paths resolve against the plugin root. */
+  /** Wrapper module. Relative paths resolve against the plugin root. */
   modulePath: string
-  /** Named export inside `modulePath`. Defaults to `default`. */
+  /** Named export. Defaults to `default`. */
   exportName?: string
-  /**
-   * Optional explicit injection name. Defaults to a synthetic
-   * `advice:<moduleId>:<name>:<type>` so the injection key stays
-   * stable across re-registrations of the same target.
-   */
+  /** Override the synthetic injection name. */
   injectionName?: string
 }
 
 const RESOLVED_PREFIX = "\0@injections-prelude/"
-const APP_RENDERER_RELOADER_ID = "app"
 
-/**
- * The single source of truth. Keyed by injection `name`. Last
- * registration with a given name wins; `dispose()` only clears the
- * slot if it still owns it (so a stale dispose can't blow away a
- * later re-registration).
- */
+// Source of truth, keyed by `name`. Last registration wins; dispose
+// only clears if we still own the slot.
 const injections = new Map<string, InjectionEntry>()
 const injectionChangeListeners = new Set<() => void>()
 
@@ -118,19 +76,16 @@ function resolveAgainstPlugin(
   return path.resolve(pluginDir, modulePath)
 }
 
-/**
- * Invalidate the `/@injections-prelude` virtual module in the host
- * Vite graph so the next request regenerates from the live registry.
- */
+// Invalidate the virtual prelude module so the next request
+// regenerates it from the live registry.
 function invalidatePrelude() {
   try {
-    const reloader = runtime.getSlot("reloader")?.instance as
-      | { get(id: string): { viteServer?: any } | undefined }
+    const vite = runtime.getSlot("vite")?.instance as
+      | { viteServer?: any }
       | undefined
-    if (!reloader) return
-    const coreEntry = reloader.get(APP_RENDERER_RELOADER_ID)
-    if (!coreEntry?.viteServer) return
-    const graph = coreEntry.viteServer.moduleGraph
+    const server = vite?.viteServer
+    if (!server) return
+    const graph = server.moduleGraph
     for (const id of graph.idToModuleMap.keys()) {
       if (typeof id !== "string") continue
       if (id.startsWith(RESOLVED_PREFIX)) {
@@ -141,13 +96,10 @@ function invalidatePrelude() {
   } catch {}
 }
 
-/**
- * Invalidate the prelude module + ping the host renderer to reload so
- * the fresh registrations take effect. Module-load injections only
- * run at boot, so a reload is the simplest contract. Also fires the
- * in-process listeners so main-side services can react to
- * injection-set changes without going through the renderer.
- */
+// Invalidate the virtual prelude + reload the renderer + fire
+// in-process listeners. Module-load injections only run at boot, so a
+// reload is the simplest way to apply changes.
+
 function emitReload() {
   invalidatePrelude()
   for (const cb of injectionChangeListeners) {
@@ -171,11 +123,7 @@ function emitReload() {
   } catch {}
 }
 
-/**
- * Subscribe to injection registry changes from the main process.
- * Useful for services that auto-register shortcuts / palette
- * actions per injection (e.g. `SidebarViewShortcutsService`).
- */
+/** Subscribe to registry changes from main-side services. */
 export function subscribeInjections(cb: () => void): () => void {
   injectionChangeListeners.add(cb)
   return () => {
@@ -183,10 +131,7 @@ export function subscribeInjections(cb: () => void): () => void {
   }
 }
 
-/**
- * Register an injection. `pluginDir` is used to resolve relative
- * `modulePath` values; pass `null` to require an absolute path.
- */
+/** Register an injection. `pluginDir = null` requires an absolute modulePath. */
 export function addInjection(
   pluginDir: string | null,
   spec: InjectionSpec,
@@ -208,12 +153,7 @@ export function addInjection(
   }
 }
 
-/**
- * Sugar for advice. Materializes an injection with the well-known
- * advice meta shape; the prelude codegen dispatches advice entries
- * through `@zenbu/advice/runtime` instead of the in-renderer
- * injection registry.
- */
+/** Sugar over `addInjection` with the advice meta shape. */
 export function addAdvice(
   pluginDir: string | null,
   spec: AdviceSpec,

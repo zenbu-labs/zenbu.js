@@ -1,7 +1,6 @@
 export { BootTraceService } from "./boot-trace";
 export { ServerService } from "./server";
-export { ReloaderService } from "./reloader";
-export { RendererHostService } from "./renderer-host";
+export { ViteService } from "./vite";
 export { HttpService } from "./http";
 export { DbService } from "./db";
 export { BaseWindowService, MAIN_WINDOW_ID } from "./base-window";

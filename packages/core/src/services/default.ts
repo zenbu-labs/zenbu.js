@@ -4,13 +4,9 @@
  * lifecycle is driven by `runtime` based on the dependency graph, so
  * import order doesn't matter for correctness.
  *
- * Imports are sequential (not Promise.all). We tried parallelizing and
- * it made boot SLOWER — the heavy services (DbService import pulls in
- * parcel-watcher's native module + effect, ReloaderService imports the
- * whole Vite bundle) compete for CPU and starve the `renderer-host`
- * warmup that runs immediately after, blowing it up from ~220ms to
- * ~1400ms. Until the warmup runs off the critical path, serial imports
- * keep total wall-clock lower.
+ * Imports run in parallel via `Promise.all` because `runtime` will
+ * sequence their actual `evaluate()` calls based on the dependency
+ * graph anyway. The bootTrace spans surface per-import cost.
  */
 
 export async function defaultServices(): Promise<void> {
@@ -18,8 +14,7 @@ export async function defaultServices(): Promise<void> {
   await Promise.all([
     bootTrace.span("import:./boot-trace", () => import("./boot-trace")),
     bootTrace.span("import:./server", () => import("./server")),
-    bootTrace.span("import:./reloader", () => import("./reloader")),
-    bootTrace.span("import:./renderer-host", () => import("./renderer-host")),
+    bootTrace.span("import:./vite", () => import("./vite")),
     bootTrace.span("import:./http", () => import("./http")),
     bootTrace.span("import:./db", () => import("./db")),
     bootTrace.span("import:./base-window", () => import("./base-window")),

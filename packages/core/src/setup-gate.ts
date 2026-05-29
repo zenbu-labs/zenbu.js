@@ -538,7 +538,7 @@ export async function setupGate(): Promise<void> {
   // Running it here lets that work overlap with Electron's own startup
   // (electron-ready usually takes 80-200ms but the GPU/network helpers
   // take longer) and with the splash/loader registration. The cached
-  // module promise is consumed later when `RendererHostService` calls
+  // module promise is consumed later when `ViteService` calls
   // `createServer` — by then it's already a cache hit.
   const vitePrewarm = bootTrace.span("prewarm:vite-import", () =>
     import("vite").then(() => {}).catch(() => {}),

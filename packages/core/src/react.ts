@@ -338,12 +338,10 @@ export function ZenbuProvider({
     );
   }
 
-  // Compose KyjuProvider inside ConnectionContext so kyju's useDb /
-  // useCollection hooks find their context. The KyjuProvider receives
-  // the same replica + client that core stores on ConnectionContext.
-  // `ShortcutDispatcher` is a tiny effect-only child that owns the
-  // keydown listener + bindings cache; it runs once per connected
-  // ZenbuProvider, so each BrowserWindow gets its own.
+  // KyjuProvider lives inside ConnectionContext so kyju's hooks find
+  // their context. `ShortcutDispatcher` is an effect-only child that
+  // installs the keydown listener (one per ZenbuProvider = one per
+  // BrowserWindow).
   return createElement(
     ConnectionContext.Provider,
     { value: state },
@@ -363,28 +361,11 @@ export function ZenbuProvider({
   );
 }
 
-// ---- Shortcut dispatcher ---------------------------------------------
-//
-// Replaces the old per-iframe `installShortcutBridge` prelude. With
-// one DOM there's no iframe boundary to bridge across; a single
-// capture-phase `keydown` listener on `window` does the entire job.
-//
-// Responsibilities:
-//   1. Fetch the current binding list once via
-//      `rpc.core.shortcuts.bindings()` and refresh on every
-//      `events.core.shortcuts.changed`.
-//   2. On every keydown (capture phase): walk up from the active
-//      element collecting `[data-zenbu-focus-context]` ancestors,
-//      match the keystroke against the cached bindings filtered by
-//      `when`, `preventDefault()` synchronously if matched, and
-//      fire `rpc.core.shortcuts.handleKeydown({ input, contexts })`
-//      so the main process dispatches the handler.
-//
-// Boot timing: the listener attaches when this component commits,
-// which is *after* the first `useEffect` pass and a few hundred
-// keydowns after page load in the worst case. If a Cmd+P fires in
-// that window the browser print dialog opens. In practice users
-// haven't moved their hands yet.
+// ---- Shortcut dispatcher ----
+// Capture-phase `keydown` on `window` -> walk `[data-zenbu-focus-context]`
+// ancestors from `event.target` for the active stack -> match against the
+// cached binding list (synced via the `bindings()` RPC + `changed`
+// event) -> `preventDefault()` on match + RPC dispatch.
 
 type ShortcutBinding = {
   key?: string;
@@ -451,11 +432,8 @@ function shortcutWhenMatches(
   return true;
 }
 
-/**
- * Walk up from `el` collecting every `[data-zenbu-focus-context]`
- * ancestor, innermost-first. Multiple ids on the same wrapper are
- * space-separated (same convention `class` uses).
- */
+// Innermost-first; multiple ids on one wrapper are space-separated
+// (same convention `class` uses).
 function readActiveFocusContexts(el: Element | null): string[] {
   const out: string[] = [];
   let node: Node | null = el ?? document.activeElement;
@@ -489,8 +467,8 @@ function ShortcutDispatcher(): null {
     };
   };
 
-  // Cache bindings in a ref so the keydown handler reads them
-  // synchronously without re-binding the listener on every refresh.
+  // Ref so the keydown handler reads bindings synchronously without
+  // re-binding the listener on every refresh.
   const bindingsRef = useRef<ShortcutBindingsSnapshot[]>([]);
 
   useEffect(() => {
@@ -527,9 +505,8 @@ function ShortcutDispatcher(): null {
       const contexts = readActiveFocusContexts(
         ev.target as Element | null,
       );
-      // Synchronous local match — only to decide `preventDefault()`.
-      // The main process re-runs the match for dispatch (so the
-      // renderer can't get ahead of late-registering shortcuts).
+      // Local match decides `preventDefault()` only; main re-runs
+      // the match for dispatch.
       let matched = false;
       for (const entry of bindingsRef.current) {
         let keyHit = false;
@@ -767,11 +744,7 @@ export function useFocusContext(_id: string | string[]) {
 
 // ---- Injection registry (client-side) ----
 
-/**
- * Opaque metadata attached to an injection. Plugin authors pass it
- * to `this.inject(...)` / `useRegisterInjection(...)`; consumers
- * filter on it via `useInjections({ kind: "…" })`.
- */
+/** Opaque metadata; consumers filter via `useInjections({ kind: … })`. */
 export type InjectionMeta = Record<string, unknown> & {
   kind?: string;
   label?: string;
@@ -786,10 +759,7 @@ export interface InjectionEntry<F = unknown> {
   meta?: InjectionMeta;
 }
 
-/**
- * Props received by an injection rendered through `<View name=… />`.
- * `args` mirrors whatever the caller passed (`{}` when nothing).
- */
+/** Props for an injection rendered through `<View>`. */
 export type ViewComponentProps<
   A extends Record<string, unknown> = Record<string, unknown>,
 > = {
@@ -800,18 +770,9 @@ export type ViewComponent<
   A extends Record<string, unknown> = Record<string, unknown>,
 > = ComponentType<ViewComponentProps<A>>;
 
-/**
- * The injection registry — one in-renderer Map keyed by injection
- * `name`. Populated two ways:
- *
- *   1. The Vite prelude pipeline calls `registerInjection(name, value,
- *      meta)` for every module-load injection declared via
- *      `this.inject(...)`. Runs once at boot, before `main.tsx`.
- *   2. Renderer-side reactive injections via `useRegisterInjection`
- *      (lifetime = component mount). Same registry slot.
- *
- * Last-writer-wins per `name`.
- */
+// One in-renderer Map keyed by `name`. Populated by the Vite prelude
+// (for `this.inject(...)`) and by `useRegisterInjection` at runtime.
+// Last-writer-wins.
 const injectionRegistry = new Map<string, InjectionEntry<unknown>>();
 const injectionRegistryListeners = new Set<() => void>();
 
@@ -824,14 +785,9 @@ function emitInjectionRegistryChange() {
 }
 
 /**
- * Imperatively register an injection under `name`. Returns an
- * unregister function; if `name` is already taken the previous entry
- * is replaced.
- *
- * Identity matters — a fresh function reference every render churns
- * the registry and forces consumers to re-read. Wrap closures in
- * `useCallback` / `useMemo`, or use `useRegisterInjection` which
- * stabilizes the effect for you.
+ * Register an injection. Returns an unregister fn. Wrap closures in
+ * `useCallback` / `useMemo` to keep identity stable, or use
+ * `useRegisterInjection` which handles that for you.
  */
 export function registerInjection<F = unknown>(
   name: string,
@@ -880,10 +836,7 @@ export function useRegisterInjection<F = unknown>(
   }, [name, value, metaKey]);
 }
 
-/**
- * Read one injection by `name`. Reactive: re-renders when the entry
- * is added, replaced, or removed.
- */
+/** Read one injection by name. Reactive. */
 export function useInjection<F = unknown>(name: string): F | undefined {
   return useSyncExternalStore(
     subscribeInjectionRegistry,
@@ -910,13 +863,10 @@ function matchesFilter(
 }
 
 /**
- * Read every injection, optionally filtered by `meta` fields or a
- * predicate. Reactive: re-renders when the registry changes. The
- * returned array reference is stable across renders that don't
- * affect the registry.
+ * Read injections, optionally filtered by `meta` keys or a predicate.
+ * Reactive; array reference is stable when the result hasn't changed.
  *
- *   useInjections()                          → all entries
- *   useInjections({ kind: "footer.item" })   → entries with that kind
+ *   useInjections({ kind: "footer.item" })
  *   useInjections((e) => e.name.startsWith("git/"))
  */
 export function useInjections<F = unknown>(
@@ -961,21 +911,11 @@ export function useInjections<F = unknown>(
 // ---- <View>: render an injection as a React component ----
 
 /**
- * `<View name="…">` renders the injection registered under `name`
- * as a React component. The component receives an `{ args }` prop
- * shaped like `ViewComponentProps`; inside the component, you can
- * also reach for `useViewArgs<A>()` instead of destructuring.
- *
- * Lifecycle: the injection lives in an in-memory registry populated
- * by the Vite prelude pipeline (for `this.inject(…)`) and by
- * `useRegisterInjection(…)` (for renderer-side reactive
- * injections). `<View>` subscribes to the registry, so a re-render
- * picks up replacements automatically.
- *
- * If no injection is registered under `name` yet, `fallback` is
- * rendered (default: `null`). The injection runs inside the host's
- * React tree and inherits the host's CSS scope directly — no
- * iframe, no postMessage handshake, no theme forwarding.
+ * Render the injection registered under `name`. The component
+ * receives `{ args }` as a prop; child components can also read
+ * args via `useViewArgs<A>()`. Re-renders pick up registry
+ * replacements. `fallback` shows when the name has no injection
+ * yet.
  */
 export type ViewProps = {
   /** Injection name to render. Required. */

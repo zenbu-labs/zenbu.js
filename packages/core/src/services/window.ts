@@ -20,7 +20,7 @@ import { URLSearchParams } from "node:url";
 import { runtime, Service } from "../runtime";
 import { BaseWindowService, MAIN_WINDOW_ID } from "./base-window";
 import { HttpService } from "./http";
-import { RendererHostService } from "./renderer-host";
+import { ViteService } from "./vite";
 import { createLogger } from "../shared/log";
 import { entrypointBgColor } from "../shared/zenbu-bg";
 import { bootTrace } from "../boot-trace";
@@ -73,7 +73,7 @@ export class WindowService extends Service.create({
   deps: {
     baseWindow: BaseWindowService,
     http: HttpService,
-    rendererHost: RendererHostService,
+    vite: ViteService,
   },
 }) {
   private mounted = new Map<string, MountedView_>();
@@ -95,12 +95,8 @@ export class WindowService extends Service.create({
       };
     });
 
-    // Re-open the main window when the user clicks the dock / taskbar
-    // icon with no windows open. Electron emits `activate` on every
-    // focus (dock click on macOS, taskbar reactivation on Win/Linux),
-    // so we gate on "no live BaseWindow currently exists" — otherwise
-    // an already-running app would spawn a duplicate window every
-    // time the user tabs back in.
+    // Re-open the main window on dock/taskbar click when no
+    // BaseWindow is live (Electron fires `activate` on every focus).
     this.setup("activate-reopens-main", () => {
       const onActivate = () => {
         if (this.ctx.baseWindow.windows.size > 0) return;
@@ -192,10 +188,9 @@ export class WindowService extends Service.create({
 
   async openWindow(args: {
     /**
-     * Injection name to render as the root of the window. Threaded
-     * into the URL as `?route=<injection>`; the host renderer's
-     * `App` component reads it and mounts `<View name={route} />`.
-     * Omit for the main window (host's default shell).
+     * Threaded into the URL as `?route=<injection>`; the host's
+     * `App` reads it and mounts `<View name={route} />`. Omit for
+     * the main window.
      */
     injection?: string;
     windowId?: string;
@@ -225,10 +220,10 @@ export class WindowService extends Service.create({
     },
     label: string,
   ): Promise<{ windowId: string }> {
-    const rendererUrl = this.ctx.rendererHost.url;
+    const rendererUrl = this.ctx.vite.url;
     if (!rendererUrl) {
       throw new Error(
-        "[window] rendererHost.url is not ready yet — the host renderer's Vite server hasn't started.",
+        "[window] Vite server URL isn't ready yet.",
       );
     }
 
@@ -353,11 +348,8 @@ export class WindowService extends Service.create({
       // the default workspace shell.
       route: args.injection,
     })}`;
-    // Always log the renderer URL on stdout so external tooling
-    // (agent-browser, curl, devtools attach scripts) can pick it up
-    // without grepping debug noise. The CDP port (if any) is logged
-    // alongside so an automation agent can `agent-browser connect <port>`
-    // and immediately know which renderer to drive.
+    // Log the renderer URL on stdout so external tools (agent-browser,
+    // curl, devtools attach scripts) can pick it up without grepping.
     const cdpPort = process.env.ZENBU_CDP_PORT;
     console.log(
       `[zenbu] renderer-url window=${label} url=${url}${
