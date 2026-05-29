@@ -1,8 +1,12 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { Service, runtime, getAppEntrypoint } from "../runtime";
+import {
+  Service,
+  runtime,
+  getAppEntrypoint,
+  subscribeConfig,
+} from "../runtime";
 import { ReloaderService } from "./reloader";
-import { ViewRegistryService } from "./view-registry";
 import { createLogger } from "../shared/log";
 
 const log = createLogger("renderer-host");
@@ -34,7 +38,11 @@ async function resolveRendererRoot(): Promise<{
   rendererRoot: string;
   configFile: string | false;
 }> {
-  const rendererRoot = getAppEntrypoint();
+  // `registerAppEntrypoint(...)` runs at the top of the loader-emitted
+  // plugin barrel, but the renderer-host service may become eligible to
+  // evaluate while the barrel is still being imported in parallel. Wait
+  // for the config snapshot to land before failing the boot.
+  const rendererRoot = await waitForAppEntrypoint();
   if (!rendererRoot) {
     throw new Error(
       "[renderer-host] no `uiEntrypoint` registered. " +
@@ -42,6 +50,7 @@ async function resolveRendererRoot(): Promise<{
     );
   }
   if (!(await pathExists(rendererRoot))) {
+    // (rendererRoot is non-null here — waitForAppEntrypoint resolved.)
     throw new Error(
       `[renderer-host] uiEntrypoint directory does not exist: ${rendererRoot}.`,
     );
@@ -83,7 +92,7 @@ async function findViteConfigUp(
 
 export class RendererHostService extends Service.create({
   key: "rendererHost",
-  deps: { reloader: ReloaderService, viewRegistry: ViewRegistryService },
+  deps: { reloader: ReloaderService },
 }) {
   url = "";
   port = 0;
@@ -97,22 +106,38 @@ export class RendererHostService extends Service.create({
     );
     this.url = entry.url;
     this.port = entry.port;
-    // The framework-managed view type is `"entrypoint"`: it's a synthetic
-    // alias over the `uiEntrypoint` directory from zenbu.config.ts that
-    // no plugin ever registers explicitly. User-defined view types live
-    // alongside it; the name makes the framework-vs-user distinction
-    // legible at every call site.
-    await this.ctx.viewRegistry.registerView({
-      type: "entrypoint",
-      source: {
-        pathPrefix: "",
-        sharedWith: APP_RENDERER_RELOADER_ID,
-      },
-      meta: { kind: "entrypoint", label: "App" },
-    });
-
     log.verbose(`ready at ${this.url}`);
   }
 }
 
 runtime.register(RendererHostService, import.meta);
+
+/**
+ * Resolve as soon as `registerAppEntrypoint(...)` has run. Returns
+ * `null` after a generous timeout so callers can still surface a
+ * proper error instead of hanging.
+ */
+function waitForAppEntrypoint(
+  timeoutMs = 30000,
+): Promise<string | null> {
+  const immediate = getAppEntrypoint();
+  if (immediate) return Promise.resolve(immediate);
+  return new Promise((resolve) => {
+    let settled = false;
+    const unsubscribe = subscribeConfig((snapshot) => {
+      if (settled) return;
+      if (snapshot.appEntrypoint) {
+        settled = true;
+        unsubscribe();
+        clearTimeout(timer);
+        resolve(snapshot.appEntrypoint);
+      }
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      resolve(getAppEntrypoint());
+    }, timeoutMs);
+  });
+}

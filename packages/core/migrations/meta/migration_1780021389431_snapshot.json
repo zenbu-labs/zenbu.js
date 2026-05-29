@@ -1,0 +1,26 @@
+{
+  "id": "3a83fd13-335d-4ab1-a305-16729c5aaced",
+  "prevId": "daffa26a-1c22-4397-aa70-20eeab9d0098",
+  "fields": {
+    "windowPrefs": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d15bbfd72cb9fe18",
+      "default": {}
+    },
+    "shortcuts": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d2534dc6e73ef123",
+      "default": {}
+    },
+    "focus": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "5e239aa0398a7422",
+      "default": {
+        "contexts": []
+      }
+    }
+  }
+}

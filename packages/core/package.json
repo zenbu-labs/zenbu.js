@@ -75,10 +75,6 @@
       "types": "./dist/prelude/boot-trace.d.mts",
       "import": "./dist/prelude/boot-trace.mjs"
     },
-    "./prelude/view-args": {
-      "types": "./dist/prelude/view-args.d.mts",
-      "import": "./dist/prelude/view-args.mjs"
-    },
     "./db": {
       "types": "./dist/db.d.mts",
       "import": "./dist/db.mjs"

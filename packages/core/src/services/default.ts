@@ -24,7 +24,6 @@ export async function defaultServices(): Promise<void> {
     bootTrace.span("import:./db", () => import("./db")),
     bootTrace.span("import:./base-window", () => import("./base-window")),
     bootTrace.span("import:./rpc", () => import("./rpc")),
-    bootTrace.span("import:./view-registry", () => import("./view-registry")),
     bootTrace.span("import:./window", () => import("./window")),
     bootTrace.span("import:./advice-config", () => import("./advice-config")),
     bootTrace.span("import:./updater", () => import("./updater")),

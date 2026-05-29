@@ -5,48 +5,34 @@ import type { Plugin } from "vite";
 import { zenbuAdvicePlugin } from "@zenbu/advice/vite";
 import { getConfig, subscribeConfig } from "./runtime";
 import {
-  getAdvice,
-  getAllTypes,
-  getContentScripts,
-  getAllContentScriptPaths,
-  getComponentViews,
-  getAllComponentViewPaths,
-  getFunctionSources,
-  getAllFunctionSourcePaths,
-  type ViewAdviceEntry,
-  type ComponentViewEntry,
-  type FunctionSourceEntry,
+  getInjections,
+  getAllInjectionPaths,
+  type InjectionEntry,
 } from "./services/advice-config";
 
 /**
- * Per-renderer Vite plugins, auto-injected by `ReloaderService`. Wires
- * three things into every Zenbu view's `<head>`:
+ * Per-renderer Vite plugins. Wires three things into the host
+ * renderer's `<head>`:
  *
  *   1. Inline theme tokens (first paint matches host theme).
- *   2. Inline static preludes (boot-trace, view-args, theme, shortcuts).
- *   3. Per-view advice prelude at `/@advice-prelude/<type>` — a virtual
- *      module generated from the maps in `advice-config.ts` (advice,
- *      content scripts, component views, function sources). Loaded as
- *      a normal `<script type="module">` so everything lands in the
- *      iframe's initial dependency graph and evaluates before
- *      `main.tsx`.
+ *   2. Inline static preludes (boot-trace, view-args, theme,
+ *      shortcuts) — framework runtime bootstrap.
+ *   3. The injection prelude at `/@injections-prelude` — a virtual
+ *      module generated from the injection registry in
+ *      `advice-config.ts`. Imports every registered module, then
+ *      dispatches by `meta.kind`: advice entries land in
+ *      `@zenbu/advice/runtime`, everything else in the in-memory
+ *      injection registry that `useInjection` / `useInjections`
+ *      read from.
  */
 
-const PRELUDE_PREFIX = "/@advice-prelude/";
-const RESOLVED_PREFIX = "\0@advice-prelude/";
+const PRELUDE_PREFIX = "/@injections-prelude";
+const RESOLVED_PREFIX = "\0@injections-prelude";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ADVICE_RUNTIME_ENTRY = path.resolve(HERE, "advice-runtime.mjs");
-const THEME_LISTENER_ENTRY = path.resolve(HERE, "prelude/theme-listener.mjs");
-const SHORTCUT_BRIDGE_ENTRY = path.resolve(
-  HERE,
-  "prelude/shortcut-bridge.mjs",
-);
 const BOOT_TRACE_ENTRY = path.resolve(HERE, "prelude/boot-trace.mjs");
-const VIEW_ARGS_ENTRY = path.resolve(HERE, "prelude/view-args.mjs");
 
-const THEME_LISTENER_SPECIFIER = "@zenbu/core/prelude/theme-listener";
-const SHORTCUT_BRIDGE_SPECIFIER = "@zenbu/core/prelude/shortcut-bridge";
 const BOOT_TRACE_SPECIFIER = "@zenbu/core/prelude/boot-trace";
 
 const CORE_PACKAGE_ROOT = path.resolve(HERE, "..");
@@ -68,230 +54,132 @@ export function zenbuFrameworkResolve(): Plugin {
   };
 }
 
-function getTypeFromPath(urlPath: string): string | null {
-  const m = urlPath.match(/^\/views\/([^/]+)\//);
-  return m ? m[1]! : null;
-}
 
-/** Resolve view type from `/views/<type>/...` path or `?type=<name>` query. */
-function resolveType(
-  urlPath: string,
-  originalUrl: string | undefined,
-): string | null {
-  const fromPath = getTypeFromPath(urlPath);
-  if (fromPath) return fromPath;
-  if (!originalUrl) return null;
-  const queryIdx = originalUrl.indexOf("?");
-  if (queryIdx < 0) return null;
-  const params = new URLSearchParams(originalUrl.slice(queryIdx + 1));
-  return params.get("type");
-}
-
-function parsePreludeId(id: string): { type: string } {
-  const rest = id.slice(RESOLVED_PREFIX.length);
-  const queryIdx = rest.indexOf("?");
-  if (queryIdx < 0) return { type: rest };
-  return { type: rest.slice(0, queryIdx) };
-}
 
 /* ---------- Static framework preludes (inlined into HTML) ---------- */
 
 let cachedStaticPreludeBody: string | null = null;
 function getStaticPreludeBody(): string {
   if (cachedStaticPreludeBody !== null) return cachedStaticPreludeBody;
-  const entries = [
-    { path: BOOT_TRACE_ENTRY, exportNames: ["installBootTraceRenderer"] },
-    // View-args listener runs as early as possible so the parent's
-    // first `zenbu:view-args` message (sent in response to our
-    // `zenbu:view-ready` ping) is never dropped.
-    { path: VIEW_ARGS_ENTRY, exportNames: ["installViewArgsListener"] },
-    { path: THEME_LISTENER_ENTRY, exportNames: ["installThemeListener"] },
-    { path: SHORTCUT_BRIDGE_ENTRY, exportNames: ["installShortcutBridge"] },
-  ];
-  const parts: string[] = [];
-  for (const entry of entries) {
-    let code: string;
-    try {
-      code = fs.readFileSync(entry.path, "utf8");
-    } catch {
-      return (cachedStaticPreludeBody = "");
-    }
-    code = code.replace(/\n\s*export\s*\{[^}]*\}\s*;?\s*$/m, "\n");
-    parts.push(code);
+  try {
+    const code = fs.readFileSync(BOOT_TRACE_ENTRY, "utf8");
+    cachedStaticPreludeBody = code.replace(
+      /\n\s*export\s*\{[^}]*\}\s*;?\s*$/m,
+      "\n",
+    );
+  } catch {
+    cachedStaticPreludeBody = "";
   }
-  cachedStaticPreludeBody = parts.join("\n");
   return cachedStaticPreludeBody;
 }
 
-function buildInlinePreludeScript(viewType: string): string | null {
+function buildInlinePreludeScript(): string | null {
   const body = getStaticPreludeBody();
   if (!body) return null;
-  const safeType = JSON.stringify(viewType);
-  return `${body}\ninstallBootTraceRenderer(${safeType});\ninstallViewArgsListener();\ninstallThemeListener();\ninstallShortcutBridge(${safeType});`;
+  // Boot-trace is the only inline prelude left in one-DOM mode.
+  // Shortcut handling, view-args, and theme forwarding all moved
+  // into the React tree (see `ShortcutDispatcher` in `react.ts`
+  // and the `<View args=>` context in the same file).
+  return `${body}\ninstallBootTraceRenderer();`;
 }
 
-/* ---------- Per-view advice prelude codegen ---------- */
+/* ---------- Injection prelude codegen ---------- */
 
-/** `replace` / `advise` imports for every entry that applies to this view. */
-function generateAdvicePreludeCode(
-  entries: ViewAdviceEntry[],
-  _viewType: string,
-): string {
+/**
+ * Emit one import + one dispatch per injection. Advice entries
+ * (kind === "advice") go through `@zenbu/advice/runtime`; everything
+ * else lands in the in-renderer injection registry that `useInjection`
+ * / `useInjections` subscribe to.
+ */
+function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
+  if (entries.length === 0) return "";
+
+  // An injection without `meta` is the old "content script" pattern:
+  // import the module for its side effects (which is how userland
+  // mounts hidden React roots etc.) but read no value back. Same for
+  // `meta.kind: "bootstrap"`. We can't `import default from ...` for
+  // those because the module typically has no default export — that
+  // throws synchronously and crashes the whole prelude.
+  const isBootstrap = (e: InjectionEntry): boolean =>
+    e.meta === undefined || e.meta?.kind === "bootstrap";
+  const isAdvice = (e: InjectionEntry): boolean =>
+    e.meta?.kind === "advice";
+
+  const hasAdvice = entries.some(isAdvice);
+  const hasValue = entries.some(
+    (e) => !isBootstrap(e) && !isAdvice(e),
+  );
+
   const imports: string[] = [];
-  const calls: string[] = [];
-  if (entries.length > 0) {
+  if (hasAdvice) {
     imports.push('import { replace, advise } from "@zenbu/advice/runtime"');
-    entries.forEach((entry, i) => {
-      const alias = `__r${i}`;
+  }
+  if (hasValue) {
+    imports.push(
+      'import { registerInjection as __zb_registerInjection } from "@zenbujs/core/react"',
+    );
+  }
+
+  const calls: string[] = [];
+  entries.forEach((entry, i) => {
+    // Side-effect-only injections — emit a bare `import` so the
+    // module runs (its side effects, e.g. mounting a hidden React
+    // root, do the actual work) without binding a default export
+    // that might not exist.
+    if (isBootstrap(entry)) {
+      imports.push(`import ${JSON.stringify(entry.modulePath)}`);
+      return;
+    }
+
+    const alias = `__i${i}`;
+    if (entry.exportName === "default") {
+      imports.push(
+        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
+      );
+    } else {
       imports.push(
         `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
           entry.modulePath,
         )}`,
       );
-      if (entry.type === "replace") {
+    }
+
+    if (isAdvice(entry)) {
+      const wraps = entry.meta?.wraps as
+        | { moduleId: string; name: string }
+        | undefined;
+      const adviceType = entry.meta?.adviceType as
+        | "replace" | "before" | "after" | "around" | undefined;
+      if (!wraps || !adviceType) {
+        // Misconfigured advice meta — skip the dispatch but keep the
+        // import so the side-effecting module still runs.
+        return;
+      }
+      if (adviceType === "replace") {
         calls.push(
-          `replace(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
-            entry.name,
+          `replace(${JSON.stringify(wraps.moduleId)}, ${JSON.stringify(
+            wraps.name,
           )}, ${alias})`,
         );
       } else {
         calls.push(
-          `advise(${JSON.stringify(entry.moduleId)}, ${JSON.stringify(
-            entry.name,
-          )}, ${JSON.stringify(entry.type)}, ${alias})`,
+          `advise(${JSON.stringify(wraps.moduleId)}, ${JSON.stringify(
+            wraps.name,
+          )}, ${JSON.stringify(adviceType)}, ${alias})`,
         );
       }
-    });
-  }
-  if (imports.length === 0 && calls.length === 0) return "";
-  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
-}
-
-/**
- * Imports every component-view source and pushes it into the renderer's
- * client registry. Emitted into every iframe (any iframe might render
- * a `<View type="x" rendering="component">`). Relies on
- * `dedupe: ["@zenbujs/core"]` so the registry mutated here is the same
- * module instance `<View>` reads from.
- */
-function generateComponentViewPreludeCode(
-  entries: ComponentViewEntry[],
-): string {
-  if (entries.length === 0) return "";
-  const imports: string[] = [
-    'import { registerViewComponent as __zb_registerViewComponent } from "@zenbujs/core/react"',
-  ];
-  const calls: string[] = [];
-  entries.forEach((entry, i) => {
-    const alias = `__cv${i}`;
-    if (entry.exportName === "default") {
-      imports.push(
-        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
-      );
-    } else {
-      imports.push(
-        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
-          entry.modulePath,
-        )}`,
-      );
+      return;
     }
+
+    // Value injection. `meta` is opaque JSON; JSON.stringify both
+    // validates serializability and produces a literal we can inline.
+    const metaLiteral = JSON.stringify(entry.meta);
     calls.push(
-      `__zb_registerViewComponent(${JSON.stringify(entry.type)}, ${alias})`,
+      `__zb_registerInjection(${JSON.stringify(entry.name)}, ${alias}, ${metaLiteral})`,
     );
   });
+
   return imports.join("\n") + "\n" + calls.join("\n") + "\n";
-}
-
-/** Same as component-view codegen but for the function registry. */
-function generateFunctionSourcePreludeCode(
-  entries: FunctionSourceEntry[],
-): string {
-  if (entries.length === 0) return "";
-  const imports: string[] = [
-    'import { registerFunction as __zb_registerFunction } from "@zenbujs/core/react"',
-  ];
-  const calls: string[] = [];
-  entries.forEach((entry, i) => {
-    const alias = `__fn${i}`;
-    if (entry.exportName === "default") {
-      imports.push(
-        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
-      );
-    } else {
-      imports.push(
-        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
-          entry.modulePath,
-        )}`,
-      );
-    }
-    // `meta` is opaque JSON; JSON.stringify both validates serializability
-    // and produces a literal we can inline directly.
-    const metaLiteral =
-      entry.meta === undefined ? "undefined" : JSON.stringify(entry.meta);
-    calls.push(
-      `__zb_registerFunction(${JSON.stringify(entry.name)}, ${alias}, ${metaLiteral})`,
-    );
-  });
-  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
-}
-
-/* ---------- Inline theme tokens ---------- */
-
-const CSS_CUSTOM_PROPERTY_RE = /^--[a-zA-Z0-9_-]+$/;
-const VIEW_BACKGROUND_TOKEN = "--zenbu-view-background";
-const VIEW_FOREGROUND_TOKEN = "--zenbu-view-foreground";
-const VIEW_COLOR_SCHEME_TOKEN = "--zenbu-view-color-scheme";
-
-function isSafeCssValue(value: string): boolean {
-  return !/[;{}<>]/.test(value);
-}
-
-function decodeThemeTokens(themeParam: string): Record<string, string> | null {
-  try {
-    const json = decodeURIComponent(escape(atob(themeParam)));
-    const parsed = JSON.parse(json) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-      return null;
-    const tokens: Record<string, string> = {};
-    for (const [key, value] of Object.entries(parsed)) {
-      if (!CSS_CUSTOM_PROPERTY_RE.test(key)) continue;
-      if (typeof value !== "string") continue;
-      if (!isSafeCssValue(value)) continue;
-      tokens[key] = value;
-    }
-    return tokens;
-  } catch {
-    return null;
-  }
-}
-
-function buildThemeCss(tokens: Record<string, string>): string | null {
-  const keys = Object.keys(tokens);
-  if (keys.length === 0) return null;
-  const root =
-    ":root:root{" + keys.map((k) => `${k}:${tokens[k]}`).join(";") + "}";
-  const background = `var(${VIEW_BACKGROUND_TOKEN}, var(--background, Canvas))`;
-  const foreground = `var(${VIEW_FOREGROUND_TOKEN}, var(--foreground, CanvasText))`;
-  const colorScheme = `var(${VIEW_COLOR_SCHEME_TOKEN}, normal)`;
-  const page =
-    `html,body{background:${background};color:${foreground};color-scheme:${colorScheme}}` +
-    `body{margin:0}` +
-    `#root{background:${background};color:${foreground}}`;
-  return root + page;
-}
-
-function buildInlineThemeCss(themeParam: string | null): string | null {
-  if (!themeParam) return null;
-  const tokens = decodeThemeTokens(themeParam);
-  return tokens ? buildThemeCss(tokens) : null;
-}
-
-function extractThemeParam(originalUrl: string | undefined): string | null {
-  if (!originalUrl) return null;
-  const queryIdx = originalUrl.indexOf("?");
-  if (queryIdx < 0) return null;
-  const params = new URLSearchParams(originalUrl.slice(queryIdx + 1));
-  return params.get("theme");
 }
 
 export function resolveAdviceRuntime(): Plugin {
@@ -300,8 +188,6 @@ export function resolveAdviceRuntime(): Plugin {
     enforce: "pre",
     resolveId(source) {
       if (source === "@zenbu/advice/runtime") return ADVICE_RUNTIME_ENTRY;
-      if (source === THEME_LISTENER_SPECIFIER) return THEME_LISTENER_ENTRY;
-      if (source === SHORTCUT_BRIDGE_SPECIFIER) return SHORTCUT_BRIDGE_ENTRY;
       if (source === BOOT_TRACE_SPECIFIER) return BOOT_TRACE_ENTRY;
       return null;
     },
@@ -318,11 +204,11 @@ export function resolveAdviceRuntime(): Plugin {
  */
 export function advicePreludePlugin(): Plugin {
   return {
-    name: "zenbu-advice-prelude",
+    name: "zenbu-injections-prelude",
     enforce: "pre",
 
     resolveId(source) {
-      if (source.startsWith(PRELUDE_PREFIX)) {
+      if (source === PRELUDE_PREFIX || source.startsWith(PRELUDE_PREFIX + "?")) {
         return RESOLVED_PREFIX + source.slice(PRELUDE_PREFIX.length);
       }
       return null;
@@ -330,35 +216,15 @@ export function advicePreludePlugin(): Plugin {
 
     load(id) {
       if (!id.startsWith(RESOLVED_PREFIX)) return null;
-      const { type } = parsePreludeId(id);
-      let code = generateAdvicePreludeCode(getAdvice(type), type);
-      for (const scriptPath of getContentScripts(type)) {
-        code += `import ${JSON.stringify(scriptPath)}\n`;
-      }
-      // Component views + functions are global — every iframe gets both.
-      code += generateComponentViewPreludeCode(getComponentViews());
-      code += generateFunctionSourcePreludeCode(getFunctionSources());
-      return code || "// empty: static preludes are inlined in HTML\n";
+      const code = generateInjectionsPreludeCode(getInjections());
+      return code || "// empty: no injections registered yet\n";
     },
 
     handleHotUpdate({ file, server }) {
-      let matched = false;
-      for (const type of getAllTypes()) {
-        for (const entry of getAdvice(type)) {
-          if (file === entry.modulePath) {
-            matched = true;
-            break;
-          }
-        }
-        if (matched) break;
-      }
-      // Editing any of these source files needs a full reload — the
-      // registration is a side effect of the prelude script, which
-      // only runs at iframe boot.
-      if (!matched) matched = getAllContentScriptPaths().includes(file);
-      if (!matched) matched = getAllComponentViewPaths().includes(file);
-      if (!matched) matched = getAllFunctionSourcePaths().includes(file);
-      if (matched) {
+      // Any edit to an injection source module needs a full reload
+      // — the registration is a side effect of the prelude script,
+      // which only runs at boot.
+      if (getAllInjectionPaths().includes(file)) {
         server.ws.send({ type: "full-reload" });
         return [];
       }
@@ -379,15 +245,14 @@ export function advicePreludePlugin(): Plugin {
             return;
           }
         } catch (e) {
-          console.error("[advice-prelude] transform error:", e);
+          console.error("[injections-prelude] transform error:", e);
         }
         next();
       });
     },
 
     transformIndexHtml(html, ctx) {
-      const type = resolveType(ctx.path ?? "", ctx.originalUrl);
-      if (!type) return html;
+     
 
       const tags: Array<{
         tag: string;
@@ -396,20 +261,12 @@ export function advicePreludePlugin(): Plugin {
         injectTo: "head" | "head-prepend" | "body" | "body-prepend";
       }> = [];
 
-      // 1. Inline theme tokens — first paint matches host theme.
-      const themeCss = buildInlineThemeCss(extractThemeParam(ctx.originalUrl));
-      if (themeCss) {
-        tags.push({
-          tag: "style",
-          attrs: { id: "zenbu-view-theme" },
-          children: themeCss,
-          injectTo: "head-prepend",
-        });
-      }
+      // The host renderer's own CSS owns `:root` (shadcn tokens,
+      // etc.) and is loaded by `index.html` directly. No iframe
+      // theme forwarding needed.
 
-      // 2. Static framework preludes (boot-trace, view-args, theme,
-      //    shortcuts) inlined as one sync `<script>` block.
-      const inlinePrelude = buildInlinePreludeScript(type);
+      // Boot-trace prelude inlined as one sync `<script>` block.
+      const inlinePrelude = buildInlinePreludeScript();
       if (inlinePrelude) {
         tags.push({
           tag: "script",
@@ -418,20 +275,21 @@ export function advicePreludePlugin(): Plugin {
         });
       } else {
         // Fallback: dist files missing (shouldn't happen in dev once
-        // `pnpm build` has run once). Fall back to the legacy module-
-        // script path so the listeners still install, just slower.
+        // `pnpm build` has run once). Fall back to the virtual module
+        // path so the listeners still install, just slower.
         tags.push({
           tag: "script",
-          attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
+          attrs: { type: "module", src: PRELUDE_PREFIX },
           injectTo: "head",
         });
       }
 
-      // 3. Per-view advice prelude. Always injected so future
-      //    registrations can invalidate + reload via the same URL.
+      // 3. The injection prelude. Imports every registered module
+      //    before `main.tsx` runs, so by the time React mounts the
+      //    in-memory injection registry is fully populated.
       tags.push({
         tag: "script",
-        attrs: { type: "module", src: `${PRELUDE_PREFIX}${type}` },
+        attrs: { type: "module", src: PRELUDE_PREFIX },
         injectTo: "head",
       });
 

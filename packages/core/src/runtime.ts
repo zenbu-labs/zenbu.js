@@ -3,11 +3,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   addAdvice,
-  addContentScript,
+  addInjection,
   type AdviceSpec,
-  type ContentScriptSpec,
+  type InjectionSpec,
 } from "./services/advice-config";
-import type { RegisterViewSpec } from "./services/view-registry";
 import { bootTrace } from "./boot-trace";
 
 /**
@@ -22,47 +21,6 @@ type SetupCleanup = ((reason: CleanupReason) => void | Promise<void>) | void;
 type SetupFn = () => SetupCleanup;
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
-
-/**
- * Resolve relative paths inside a `RegisterViewSpec` against the
- * calling plugin's directory. Mirrors the same convention
- * `addAdvice` / `addContentScript` use for `modulePath`. Absolute
- * paths pass through unchanged.
- */
-function resolveViewSpecPaths(
-  spec: RegisterViewSpec,
-  pluginDir: string,
-): RegisterViewSpec {
-  const resolveRel = (p: string) =>
-    path.isAbsolute(p) ? p : path.resolve(pluginDir, p);
-
-  if (spec.rendering === "component") {
-    return {
-      ...spec,
-      source: {
-        ...spec.source,
-        modulePath: resolveRel(spec.source.modulePath),
-      },
-    };
-  }
-
-  // Iframe variant. Two shapes inside `source`: own-server (`root`) or
-  // shared (`pathPrefix`). Only own-server has any paths to resolve.
-  if ("root" in spec.source) {
-    const { root, configFile, eager } = spec.source;
-    return {
-      ...spec,
-      source: {
-        root: resolveRel(root),
-        configFile:
-          typeof configFile === "string" ? resolveRel(configFile) : configFile,
-        eager,
-      },
-    };
-  }
-
-  return spec;
-}
 
 function readShutdownTimeoutMs(): number {
   const raw = process.env.ZENBU_SHUTDOWN_TIMEOUT_MS;
@@ -172,105 +130,86 @@ export abstract class Service {
   evaluate(): void | Promise<void> {}
 
   /**
-   * Register advice (component wrap/replace, function before/after/around)
-   * targeting another plugin's exports. The owning plugin's root directory
-   * is resolved automatically from this service's slot, so relative
-   * `modulePath` values just work.
+   * Inject a named module export into the renderer's injection
+   * registry. The one primitive plugins use to extend the app.
    *
-   *   this.setup("wrap-counter", () =>
-   *     this.advise({
-   *       view: "app",
-   *       moduleId: "App.tsx",
-   *       name: "Counter",
-   *       type: "around",
-   *       modulePath: "src/content/wrap-counter.tsx",
-   *       exportName: "WrapCounter",
+   * The Vite prelude pipeline imports `modulePath` before `main.tsx`
+   * runs and registers its export under `name`. Consumers find it
+   * via `useInjection(name)` (single) or `useInjections({ kind })`
+   * (filtered). `<View name="…" />` is the canonical reader for
+   * "render this injection as a React component".
+   *
+   *   this.setup("footer-item", () =>
+   *     this.inject({
+   *       name: "my-plugin/vim-mode",
+   *       modulePath: "./src/footer-item.tsx",
+   *       meta: { kind: "footer.item", order: 10, position: "right" },
    *     }),
    *   )
    *
-   * Returns an unregister function — wrap the call in `this.setup(...)`
-   * so cleanup runs on hot reload.
+   * Convention: scope `name` with your plugin id, e.g.
+   * `"my-plugin/footer-item"`. Last registration with the same name
+   * wins.
+   *
+   * Common shapes (`meta.kind`):
+   *   - `"view"` / `"left-sidebar"` / `"right-sidebar"` / `"bottom-panel"` /
+   *     `"workspace-rail"` / `"title-bar"` / `"footer.item"` — host
+   *     slot conventions, discovered by the host's slot hooks.
+   *   - `"cm.composer-extension"` / `"cm.composer-extension-editable"` —
+   *     CodeMirror extensions the composer merges in.
+   *   - No `kind` — the module is imported for side effects only
+   *     (the old "content script" pattern: mount a hidden React root
+   *     that uses `useRegisterInjection` to publish reactive values).
+   *
+   * If the owning plugin's manifest has `icons[name]`, the SVG is
+   * auto-attached as `meta.icon` so slot hooks render it without
+   * the registration site repeating the markup.
+   *
+   * Returns a synchronous dispose; wrap in `this.setup(...)` so
+   * plugin teardown / hot reload removes the prelude entry cleanly.
+   *
+   * For renderer-side reactive injections (value depends on db /
+   * component state), use `useRegisterInjection` from
+   * `@zenbujs/core/react` — it writes into the same registry.
+   */
+  inject(spec: InjectionSpec): () => void {
+    const pluginDir = this.__getPluginDir("inject");
+    // Icon lookup: search the owning plugin's manifest for a key
+    // matching the injection name. Plugins own their own icons —
+    // there's no cross-plugin fallback. If you want an icon on
+    // your injection, ship it in your plugin's `icons:` map.
+    let resolvedSpec = spec;
+    const owningPlugin = getPlugins().find((p) => p.dir === pluginDir);
+    const iconSvg = owningPlugin?.icons?.[spec.name];
+    if (iconSvg && spec.meta?.icon === undefined) {
+      resolvedSpec = {
+        ...spec,
+        meta: { ...(spec.meta ?? {}), icon: iconSvg },
+      };
+    }
+    return addInjection(pluginDir, resolvedSpec);
+  }
+
+  /**
+   * Sugar for wrapping another module's export. Equivalent to an
+   * injection with `meta.kind: "advice"` plus the wrap target and
+   * shape — the Vite prelude routes advice entries through
+   * `@zenbu/advice/runtime` instead of the in-renderer injection
+   * registry.
+   *
+   *   this.setup("wrap-counter", () =>
+   *     this.advise({
+   *       moduleId: "App.tsx",
+   *       name: "Counter",
+   *       type: "around",
+   *       modulePath: "./src/content/wrap-counter.tsx",
+   *       exportName: "WrapCounter",
+   *     }),
+   *   )
    */
   advise(spec: AdviceSpec): () => void {
     const pluginDir = this.__getPluginDir("advise");
     return addAdvice(pluginDir, spec);
-  }
-
-  /**
-   * Inject a content script into a view. Same plugin-root resolution
-   * rules as `advise`.
-   *
-   *   this.setup("inject", () =>
-   *     this.injectContentScript({
-   *       view: "*",
-   *       modulePath: "src/content/toolbar.tsx",
-   *     }),
-   *   )
-   */
-  injectContentScript(spec: ContentScriptSpec): () => void {
-    const pluginDir = this.__getPluginDir("injectContentScript");
-    return addContentScript(pluginDir, spec);
-  }
-
-  /**
-   * Register a view from inside a plugin service. Same plugin-root
-   * resolution rules as `this.advise(...)`: any relative `modulePath`,
-   * `root`, or `configFile` is resolved against the calling plugin's
-   * directory — no `path.resolve(import.meta.dirname, ...)` boilerplate
-   * at the call site.
-   *
-   *   // Component view
-   *   this.setup("my-view", () =>
-   *     this.registerView({
-   *       type: "my-view",
-   *       rendering: "component",
-   *       source: { modulePath: "src/views/my-view.tsx" },
-   *       meta: { ... },
-   *     }),
-   *   )
-   *
-   *   // Iframe view with dedicated Vite server
-   *   this.setup("my-iframe", () =>
-   *     this.registerView({
-   *       type: "my-iframe",
-   *       source: { root: "src/views/my-iframe" },
-   *       meta: { ... },
-   *     }),
-   *   )
-   *
-   *   // Iframe view sharing an existing Vite server
-   *   this.setup("my-shared", () =>
-   *     this.registerView({
-   *       type: "my-shared",
-   *       source: { pathPrefix: "/views/my-shared" },
-   *       meta: { ... },
-   *     }),
-   *   )
-   *
-   * Returns a synchronous dispose. Wrap in `this.setup(...)` so plugin
-   * teardown / hot reload runs the matching `unregisterView`.
-   */
-  registerView(spec: RegisterViewSpec): () => void {
-    const pluginDir = this.__getPluginDir("registerView");
-    const resolved = resolveViewSpecPaths(spec, pluginDir);
-    const slot = runtime.getSlot("viewRegistry");
-    const vr = slot?.instance as
-      | {
-          registerView: (s: RegisterViewSpec) => Promise<unknown>;
-          unregisterView: (t: string) => Promise<void>;
-        }
-      | undefined;
-    if (!vr) {
-      throw new Error(
-        `[runtime] this.registerView("${spec.type}") called but ViewRegistryService isn't ready yet. ` +
-          `Either depend on it explicitly (deps: { viewRegistry: ViewRegistryService }) so the runtime ` +
-          `resolves order, or call registerView later (e.g. from a setup() block).`,
-      );
-    }
-    void vr.registerView(resolved);
-    return () => {
-      void vr.unregisterView(resolved.type);
-    };
   }
 
   /** @internal */

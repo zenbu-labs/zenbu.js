@@ -1,7 +1,7 @@
 import { Service, runtime } from "../runtime";
 import { RpcService } from "./rpc";
 import { DbService } from "./db";
-import type { ShortcutBinding, ViewChainEntry } from "../schema";
+import type { ShortcutBinding } from "../schema";
 import { createLogger } from "../shared/log";
 
 const log = createLogger("shortcuts");
@@ -159,7 +159,7 @@ function effectiveBindings(
  * Test a `when` clause against the active focus-context stack.
  *
  * The active stack is innermost-first: index 0 is the most-nested
- * context (deepest in the DOM, including child iframes), and the last
+ * `<FocusContext>` ancestor of the focused element, and the last
  * entry is the outermost.
  */
 export function whenMatches(
@@ -221,17 +221,19 @@ export function whenSpecificity(
  * plugin can register against it without depending on the host app.
  *
  * Lifecycle:
- *   1. Plugin services call `register({...})` from `evaluate()` (wrapped
- *      in `this.setup` so re-evaluates de-dup cleanly).
- *   2. The renderer's bridge component listens for `zenbu:view-keydown`
- *      messages from any iframe's prelude and calls `handleKeydown`.
- *   3. `handleKeydown` filters defs by their `when` clause against the
- *      current `core.focus.contexts` stack, picks the most-specific
- *      match, and runs its handler.
+ *   1. Plugin services call `register({...})` from `evaluate()`
+ *      (wrapped in `this.setup` so re-evaluates de-dup cleanly).
+ *   2. Each renderer's `ZenbuProvider` mounts a `ShortcutDispatcher`
+ *      that captures `keydown` on `window`, reads the active focus
+ *      context stack from the DOM, and calls `handleKeydown` over
+ *      RPC for dispatch.
+ *   3. `handleKeydown` filters defs by their `when` clause against
+ *      the active stack, picks the most-specific match, and runs
+ *      its handler.
  *
- * Bindings live in `db.core.shortcuts`. The replica auto-syncs them to
- * every renderer/iframe so the settings UI and the prelude's
- * `preventDefault` filter stay consistent without manual broadcasts.
+ * Bindings live in `db.core.shortcuts`. The replica auto-syncs them
+ * to every renderer so the settings UI and the renderer's
+ * `preventDefault` cache stay consistent without manual broadcasts.
  */
 export class ShortcutsService extends Service.create({
   key: "shortcuts",
@@ -260,8 +262,7 @@ export class ShortcutsService extends Service.create({
 
   /**
    * RPC: return the full sorted list of shortcuts plus their current
-   * effective bindings. Used by the settings UI and by the renderer's
-   * bridge to fan bindings down to iframes.
+   * effective bindings. Used by the settings UI.
    */
   list(): ShortcutListing[] {
     const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
@@ -321,22 +322,19 @@ export class ShortcutsService extends Service.create({
   }
 
   /**
-   * RPC: dispatch a keystroke forwarded by the renderer bridge. The
-   * caller passes the active focus-context stack (innermost first) so
-   * dispatch matches the prelude's local matching — otherwise an
-   * iframe's bindings could fire even though focus moved away by the
-   * time the RPC reaches us.
+   * RPC: dispatch a keystroke forwarded by the renderer's
+   * `ShortcutDispatcher`. The caller passes the active focus-context
+   * stack (innermost first) so dispatch sees the same context the
+   * renderer used to decide `preventDefault()`.
    *
-   * Returns `{ handled, id? }`. Fire-and-forget at the renderer side —
-   * the result is only used for debug logging.
+   * Returns `{ handled, id? }`. Fire-and-forget at the renderer side
+   * — the result is only used for debug logging.
    */
   handleKeydown(args: {
     input: KeyboardInput;
     /**
-     * Live active focus-context stack (innermost first) at the moment
-     * the keystroke fired. Pass-through from the renderer bridge so
-     * dispatch matches what the prelude saw, even if `core.focus.contexts`
-     * hasn't been written yet (writes are async).
+     * Live active focus-context stack (innermost first) at the
+     * moment the keystroke fired.
      */
     contexts?: readonly string[];
   }): { handled: boolean; id?: string } {
@@ -382,21 +380,22 @@ export class ShortcutsService extends Service.create({
   }
 
   /**
-   * RPC: write the live focus state (iframe chain + flattened context
-   * stack) to the DB. Called by the renderer bridge on every focus
-   * change.
+   * RPC: write the flattened focus-context stack to the DB. Plugin
+   * services that want to read "which context is active right now"
+   * via `useDb` can subscribe to `root.core.focus.contexts`.
+   *
+   * The renderer's `ShortcutDispatcher` doesn't need this round-trip
+   * for its own dispatch — it reads the active stack from the DOM
+   * synchronously at keydown time — but writing it lets other
+   * subscribers observe focus changes.
    */
-  setFocus(args: {
-    iframes: ViewChainEntry[];
-    contexts: string[];
-  }): void {
+  setFocus(args: { contexts: string[] }): void {
     void this.ctx.db.client
       .update((root) => {
         const r = root as any;
         if (!r.core.focus) {
-          r.core.focus = { iframes: [], contexts: [] };
+          r.core.focus = { contexts: [] };
         }
-        r.core.focus.iframes = args.iframes ?? [];
         r.core.focus.contexts = args.contexts ?? [];
       })
       .catch(() => {});
@@ -413,23 +412,11 @@ export class ShortcutsService extends Service.create({
   }
 
   /**
-   * Read the current focused-iframe chain (outermost first).
-   */
-  focusedIframes(): ViewChainEntry[] {
-    return (
-      (this.ctx.db.client.readRoot().core?.focus?.iframes ?? []) as ViewChainEntry[]
-    ).slice();
-  }
-
-  /**
    * RPC: snapshot of the active bindings, in the simple shape the
-   * prelude's local matcher uses. Exposed so a freshly-mounted iframe
-   * can ask the entrypoint for the current set before any keystrokes
-   * arrive (`zenbu:request-bindings`).
-   *
-   * The `when` clause is included so the prelude can replicate the
-   * filtering logic locally and only `preventDefault()` when the
-   * binding would actually fire.
+   * renderer's `ShortcutDispatcher` uses for its local matcher. The
+   * `when` clause is included so the renderer can replicate the
+   * filtering logic and only `preventDefault()` when the binding
+   * would actually fire.
    */
   bindings(): ShortcutBindingsSnapshot[] {
     const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<

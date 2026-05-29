@@ -1,13 +1,21 @@
+/**
+ * Public surface for the injection pipeline. Plugin authors use
+ * `this.inject(...)` from a service or `useRegisterInjection` from
+ * the renderer; this module re-exports the introspection helpers the
+ * Vite plugin needs to generate the prelude module.
+ */
+
 export type {
   AdviceSpec,
-  ContentScriptSpec,
-  ViewAdviceEntry,
+  InjectionSpec,
+  InjectionMeta,
+  InjectionEntry,
 } from "./services/advice-config";
 
 export {
-  getAdvice,
-  getContentScripts,
-  getComponentViews,
-  getFunctionSources,
-  getAllTypes,
+  addAdvice,
+  addInjection,
+  getInjections,
+  getAllInjectionPaths,
+  subscribeInjections,
 } from "./services/advice-config";

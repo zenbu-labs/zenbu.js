@@ -5,88 +5,124 @@ import { runtime } from "../runtime"
 // `vite-plugins.ts`, and a top-level circular import would resolve the
 // dep classes to `undefined` during first eval. Look them up lazily.
 
-export interface ViewAdviceEntry {
-  moduleId: string
+/**
+ * The injection registry — the one primitive plugins use to push
+ * module exports into the renderer.
+ *
+ * Each injection is a `{ name, modulePath, exportName, meta }` record.
+ * The Vite prelude pipeline imports every registered module before
+ * `main.tsx` runs, and dispatches based on `meta.kind`:
+ *
+ *   - `meta.kind === "advice"` (with `meta.wraps` + `meta.adviceType`)
+ *     wires up wrap/replace/before/after via `@zenbu/advice/runtime`.
+ *
+ *   - Anything else (or no kind) lands in the in-memory injection
+ *     registry under `name`, where `useInjection(name)` /
+ *     `useInjections({ kind })` can find it. `<View name="…">` is the
+ *     canonical reader for "render this injection as a React component".
+ *
+ * A registration with no `meta` and no consumer is the old "content
+ * script" pattern: the module is imported for side effects (which is
+ * typically how userland mounts hidden React roots that themselves
+ * call `useRegisterInjection`).
+ */
+
+/** Public spec for `this.inject({...})`. */
+export interface InjectionSpec {
   name: string
-  type: "replace" | "before" | "after" | "around"
   modulePath: string
-  exportName: string
+  exportName?: string
+  meta?: InjectionMeta
 }
 
 /**
- * Spec passed to `service.advise({...})`. `modulePath` is relative to
- * the plugin root by default; absolute paths pass through.
+ * Opaque, JSON-serializable metadata attached to an injection. The
+ * codegen JSON.stringifies this verbatim, so every leaf has to round-
+ * trip through `JSON.parse(JSON.stringify(...))`.
+ *
+ * Conventional keys plugin authors use:
+ *   - `kind`: slot key (`"view"`, `"left-sidebar"`, `"footer.item"`, …).
+ *             Discovery: `useInjections({ kind: "…" })`.
+ *   - `label`: human-readable name.
+ *   - `icon`: SVG markup. Auto-attached by `this.inject(...)` from the
+ *             owning plugin's manifest if `plugin.icons[name]` exists.
+ *
+ * Advice-specific:
+ *   - `kind: "advice"` + `wraps: { moduleId, name }` + `adviceType`.
+ */
+export type InjectionMeta = Record<string, unknown> & {
+  kind?: string
+  label?: string
+  icon?: string
+  wraps?: { moduleId: string; name: string }
+  adviceType?: "replace" | "before" | "after" | "around"
+}
+
+export interface InjectionEntry {
+  name: string
+  modulePath: string
+  exportName: string
+  meta?: InjectionMeta
+}
+
+/**
+ * Sugar spec for `this.advise({...})`. Translated into an injection
+ * with `meta.kind: "advice"` plus the target / wrap-type meta.
  */
 export interface AdviceSpec {
-  view: string
+  /**
+   * Module whose export is being wrapped. Matched as a suffix against
+   * the importing module's id, so file-extension agnostic
+   * (`"App.tsx"` matches `/abs/path/App.tsx` and the .ts variant).
+   */
   moduleId: string
+  /** Name of the export to advise. */
   name: string
+  /** Wrap shape — same vocabulary as `@zenbu/advice/runtime`. */
   type: "replace" | "before" | "after" | "around"
+  /** Module containing the wrapper. Relative paths resolve against the plugin root. */
   modulePath: string
-  exportName: string
-}
-
-/** Spec for `service.contentScript({...})`. Same path rules as `AdviceSpec`. */
-export interface ContentScriptSpec {
-  view: string
-  modulePath: string
-}
-
-/** Source spec for a component view. Same path rules as advice. */
-export interface ComponentViewSpec {
-  type: string
-  modulePath: string
+  /** Named export inside `modulePath`. Defaults to `default`. */
   exportName?: string
+  /**
+   * Optional explicit injection name. Defaults to a synthetic
+   * `advice:<moduleId>:<name>:<type>` so the injection key stays
+   * stable across re-registrations of the same target.
+   */
+  injectionName?: string
 }
 
-export interface ComponentViewEntry {
-  type: string
-  modulePath: string
-  exportName: string
-}
-
-/** Source spec for a registered function. Same path rules as advice. */
-export interface FunctionSourceSpec {
-  name: string
-  modulePath: string
-  exportName?: string
-  meta?: Record<string, unknown>
-}
-
-export interface FunctionSourceEntry {
-  name: string
-  modulePath: string
-  exportName: string
-  meta?: Record<string, unknown>
-}
-
-const RESOLVED_PREFIX = "\0@advice-prelude/"
+const RESOLVED_PREFIX = "\0@injections-prelude/"
 const APP_RENDERER_RELOADER_ID = "app"
 
-/** Per-view advice (matches `view` or `view: "*"`). */
-const adviceEntries = new Map<string, ViewAdviceEntry[]>()
+/**
+ * The single source of truth. Keyed by injection `name`. Last
+ * registration with a given name wins; `dispose()` only clears the
+ * slot if it still owns it (so a stale dispose can't blow away a
+ * later re-registration).
+ */
+const injections = new Map<string, InjectionEntry>()
+const injectionChangeListeners = new Set<() => void>()
 
-interface ContentScriptEntry { path: string }
-const contentScripts = new Map<string, ContentScriptEntry[]>()
-
-/** Component views are global — every iframe's prelude registers all of them. */
-const componentViews = new Map<string, ComponentViewEntry>()
-
-/** Function sources are global too. Last-write-wins per name. */
-const functionSources = new Map<string, FunctionSourceEntry>()
-
-function resolveAgainstPlugin(modulePath: string, pluginDir: string): string {
+function resolveAgainstPlugin(
+  modulePath: string,
+  pluginDir: string | null,
+): string {
   if (path.isAbsolute(modulePath)) return modulePath
+  if (pluginDir == null) {
+    throw new Error(
+      `[injections] relative modulePath "${modulePath}" registered without a plugin root. ` +
+        `Pass an absolute path or register from inside a plugin service.`,
+    )
+  }
   return path.resolve(pluginDir, modulePath)
 }
 
 /**
- * Invalidate the `/@advice-prelude/<type>` virtual module in the host
- * Vite graph so the next request regenerates from the live maps.
- * Wildcards / component-view / function changes fan out across every
- * prelude module.
+ * Invalidate the `/@injections-prelude` virtual module in the host
+ * Vite graph so the next request regenerates from the live registry.
  */
-function invalidatePrelude(type: string) {
+function invalidatePrelude() {
   try {
     const reloader = runtime.getSlot("reloader")?.instance as
       | { get(id: string): { viteServer?: any } | undefined }
@@ -95,43 +131,30 @@ function invalidatePrelude(type: string) {
     const coreEntry = reloader.get(APP_RENDERER_RELOADER_ID)
     if (!coreEntry?.viteServer) return
     const graph = coreEntry.viteServer.moduleGraph
-    const invalidateMatching = (test: (id: string) => boolean) => {
-      const ids: string[] = []
-      for (const id of graph.idToModuleMap.keys()) {
-        if (typeof id !== "string") continue
-        if (test(id)) ids.push(id)
-      }
-      for (const id of ids) {
+    for (const id of graph.idToModuleMap.keys()) {
+      if (typeof id !== "string") continue
+      if (id.startsWith(RESOLVED_PREFIX)) {
         const mod = graph.getModuleById(id)
         if (mod) graph.invalidateModule(mod)
       }
-    }
-    if (
-      type === "*" ||
-      type === "**components" ||
-      type === "**functions"
-    ) {
-      // Wildcard advice and the two global registries all affect every
-      // prelude. The `**components` / `**functions` sentinels exist so
-      // `emitReload` can distinguish them from user `view: "*"`.
-      invalidateMatching((id) => id.startsWith(RESOLVED_PREFIX))
-    } else {
-      const prefix = RESOLVED_PREFIX + type
-      invalidateMatching(
-        (id) => id === prefix || id.startsWith(prefix + "?"),
-      )
     }
   } catch {}
 }
 
 /**
- * Invalidate the prelude module(s) for `type`, then publish
- * `core.advice.reload` so connected iframes reload. The
- * `**components` / `**functions` sentinels collapse to `"*"` on the
- * wire — those registrations are global.
+ * Invalidate the prelude module + ping the host renderer to reload so
+ * the fresh registrations take effect. Module-load injections only
+ * run at boot, so a reload is the simplest contract. Also fires the
+ * in-process listeners so main-side services can react to
+ * injection-set changes without going through the renderer.
  */
-function emitReload(type: string) {
-  invalidatePrelude(type)
+function emitReload() {
+  invalidatePrelude()
+  for (const cb of injectionChangeListeners) {
+    try {
+      cb()
+    } catch {}
+  }
   try {
     const rpc = runtime.getSlot("rpc")?.instance as
       | {
@@ -140,188 +163,82 @@ function emitReload(type: string) {
           }
         }
       | undefined
-    if (!rpc) return
-    const userType =
-      type === "**components" || type === "**functions" ? "*" : type
-    rpc.emit.core.advice.reload({ type: userType })
+    // The host renderer's reload signal is the legacy
+    // `core.advice.reload` event; keeping the wire-level event name
+    // unchanged means the in-renderer listener doesn't have to change
+    // while we're shuffling the prelude.
+    rpc?.emit?.core?.advice?.reload({ type: "*" })
   } catch {}
 }
 
-// --- Advice ---
-
-/** Internal advice registrar. User code calls `service.advise({...})`. */
-export function addAdvice(pluginDir: string, spec: AdviceSpec): () => void {
-  const { view, ...entry } = spec
-  const resolvedEntry: ViewAdviceEntry = {
-    ...entry,
-    modulePath: resolveAgainstPlugin(entry.modulePath, pluginDir),
-  }
-  const list = adviceEntries.get(view) ?? []
-  list.push(resolvedEntry)
-  adviceEntries.set(view, list)
-  emitReload(view)
-
+/**
+ * Subscribe to injection registry changes from the main process.
+ * Useful for services that auto-register shortcuts / palette
+ * actions per injection (e.g. `SidebarViewShortcutsService`).
+ */
+export function subscribeInjections(cb: () => void): () => void {
+  injectionChangeListeners.add(cb)
   return () => {
-    const current = adviceEntries.get(view)
-    if (!current) return
-    const idx = current.indexOf(resolvedEntry)
-    if (idx >= 0) current.splice(idx, 1)
-    if (current.length === 0) adviceEntries.delete(view)
-    emitReload(view)
+    injectionChangeListeners.delete(cb)
   }
 }
 
 /**
- * Advice that applies to `type`. Wildcards come first so view-scoped
- * advice wraps them in the around-chain order.
+ * Register an injection. `pluginDir` is used to resolve relative
+ * `modulePath` values; pass `null` to require an absolute path.
  */
-export function getAdvice(type: string): ViewAdviceEntry[] {
-  const scoped = adviceEntries.get(type) ?? []
-  const wildcard = type !== "*" ? (adviceEntries.get("*") ?? []) : []
-  return [...wildcard, ...scoped]
-}
-
-export function getAllAdviceTypes(): string[] {
-  return [...adviceEntries.keys()]
-}
-
-// --- Content Scripts ---
-
-/** Internal content-script registrar. User code calls `service.contentScript({...})`. */
-export function addContentScript(
-  pluginDir: string,
-  spec: ContentScriptSpec,
-): () => void {
-  const { view, modulePath } = spec
-  const resolvedPath = resolveAgainstPlugin(modulePath, pluginDir)
-  const entry: ContentScriptEntry = { path: resolvedPath }
-  const list = contentScripts.get(view) ?? []
-  list.push(entry)
-  contentScripts.set(view, list)
-  emitReload(view === "*" ? "*" : view)
-
-  return () => {
-    const current = contentScripts.get(view)
-    if (!current) return
-    const idx = current.indexOf(entry)
-    if (idx >= 0) current.splice(idx, 1)
-    if (current.length === 0) contentScripts.delete(view)
-    emitReload(view === "*" ? "*" : view)
-  }
-}
-
-export function getContentScripts(type: string): string[] {
-  const scoped = (contentScripts.get(type) ?? []).map(e => e.path)
-  const global = type !== "*" ? (contentScripts.get("*") ?? []).map(e => e.path) : []
-  return [...global, ...scoped]
-}
-
-export function getAllContentScriptPaths(): string[] {
-  const paths: string[] = []
-  for (const list of contentScripts.values()) {
-    for (const entry of list) paths.push(entry.path)
-  }
-  return paths
-}
-
-export function getAllTypes(): string[] {
-  const types = new Set<string>()
-  for (const k of adviceEntries.keys()) types.add(k)
-  for (const k of contentScripts.keys()) if (k !== "*") types.add(k)
-  for (const k of componentViews.keys()) types.add(k)
-  for (const k of functionSources.keys()) types.add(k)
-  return [...types]
-}
-
-// --- Component views ---
-
-/**
- * Internal component-view registrar. Pass `pluginDir = null` to require
- * an absolute `modulePath`.
- */
-export function addComponentView(
+export function addInjection(
   pluginDir: string | null,
-  spec: ComponentViewSpec,
+  spec: InjectionSpec,
 ): () => void {
-  const resolvedPath =
-    pluginDir != null
-      ? resolveAgainstPlugin(spec.modulePath, pluginDir)
-      : (() => {
-          if (!path.isAbsolute(spec.modulePath)) {
-            throw new Error(
-              `[viewRegistry] component view "${spec.type}" has a relative modulePath "${spec.modulePath}" but no plugin root to anchor it against. Pass an absolute path or register from inside a plugin service.`,
-            )
-          }
-          return spec.modulePath
-        })()
-  const entry: ComponentViewEntry = {
-    type: spec.type,
-    modulePath: resolvedPath,
-    exportName: spec.exportName ?? "default",
-  }
-  componentViews.set(spec.type, entry)
-  emitReload("**components")
-
-  return () => {
-    // Only clear if we still own the slot — protects against stale
-    // disposes overwriting a later re-registration (HMR).
-    if (componentViews.get(spec.type) === entry) {
-      componentViews.delete(spec.type)
-      emitReload("**components")
-    }
-  }
-}
-
-export function getComponentViews(): ComponentViewEntry[] {
-  return [...componentViews.values()]
-}
-
-export function getAllComponentViewPaths(): string[] {
-  return [...componentViews.values()].map((e) => e.modulePath)
-}
-
-// --- Function sources ---
-
-/**
- * Internal function-source registrar. Pass `pluginDir = null` to require
- * an absolute `modulePath`.
- */
-export function addFunctionSource(
-  pluginDir: string | null,
-  spec: FunctionSourceSpec,
-): () => void {
-  const resolvedPath =
-    pluginDir != null
-      ? resolveAgainstPlugin(spec.modulePath, pluginDir)
-      : (() => {
-          if (!path.isAbsolute(spec.modulePath)) {
-            throw new Error(
-              `[functionRegistry] function "${spec.name}" has a relative modulePath "${spec.modulePath}" but no plugin root to anchor it against. Pass an absolute path or register from inside a plugin service.`,
-            )
-          }
-          return spec.modulePath
-        })()
-  const entry: FunctionSourceEntry = {
+  const entry: InjectionEntry = {
     name: spec.name,
-    modulePath: resolvedPath,
+    modulePath: resolveAgainstPlugin(spec.modulePath, pluginDir),
     exportName: spec.exportName ?? "default",
     meta: spec.meta,
   }
-  functionSources.set(spec.name, entry)
-  emitReload("**functions")
+  injections.set(spec.name, entry)
+  emitReload()
 
   return () => {
-    if (functionSources.get(spec.name) === entry) {
-      functionSources.delete(spec.name)
-      emitReload("**functions")
+    if (injections.get(spec.name) === entry) {
+      injections.delete(spec.name)
+      emitReload()
     }
   }
 }
 
-export function getFunctionSources(): FunctionSourceEntry[] {
-  return [...functionSources.values()]
+/**
+ * Sugar for advice. Materializes an injection with the well-known
+ * advice meta shape; the prelude codegen dispatches advice entries
+ * through `@zenbu/advice/runtime` instead of the in-renderer
+ * injection registry.
+ */
+export function addAdvice(
+  pluginDir: string | null,
+  spec: AdviceSpec,
+): () => void {
+  const name =
+    spec.injectionName ??
+    `advice:${spec.moduleId}:${spec.name}:${spec.type}`
+  return addInjection(pluginDir, {
+    name,
+    modulePath: spec.modulePath,
+    exportName: spec.exportName,
+    meta: {
+      kind: "advice",
+      wraps: { moduleId: spec.moduleId, name: spec.name },
+      adviceType: spec.type,
+    },
+  })
 }
 
-export function getAllFunctionSourcePaths(): string[] {
-  return [...functionSources.values()].map((e) => e.modulePath)
+/** Every registered injection. Read by the prelude codegen. */
+export function getInjections(): InjectionEntry[] {
+  return [...injections.values()]
+}
+
+/** Source paths for HMR detection in the Vite plugin. */
+export function getAllInjectionPaths(): string[] {
+  return [...injections.values()].map((e) => e.modulePath)
 }

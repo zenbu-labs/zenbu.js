@@ -1,7 +1,7 @@
 /**
  * Boot-trace renderer prelude.
  *
- * Loaded as the very first <script type="module"> in every Zenbu iframe
+ * Loaded as the very first <script> tag in the host renderer's HTML
  * (see `vite-plugins.ts`). Sets up `window.__zenbuBootTrace` with `mark`
  * / `span` helpers and auto-records:
  *
@@ -16,7 +16,7 @@
  * then merges them into the main-process trace and renders them in the
  * unified flame.
  *
- * Anchored to the iframe's `performance.timeOrigin` so the `at` timestamps
+ * Anchored to the renderer's `performance.timeOrigin` so the `at` timestamps
  * are comparable to the main process by converting through `Date.now()` —
  * see `bootTrace.addEvents` in the host's `BootTraceService.report`.
  */
@@ -39,7 +39,7 @@ type RendererEvent =
     };
 
 interface BootTraceAPI {
-  /** Wall-clock ms when this iframe started executing (epoch). */
+  /** Wall-clock ms when this renderer started executing (epoch). */
   timeOrigin: number;
   /** Buffered events not yet forwarded to the host. */
   buffer: RendererEvent[];
@@ -50,7 +50,7 @@ interface BootTraceAPI {
   drain(): RendererEvent[];
 }
 
-function installBootTrace(viewType: string): void {
+function installBootTrace(): void {
   const w = window as unknown as { __zenbuBootTrace?: BootTraceAPI };
   if (w.__zenbuBootTrace) return;
 
@@ -64,7 +64,7 @@ function installBootTrace(viewType: string): void {
 
   const now = (): number => performance.now();
 
-  const prefix = `renderer[${viewType}]:`;
+  const prefix = `renderer:`;
 
   const mark = (name: string, meta?: Record<string, unknown>): void => {
     buffer.push({
@@ -174,10 +174,8 @@ function installBootTrace(viewType: string): void {
 }
 
 /**
- * Exported entry point used by the per-iframe advice prelude. Call site:
- *   import { installBootTraceRenderer } from "@zenbu/core/prelude/boot-trace"
- *   installBootTraceRenderer(<viewType>)
+ * Exported entry point used by the inline boot-trace prelude.
  */
-export function installBootTraceRenderer(viewType: string): void {
-  installBootTrace(viewType);
+export function installBootTraceRenderer(): void {
+  installBootTrace();
 }

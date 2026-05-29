@@ -19,7 +19,6 @@ import path from "node:path";
 import { URLSearchParams } from "node:url";
 import { runtime, Service } from "../runtime";
 import { BaseWindowService, MAIN_WINDOW_ID } from "./base-window";
-import { ViewRegistryService } from "./view-registry";
 import { HttpService } from "./http";
 import { RendererHostService } from "./renderer-host";
 import { createLogger } from "../shared/log";
@@ -49,9 +48,9 @@ const BOOT_ARGV: ReadonlyArray<string> = Object.freeze(
   process.argv.slice(1),
 );
 
-type MountedView = {
+type MountedView_ = {
   windowId: string;
-  type: string;
+  injection: string | null;
   view: WebContentsView;
   disposeContextMenu: () => void;
 };
@@ -73,12 +72,11 @@ export class WindowService extends Service.create({
   key: "window",
   deps: {
     baseWindow: BaseWindowService,
-    viewRegistry: ViewRegistryService,
     http: HttpService,
     rendererHost: RendererHostService,
   },
 }) {
-  private mounted = new Map<string, MountedView>();
+  private mounted = new Map<string, MountedView_>();
 
   evaluate() {
     this.setup("window-view-cleanup", () => {
@@ -97,23 +95,17 @@ export class WindowService extends Service.create({
       };
     });
 
-    // Re-open the entrypoint when the user clicks the dock / taskbar icon
-    // with no windows open. Electron emits `activate` on every focus
-    // (dock click on macOS, taskbar reactivation on Win/Linux), so we
-    // gate on "no live BaseWindow currently exists" — otherwise an
-    // already-running app would spawn a duplicate window every time the
-    // user tabs back in.
-    //
-    // The entrypoint view type is the framework-registered alias
-    // `"entrypoint"` (see RendererHostService) — a synthetic view over
-    // the project's `uiEntrypoint` directory, not anything the user
-    // plugin tracks. This is purely "open the canonical entrypoint", no
-    // last-value bookkeeping.
-    this.setup("activate-reopens-entrypoint", () => {
+    // Re-open the main window when the user clicks the dock / taskbar
+    // icon with no windows open. Electron emits `activate` on every
+    // focus (dock click on macOS, taskbar reactivation on Win/Linux),
+    // so we gate on "no live BaseWindow currently exists" — otherwise
+    // an already-running app would spawn a duplicate window every
+    // time the user tabs back in.
+    this.setup("activate-reopens-main", () => {
       const onActivate = () => {
         if (this.ctx.baseWindow.windows.size > 0) return;
-        this.openView({ type: "entrypoint" }).catch((err) => {
-          log.error("activate-reopens-entrypoint: openView failed:", err);
+        this.openWindow({}).catch((err) => {
+          log.error("activate-reopens-main: openWindow failed:", err);
         });
       };
       app.on("activate", onActivate);
@@ -198,34 +190,47 @@ export class WindowService extends Service.create({
     };
   }
 
-  async openView(args: {
-    type: string;
+  async openWindow(args: {
+    /**
+     * Injection name to render as the root of the window. Threaded
+     * into the URL as `?route=<injection>`; the host renderer's
+     * `App` component reads it and mounts `<View name={route} />`.
+     * Omit for the main window (host's default shell).
+     */
+    injection?: string;
     windowId?: string;
     query?: Record<string, string | number | boolean | null | undefined>;
-
     baseWindow?: BaseWindowConstructorOptions;
     webContentsView?: WebContentsViewConstructorOptions;
     backgroundColor?: string;
     contextMenu?: false | Parameters<typeof electronContextMenu>[0];
     devtoolsShortcut?: boolean;
   }): Promise<{ windowId: string }> {
-    return bootTrace.span(`openView(${args.type})`, () =>
-      this.openViewImpl(args),
+    const label = args.injection ?? "main";
+    return bootTrace.span(`openWindow(${label})`, () =>
+      this.openWindowImpl(args, label),
     );
   }
 
-  private async openViewImpl(args: {
-    type: string;
-    windowId?: string;
-    query?: Record<string, string | number | boolean | null | undefined>;
-    baseWindow?: BaseWindowConstructorOptions;
-    webContentsView?: WebContentsViewConstructorOptions;
-    backgroundColor?: string;
-    contextMenu?: false | Parameters<typeof electronContextMenu>[0];
-    devtoolsShortcut?: boolean;
-  }): Promise<{ windowId: string }> {
-    const entry = this.ctx.viewRegistry.get(args.type);
-    if (!entry) throw new Error(`No registered view for type "${args.type}"`);
+  private async openWindowImpl(
+    args: {
+      injection?: string;
+      windowId?: string;
+      query?: Record<string, string | number | boolean | null | undefined>;
+      baseWindow?: BaseWindowConstructorOptions;
+      webContentsView?: WebContentsViewConstructorOptions;
+      backgroundColor?: string;
+      contextMenu?: false | Parameters<typeof electronContextMenu>[0];
+      devtoolsShortcut?: boolean;
+    },
+    label: string,
+  ): Promise<{ windowId: string }> {
+    const rendererUrl = this.ctx.rendererHost.url;
+    if (!rendererUrl) {
+      throw new Error(
+        "[window] rendererHost.url is not ready yet — the host renderer's Vite server hasn't started.",
+      );
+    }
 
     const windowId = args.windowId ?? MAIN_WINDOW_ID;
     // Patchable diffs apply via setters; immutable diffs recreate and
@@ -260,7 +265,7 @@ export class WindowService extends Service.create({
     win.contentView.addChildView(view);
 
     // Right-click → standard browser context menu with "Inspect Element" so
-    // the framework's iframes are debuggable out of the box.
+    // the renderer is debuggable out of the box.
     const disposeContextMenu =
       args.contextMenu === false
         ? () => {}
@@ -338,15 +343,15 @@ export class WindowService extends Service.create({
       } catch {}
     });
 
-    const url = `${entry.url.replace(/\/$/, "")}/index.html${queryString({
+    const url = `${rendererUrl.replace(/\/$/, "")}/index.html${queryString({
       ...args.query,
       wsPort: this.ctx.http.port,
       wsToken: this.ctx.http.authToken,
       windowId,
-      // The advice/content-script prelude reads `?type=` to pick which
-      // registrations apply to this iframe (mirrors how Chrome extensions
-      // match content scripts to URLs).
-      type: args.type,
+      // Host's `App.tsx` reads `?route=` and renders
+      // `<View name={route} />` when set, otherwise falls through to
+      // the default workspace shell.
+      route: args.injection,
     })}`;
     // Always log the renderer URL on stdout so external tooling
     // (agent-browser, curl, devtools attach scripts) can pick it up
@@ -355,16 +360,16 @@ export class WindowService extends Service.create({
     // and immediately know which renderer to drive.
     const cdpPort = process.env.ZENBU_CDP_PORT;
     console.log(
-      `[zenbu] renderer-url type=${args.type} url=${url}${
+      `[zenbu] renderer-url window=${label} url=${url}${
         cdpPort ? ` cdp=${cdpPort}` : ""
       }`,
     );
-    bootTrace.mark(`renderer-url:${args.type}`, { url, cdpPort });
+    bootTrace.mark(`renderer-url:${label}`, { url, cdpPort });
 
     // Trace each renderer-process milestone so the flame surfaces WHICH
     // Electron event is actually gating `loadURL` resolution.
     const evtMark = (name: string) =>
-      bootTrace.mark(`webContents:${args.type}:${name}`);
+      bootTrace.mark(`webContents:${label}:${name}`);
     view.webContents.once("did-start-loading", () =>
       evtMark("did-start-loading"),
     );
@@ -383,13 +388,11 @@ export class WindowService extends Service.create({
     // Resolve on `dom-ready` of the main frame: this fires once per
     // navigation, *after* the main frame's DOM is parsed, but *before*
     // the page `load` event waits on every subresource (including nested
-    // <View> iframes loading their own bundles). On cold boot, child
-    // Vite servers may not even be up yet — making the page load event
-    // gate the splash swap stalls first paint by 1-2s for no user-visible
-    // benefit. We let Electron's loadURL keep running in the background
-    // and just don't await it.
+    // injected component subtrees that haven't yet rendered). We let
+    // Electron's loadURL keep running in the background and just don't
+    // await it.
     await bootTrace.span(
-      `openView:loadURL(${args.type})`,
+      `openWindow:loadURL(${label})`,
       () =>
         new Promise<void>((resolve, reject) => {
           const onReady = () => {
@@ -433,14 +436,14 @@ export class WindowService extends Service.create({
 
     this.mounted.set(windowId, {
       windowId,
-      type: args.type,
+      injection: args.injection ?? null,
       view,
       disposeContextMenu,
     });
     // currentWin, not win, in case recreate fired during loadURL.
     if (!currentWin.isVisible()) currentWin.show();
     currentWin.focus();
-    log.verbose(`mounted "${args.type}" in window "${windowId}"`);
+    log.verbose(`mounted "${label}" in window "${windowId}"`);
 
     return { windowId };
   }

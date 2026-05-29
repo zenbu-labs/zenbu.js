@@ -5,7 +5,6 @@ import type {
   BaseWindowService,
   BootTraceService,
   DbService,
-  FunctionRegistryService,
   HttpService,
   PluginUpdaterService,
   ReloaderService,
@@ -14,7 +13,6 @@ import type {
   ServerService,
   ShortcutsService,
   UpdaterService,
-  ViewRegistryService,
   WindowService,
 } from "@zenbujs/core/services"
 import type { Events as Events_core } from "@zenbujs/core/events"
@@ -43,7 +41,6 @@ export type CoreServiceRouter = {
     baseWindow: ExtractRpcMethods<BaseWindowService>;
     bootTrace: ExtractRpcMethods<BootTraceService>;
     db: ExtractRpcMethods<DbService>;
-    functionRegistry: ExtractRpcMethods<FunctionRegistryService>;
     http: ExtractRpcMethods<HttpService>;
     pluginUpdater: ExtractRpcMethods<PluginUpdaterService>;
     reloader: ExtractRpcMethods<ReloaderService>;
@@ -52,7 +49,6 @@ export type CoreServiceRouter = {
     server: ExtractRpcMethods<ServerService>;
     shortcuts: ExtractRpcMethods<ShortcutsService>;
     updater: ExtractRpcMethods<UpdaterService>;
-    viewRegistry: ExtractRpcMethods<ViewRegistryService>;
     window: ExtractRpcMethods<WindowService>;
   };
 }

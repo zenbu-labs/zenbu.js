@@ -75,11 +75,9 @@ type ConnectionState =
 const ConnectionContext = createContext<ConnectionState | null>(null);
 
 /**
- * Args delivered to a component-mode `<View>`. The iframe path uses
- * `window.__zenbuViewArgs` (populated by the prelude's postMessage
- * listener); the in-process component path reads this context instead.
- * `useViewArgs()` prefers the context when present so the same hook
- * works in both rendering modes.
+ * Args delivered to a `<View>` rendered injection. Read by
+ * `useViewArgs()` so child components don't have to destructure
+ * `args` themselves.
  */
 const ViewArgsContext = createContext<Record<string, unknown> | null>(null);
 
@@ -133,31 +131,6 @@ export function ZenbuProvider({
   const [state, setState] = useState<ConnectionState>({ status: "connecting" });
   const cleanupRef = useRef<(() => void) | null>(null);
   const retriesRef = useRef(0);
-
-  // Gate iframe view rendering on the first view-args message arriving.
-  // This guarantees `useViewArgs<T>(): T` is non-null at every call site:
-  // children only mount after the parent has delivered args. The
-  // entrypoint view (top-level, no parent) skips the gate — it never
-  // gets args from anyone.
-  const isIframeView =
-    typeof window !== "undefined" &&
-    window.parent !== window &&
-    !!window.__zenbuViewArgs;
-  const [viewArgsReady, setViewArgsReady] = useState<boolean>(
-    () => !isIframeView || !!window.__zenbuViewArgs?.current,
-  );
-  useEffect(() => {
-    if (viewArgsReady) return;
-    const store = window.__zenbuViewArgs;
-    if (!store) return;
-    let cancelled = false;
-    store.ready.then(() => {
-      if (!cancelled) setViewArgsReady(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [viewArgsReady]);
 
   useEffect(() => {
     let cancelled = false;
@@ -237,53 +210,16 @@ export function ZenbuProvider({
             return;
           }
 
-          // Close the race where the iframe's prelude was generated
-          // before late-registering services contributed their
-          // functions / component views. Compare db snapshot to the
-          // in-memory registries the prelude populated; mismatch
-          // → reload once. Fresh prelude has everything, second run
-          // passes the check, no loop.
-          try {
-            const root = (db as unknown as { readRoot: () => unknown }).readRoot();
-            const core = (root as { core?: unknown } | undefined)?.core as
-              | {
-                  lastKnownFunctionRegistry?: Array<{ name: string }>;
-                  lastKnownViewRegistry?: Array<{ type: string; rendering?: string }>;
-                }
-              | undefined;
-            const dbFns = core?.lastKnownFunctionRegistry ?? [];
-            const dbComponentViews = (core?.lastKnownViewRegistry ?? []).filter(
-              (v) => v.rendering === "component",
-            );
-            const missingFn = dbFns.filter((f) => !functionRegistry.has(f.name));
-            const missingView = dbComponentViews.filter(
-              (v) => !viewComponentRegistry.has(v.type),
-            );
-            if (missingFn.length > 0 || missingView.length > 0) {
-              await disconnectDb();
-              disconnectRpc();
-              ws.close();
-              location.reload();
-              return;
-            }
-          } catch (err) {
-            // Best-effort; fall through to the live reload subscription.
-            // eslint-disable-next-line no-console
-            console.warn("[zenbu/react] reconcile check failed:", err);
-          }
-
-          // View type lives at `/views/<type>/...` or `?type=<name>`.
-          // Mirrors `resolveType()` in `vite-plugins.ts`.
-          const viewMatch = window.location.pathname.match(/^\/views\/([^/]+)\//);
-          const viewType =
-            viewMatch?.[1] ??
-            new URLSearchParams(window.location.search).get("type");
+          // Subscribe to the host's reload signal so registration
+          // changes (a new injection appearing after the prelude was
+          // generated) trigger a one-shot `location.reload()` and a
+          // fresh prelude pulls them in.
           let unsubReload: (() => void) | null = null;
-          if (viewType) {
+          {
             const adviceReload = (events as any)?.core?.advice?.reload;
             if (adviceReload?.subscribe) {
               unsubReload = adviceReload.subscribe((data: { type?: string }) => {
-                if (data?.type === "*" || data?.type === viewType) {
+                if (data?.type === "*") {
                   location.reload();
                 }
               });
@@ -394,18 +330,6 @@ export function ZenbuProvider({
       fallback ?? null,
     );
   }
-  if (!viewArgsReady) {
-    // Connected but args haven't landed yet. In practice this window is
-    // sub-millisecond — the child posts `zenbu:view-ready` from the
-    // inline prelude and the parent replies synchronously. Rendering
-    // `fallback` keeps the visual story consistent with the connecting
-    // state for the rare case it stretches.
-    return createElement(
-      "span",
-      { "data-zenbu-view-args-pending": true },
-      fallback ?? null,
-    );
-  }
   if (state.status === "error") {
     return createElement(
       "span",
@@ -417,14 +341,226 @@ export function ZenbuProvider({
   // Compose KyjuProvider inside ConnectionContext so kyju's useDb /
   // useCollection hooks find their context. The KyjuProvider receives
   // the same replica + client that core stores on ConnectionContext.
+  // `ShortcutDispatcher` is a tiny effect-only child that owns the
+  // keydown listener + bindings cache; it runs once per connected
+  // ZenbuProvider, so each BrowserWindow gets its own.
   return createElement(
     ConnectionContext.Provider,
     { value: state },
     createElement(
       kyjuReact.KyjuProvider,
-      { client: state.conn.db, replica: state.conn.replica, children },
+      {
+        client: state.conn.db,
+        replica: state.conn.replica,
+        children: createElement(
+          "div",
+          { "data-zenbu-root": true, style: { display: "contents" } },
+          createElement(ShortcutDispatcher, {}),
+          children,
+        ),
+      },
     ),
   );
+}
+
+// ---- Shortcut dispatcher ---------------------------------------------
+//
+// Replaces the old per-iframe `installShortcutBridge` prelude. With
+// one DOM there's no iframe boundary to bridge across; a single
+// capture-phase `keydown` listener on `window` does the entire job.
+//
+// Responsibilities:
+//   1. Fetch the current binding list once via
+//      `rpc.core.shortcuts.bindings()` and refresh on every
+//      `events.core.shortcuts.changed`.
+//   2. On every keydown (capture phase): walk up from the active
+//      element collecting `[data-zenbu-focus-context]` ancestors,
+//      match the keystroke against the cached bindings filtered by
+//      `when`, `preventDefault()` synchronously if matched, and
+//      fire `rpc.core.shortcuts.handleKeydown({ input, contexts })`
+//      so the main process dispatches the handler.
+//
+// Boot timing: the listener attaches when this component commits,
+// which is *after* the first `useEffect` pass and a few hundred
+// keydowns after page load in the worst case. If a Cmd+P fires in
+// that window the browser print dialog opens. In practice users
+// haven't moved their hands yet.
+
+type ShortcutBinding = {
+  key?: string;
+  code?: string;
+  meta?: boolean;
+  control?: boolean;
+  alt?: boolean;
+  shift?: boolean;
+};
+
+type ShortcutWhen =
+  | string
+  | string[]
+  | { all?: string[]; any?: string[]; not?: string | string[] };
+
+type ShortcutBindingsSnapshot = {
+  id: string;
+  bindings: ShortcutBinding[];
+  when?: ShortcutWhen;
+};
+
+function shortcutInputMatchesBinding(
+  ev: KeyboardEvent,
+  b: ShortcutBinding,
+): boolean {
+  if (!!b.meta !== !!ev.metaKey) return false;
+  if (!!b.control !== !!ev.ctrlKey) return false;
+  if (!!b.alt !== !!ev.altKey) return false;
+  if (!!b.shift !== !!ev.shiftKey) return false;
+  if (b.code && ev.code !== b.code) return false;
+  if (b.key) {
+    const want = String(b.key).toLowerCase();
+    const have = String(ev.key || "").toLowerCase();
+    if (have !== want) return false;
+  }
+  return true;
+}
+
+function shortcutWhenMatches(
+  w: ShortcutWhen | undefined,
+  active: readonly string[],
+): boolean {
+  if (w == null) return true;
+  const set = new Set(active);
+  if (typeof w === "string") return set.has(w);
+  if (Array.isArray(w)) {
+    for (const id of w) if (!set.has(id)) return false;
+    return true;
+  }
+  if (w.all) for (const id of w.all) if (!set.has(id)) return false;
+  if (w.any) {
+    let hit = false;
+    for (const id of w.any)
+      if (set.has(id)) {
+        hit = true;
+        break;
+      }
+    if (!hit) return false;
+  }
+  if (w.not) {
+    const nots = Array.isArray(w.not) ? w.not : [w.not];
+    for (const id of nots) if (set.has(id)) return false;
+  }
+  return true;
+}
+
+/**
+ * Walk up from `el` collecting every `[data-zenbu-focus-context]`
+ * ancestor, innermost-first. Multiple ids on the same wrapper are
+ * space-separated (same convention `class` uses).
+ */
+function readActiveFocusContexts(el: Element | null): string[] {
+  const out: string[] = [];
+  let node: Node | null = el ?? document.activeElement;
+  while (node && node.nodeType === 1) {
+    const attr = (node as Element).getAttribute?.(
+      "data-zenbu-focus-context",
+    );
+    if (attr) {
+      for (const id of String(attr).split(/\s+/)) if (id) out.push(id);
+    }
+    node = node.parentNode;
+  }
+  return out;
+}
+
+function ShortcutDispatcher(): null {
+  const rpc = useRpc() as unknown as {
+    core: {
+      shortcuts: {
+        bindings: () => Promise<ShortcutBindingsSnapshot[]>;
+        handleKeydown: (args: {
+          input: ShortcutBinding;
+          contexts: string[];
+        }) => Promise<unknown>;
+      };
+    };
+  };
+  const events = useEvents() as unknown as {
+    core: {
+      shortcuts: { changed: { subscribe: (cb: () => void) => () => void } };
+    };
+  };
+
+  // Cache bindings in a ref so the keydown handler reads them
+  // synchronously without re-binding the listener on every refresh.
+  const bindingsRef = useRef<ShortcutBindingsSnapshot[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const list = await rpc.core.shortcuts.bindings();
+        if (!cancelled) bindingsRef.current = list;
+      } catch {
+        // Service not ready yet; the next `changed` emit catches us up.
+      }
+    };
+    void refresh();
+    const off = events.core.shortcuts.changed.subscribe(() => {
+      void refresh();
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, [rpc, events]);
+
+  useEffect(() => {
+    const handler = (ev: KeyboardEvent) => {
+      if (ev.defaultPrevented) return;
+      const input: ShortcutBinding = {
+        key: ev.key,
+        code: ev.code,
+        meta: !!ev.metaKey,
+        control: !!ev.ctrlKey,
+        alt: !!ev.altKey,
+        shift: !!ev.shiftKey,
+      };
+      const contexts = readActiveFocusContexts(
+        ev.target as Element | null,
+      );
+      // Synchronous local match — only to decide `preventDefault()`.
+      // The main process re-runs the match for dispatch (so the
+      // renderer can't get ahead of late-registering shortcuts).
+      let matched = false;
+      for (const entry of bindingsRef.current) {
+        let keyHit = false;
+        for (const b of entry.bindings) {
+          if (shortcutInputMatchesBinding(ev, b)) {
+            keyHit = true;
+            break;
+          }
+        }
+        if (!keyHit) continue;
+        if (!shortcutWhenMatches(entry.when, contexts)) continue;
+        matched = true;
+        break;
+      }
+      if (matched) {
+        try {
+          ev.preventDefault();
+        } catch {}
+        try {
+          ev.stopPropagation();
+        } catch {}
+      }
+      void rpc.core.shortcuts
+        .handleKeydown({ input, contexts })
+        .catch(() => {});
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [rpc]);
+
+  return null;
 }
 
 // ---- Connection accessor (RPC/events/db-client) ----
@@ -491,16 +627,17 @@ export type { CollectionRefValue };
 // ---- <FocusContext>: focus-context primitive for shortcut `when` ----
 
 /**
- * Declares a named focus region. The region is *active* whenever DOM
- * focus is anywhere inside the wrapper element (including inside
- * descendant iframes). Shortcuts registered with a matching `when`
- * clause only fire while the region is active.
+ * Declares a named focus region. The region is *active* whenever
+ * DOM focus is anywhere inside the wrapper element. Shortcuts
+ * registered with a matching `when` clause only fire while the
+ * region is active.
  *
  * Multiple `<FocusContext>` instances nest naturally — the active
- * stack is innermost-first. You can declare more than one id at the
- * same level by passing an array (`id={["app.sidebar", "app.workspace"]}`),
- * which is exposed to the prelude as a space-separated
- * `data-zenbu-focus-context` attribute (same convention as `class`).
+ * stack is innermost-first. You can declare more than one id at
+ * the same level by passing an array (`id={["app.sidebar",
+ * "app.workspace"]}`), which is exposed as a space-separated
+ * `data-zenbu-focus-context` attribute (same convention as `class`)
+ * that `ShortcutDispatcher` walks at keydown time.
  *
  * `<FocusContext>` renders a `<div>` wrapper by default. Pass
  * `tabIndex={-1}` and a `ref` (or use `useFocusContext`) if you want
@@ -628,14 +765,30 @@ export function useFocusContext(_id: string | string[]) {
 
 // ---- Component view registry (client-side) ----
 
+// ---- Injection registry (client-side) ----
+
 /**
- * Props received by a component-mode view. `args` mirrors what the
- * caller passed to `<View args=...>` (or `{}` when nothing was passed).
- *
- * The shape is intentionally minimal: anything more elaborate (per-view
- * metadata, slot info, etc.) lives in the server-side `ViewRegistryService`
- * and is read out via `useDb` from `core.lastKnownViewRegistry` if the
- * component cares.
+ * Opaque metadata attached to an injection. Plugin authors pass it
+ * to `this.inject(...)` / `useRegisterInjection(...)`; consumers
+ * filter on it via `useInjections({ kind: "…" })`.
+ */
+export type InjectionMeta = Record<string, unknown> & {
+  kind?: string;
+  label?: string;
+  icon?: string;
+};
+
+export type AnyFn = (...args: any[]) => any;
+
+export interface InjectionEntry<F = unknown> {
+  name: string;
+  value: F;
+  meta?: InjectionMeta;
+}
+
+/**
+ * Props received by an injection rendered through `<View name=… />`.
+ * `args` mirrors whatever the caller passed (`{}` when nothing).
  */
 export type ViewComponentProps<
   A extends Record<string, unknown> = Record<string, unknown>,
@@ -648,20 +801,22 @@ export type ViewComponent<
 > = ComponentType<ViewComponentProps<A>>;
 
 /**
- * In-process registry of React components keyed by view `type`. Used by
- * `<View>` when the server-side registry reports `rendering: "component"`.
+ * The injection registry — one in-renderer Map keyed by injection
+ * `name`. Populated two ways:
  *
- * This is a plain client-side store — entries do not need to round-trip
- * to the server. The server-side `ViewRegistryService.register({ type,
- * rendering: "component", meta })` advertises the slot (icon, sidebar,
- * label, focus integration); the component itself is pushed here from
- * user-land at runtime.
+ *   1. The Vite prelude pipeline calls `registerInjection(name, value,
+ *      meta)` for every module-load injection declared via
+ *      `this.inject(...)`. Runs once at boot, before `main.tsx`.
+ *   2. Renderer-side reactive injections via `useRegisterInjection`
+ *      (lifetime = component mount). Same registry slot.
+ *
+ * Last-writer-wins per `name`.
  */
-const viewComponentRegistry = new Map<string, ViewComponent<any>>();
-const viewComponentListeners = new Set<() => void>();
+const injectionRegistry = new Map<string, InjectionEntry<unknown>>();
+const injectionRegistryListeners = new Set<() => void>();
 
-function emitViewComponentChange() {
-  for (const cb of viewComponentListeners) {
+function emitInjectionRegistryChange() {
+  for (const cb of injectionRegistryListeners) {
     try {
       cb();
     } catch {}
@@ -669,160 +824,49 @@ function emitViewComponentChange() {
 }
 
 /**
- * Register a React component to render for `<View type={type}>` when the
- * server-side registry has the view in `"component"` rendering mode.
+ * Imperatively register an injection under `name`. Returns an
+ * unregister function; if `name` is already taken the previous entry
+ * is replaced.
  *
- * Returns an unregister function. If a different component is already
- * registered under `type`, it is replaced (last writer wins) so HMR and
- * re-renders of the registering tree behave naturally.
+ * Identity matters — a fresh function reference every render churns
+ * the registry and forces consumers to re-read. Wrap closures in
+ * `useCallback` / `useMemo`, or use `useRegisterInjection` which
+ * stabilizes the effect for you.
  */
-export function registerViewComponent<
-  A extends Record<string, unknown> = Record<string, unknown>,
->(type: string, Component: ViewComponent<A>): () => void {
-  viewComponentRegistry.set(type, Component as ViewComponent<any>);
-  emitViewComponentChange();
-  return () => {
-    // Only clear if we still own the slot — prevents a stale unmount
-    // from blowing away a replacement registered after us.
-    if (viewComponentRegistry.get(type) === (Component as ViewComponent<any>)) {
-      viewComponentRegistry.delete(type);
-      emitViewComponentChange();
-    }
-  };
-}
-
-export function getViewComponent(type: string): ViewComponent<any> | undefined {
-  return viewComponentRegistry.get(type);
-}
-
-function subscribeViewComponents(cb: () => void) {
-  viewComponentListeners.add(cb);
-  return () => {
-    viewComponentListeners.delete(cb);
-  };
-}
-
-function useViewComponent(type: string): ViewComponent<any> | undefined {
-  return useSyncExternalStore(
-    subscribeViewComponents,
-    () => viewComponentRegistry.get(type),
-    () => viewComponentRegistry.get(type),
-  );
-}
-
-/**
- * Convenience hook: register `Component` for `type` while the calling
- * component is mounted. Designed as the primitive for the "sentinel"
- * pattern — mount a tiny component anywhere in your tree that pushes
- * itself into the registry, optionally with advice applied. Unmounting
- * the sentinel unregisters.
- */
-export function useRegisterViewComponent<
-  A extends Record<string, unknown> = Record<string, unknown>,
->(type: string, Component: ViewComponent<A>): void {
-  useEffect(() => {
-    return registerViewComponent<A>(type, Component);
-  }, [type, Component]);
-}
-
-// ---- Function registry (client-side) ----
-
-/**
- * Opaque metadata attached to a registered function. Mirrors
- * `FunctionMeta` on the server side; consumers (`useFunctions`) can
- * filter by any field they care about — `kind` is the conventional
- * one (e.g. `kind: "cm.completion"`).
- */
-export type FunctionMeta = Record<string, unknown> & {
-  kind?: string;
-  label?: string;
-};
-
-export type AnyFn = (...args: any[]) => any;
-
-/**
- * What the registry actually stores. In practice this is usually a
- * function, but registered values can be anything serializable from a
- * module — e.g. a CodeMirror `Extension` (which is a value, not a
- * function). The generic on the hooks defaults to `AnyFn` for ergonomics
- * but you can pass any type at the call site (`useFunctions<Extension>(...)`).
- */
-export type RegistryValue = unknown;
-
-export interface FunctionRegistryEntry<F = AnyFn> {
-  name: string;
-  fn: F;
-  meta?: FunctionMeta;
-}
-
-/**
- * In-process registry of functions keyed by `name`. Populated either
- * by the prelude (for service-declared source-file functions) or by
- * `registerFunction` / `useRegisterFunction` at runtime (for
- * React-scoped closures). Read via `useFunction` / `useFunctions`.
- *
- * Last-writer-wins: if both a service-declared and a React-declared
- * function share a name, whichever registered most recently is the
- * one consumers see. Same churn rule as the component-view registry.
- */
-const functionRegistry = new Map<string, FunctionRegistryEntry<unknown>>();
-const functionRegistryListeners = new Set<() => void>();
-
-function emitFunctionRegistryChange() {
-  for (const cb of functionRegistryListeners) {
-    try {
-      cb();
-    } catch {}
-  }
-}
-
-/**
- * Imperatively register a function under `name`. Returns an unregister
- * function. If `name` is already taken, the previous entry is replaced.
- *
- * Identity matters — calling this with a *new* function reference on
- * every render churns the registry and forces consumers to re-read.
- * Wrap closures in `useCallback` / `useMemo`, or use
- * `useRegisterFunction` which does the right thing automatically.
- */
-export function registerFunction<F = AnyFn>(
+export function registerInjection<F = unknown>(
   name: string,
-  fn: F,
-  meta?: FunctionMeta,
+  value: F,
+  meta?: InjectionMeta,
 ): () => void {
-  const entry: FunctionRegistryEntry<unknown> = { name, fn, meta };
-  functionRegistry.set(name, entry);
-  emitFunctionRegistryChange();
+  const entry: InjectionEntry<unknown> = { name, value, meta };
+  injectionRegistry.set(name, entry);
+  emitInjectionRegistryChange();
   return () => {
-    // Only clear if we still own the slot — keep the latest
-    // registration intact when a stale dispose fires after a
-    // replacement.
-    if (functionRegistry.get(name) === entry) {
-      functionRegistry.delete(name);
-      emitFunctionRegistryChange();
+    // Only clear if we still own the slot — keeps a later
+    // re-registration intact when a stale dispose fires after it.
+    if (injectionRegistry.get(name) === entry) {
+      injectionRegistry.delete(name);
+      emitInjectionRegistryChange();
     }
   };
 }
 
-function subscribeFunctionRegistry(cb: () => void) {
-  functionRegistryListeners.add(cb);
+function subscribeInjectionRegistry(cb: () => void) {
+  injectionRegistryListeners.add(cb);
   return () => {
-    functionRegistryListeners.delete(cb);
+    injectionRegistryListeners.delete(cb);
   };
 }
 
 /**
- * Convenience hook: register `fn` for `name` while the calling
- * component is mounted. Re-registers when `fn` identity or `name`
- * changes; unregisters on unmount.
- *
- * Wrap your function in `useCallback` so dependencies decide when
- * to re-register — otherwise you'll churn the registry every render.
+ * Hook companion to `registerInjection`. Registers `value` under
+ * `name` while the calling component is mounted; re-registers when
+ * `value` identity or `name` changes.
  */
-export function useRegisterFunction<F = AnyFn>(
+export function useRegisterInjection<F = unknown>(
   name: string,
-  fn: F,
-  meta?: FunctionMeta,
+  value: F,
+  meta?: InjectionMeta,
 ): void {
   // Stringify meta for the effect deps so callers don't need to
   // memoize the meta object themselves. Cheap because meta is small.
@@ -831,33 +875,33 @@ export function useRegisterFunction<F = AnyFn>(
     [meta],
   );
   useEffect(() => {
-    return registerFunction(name, fn, meta);
+    return registerInjection(name, value, meta);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [name, fn, metaKey]);
+  }, [name, value, metaKey]);
 }
 
 /**
- * Read one registered function by `name`. Reactive: re-renders when
- * the entry is added, replaced, or removed.
+ * Read one injection by `name`. Reactive: re-renders when the entry
+ * is added, replaced, or removed.
  */
-export function useFunction<F = AnyFn>(name: string): F | undefined {
+export function useInjection<F = unknown>(name: string): F | undefined {
   return useSyncExternalStore(
-    subscribeFunctionRegistry,
-    () => functionRegistry.get(name)?.fn as F | undefined,
-    () => functionRegistry.get(name)?.fn as F | undefined,
+    subscribeInjectionRegistry,
+    () => injectionRegistry.get(name)?.value as F | undefined,
+    () => injectionRegistry.get(name)?.value as F | undefined,
   );
 }
 
-export type FunctionsFilter =
+export type InjectionsFilter =
   | { kind?: string; [k: string]: unknown }
-  | ((entry: FunctionRegistryEntry) => boolean);
+  | ((entry: InjectionEntry) => boolean);
 
 function matchesFilter(
-  entry: FunctionRegistryEntry<unknown>,
-  filter: FunctionsFilter | undefined,
+  entry: InjectionEntry<unknown>,
+  filter: InjectionsFilter | undefined,
 ): boolean {
   if (filter === undefined) return true;
-  if (typeof filter === "function") return filter(entry as FunctionRegistryEntry);
+  if (typeof filter === "function") return filter(entry as InjectionEntry);
   const meta = entry.meta ?? {};
   for (const [k, v] of Object.entries(filter)) {
     if ((meta as Record<string, unknown>)[k] !== v) return false;
@@ -866,42 +910,36 @@ function matchesFilter(
 }
 
 /**
- * Read every registered function, optionally filtered by `meta`
- * fields or a predicate. Reactive: re-renders when the registry
- * changes (entries added/removed/replaced). The returned array is a
- * fresh reference on every change — stable across renders that
- * don't affect the registry.
+ * Read every injection, optionally filtered by `meta` fields or a
+ * predicate. Reactive: re-renders when the registry changes. The
+ * returned array reference is stable across renders that don't
+ * affect the registry.
  *
- *   useFunctions()                          → all entries
- *   useFunctions({ kind: "cm.completion" }) → entries whose meta.kind === "cm.completion"
- *   useFunctions((e) => e.name.startsWith("git."))
+ *   useInjections()                          → all entries
+ *   useInjections({ kind: "footer.item" })   → entries with that kind
+ *   useInjections((e) => e.name.startsWith("git/"))
  */
-export function useFunctions<F = AnyFn>(
-  filter?: FunctionsFilter,
-): Array<FunctionRegistryEntry<F>> {
-  // Hold the same snapshot reference across reads that produce an
-  // equal result. `useSyncExternalStore` requires a stable snapshot
-  // identity for skipping re-renders.
-  const lastSnapshotRef = useRef<Array<FunctionRegistryEntry<F>>>([]);
+export function useInjections<F = unknown>(
+  filter?: InjectionsFilter,
+): Array<InjectionEntry<F>> {
+  const lastSnapshotRef = useRef<Array<InjectionEntry<F>>>([]);
   const lastKeyRef = useRef<string>("");
 
   const getSnapshot = () => {
-    const matches: Array<FunctionRegistryEntry<F>> = [];
-    for (const entry of functionRegistry.values()) {
+    const matches: Array<InjectionEntry<F>> = [];
+    for (const entry of injectionRegistry.values()) {
       if (matchesFilter(entry, filter)) {
-        matches.push(entry as FunctionRegistryEntry<F>);
+        matches.push(entry as InjectionEntry<F>);
       }
     }
-    // Cheap structural key — names + fn identity ordering. If both
-    // are identical to last call, return the cached array so
-    // downstream `useMemo` / effect deps don't churn.
     const key = matches.map((m) => m.name).join("\u0000");
-    if (key === lastKeyRef.current && matches.length === lastSnapshotRef.current.length) {
-      // Identity check on each fn so a replacement of the same name
-      // still produces a fresh snapshot.
+    if (
+      key === lastKeyRef.current &&
+      matches.length === lastSnapshotRef.current.length
+    ) {
       let same = true;
       for (let i = 0; i < matches.length; i++) {
-        if (matches[i]!.fn !== lastSnapshotRef.current[i]!.fn) {
+        if (matches[i]!.value !== lastSnapshotRef.current[i]!.value) {
           same = false;
           break;
         }
@@ -914,496 +952,97 @@ export function useFunctions<F = AnyFn>(
   };
 
   return useSyncExternalStore(
-    subscribeFunctionRegistry,
+    subscribeInjectionRegistry,
     getSnapshot,
     getSnapshot,
   );
 }
 
-// ---- <View>: iframe-or-component primitive ----
+// ---- <View>: render an injection as a React component ----
 
 /**
- * Mounts a registered view (separate Vite root, registered via
- * `ViewRegistryService.register(type, …)`) inside an `<iframe>` and:
+ * `<View name="…">` renders the injection registered under `name`
+ * as a React component. The component receives an `{ args }` prop
+ * shaped like `ViewComponentProps`; inside the component, you can
+ * also reach for `useViewArgs<A>()` instead of destructuring.
  *
- * 1. **Auto-inherits auth from the parent iframe's URL.** Reads `wsPort` /
- *    `wsToken` from `window.location.search` and forwards them in the
- *    child URL so the child's `<ZenbuProvider>` connects without the
- *    consumer wiring anything.
- * 2. **Mount-once src.** The iframe's `src` is set on first mount and
- *    *never updated*. Toggling `visible` only flips `style.display` —
- *    state inside the child (sockets, ghostty terminals, etc.) survives
- *    visibility changes.
- * 3. **Args via postMessage handshake.** Args are *never* serialized into
- *    the iframe URL — they can be arbitrarily large and would blow past
- *    URL length limits and pollute devtools. Instead, the child's inline
- *    prelude (`installViewArgsListener`) installs a `message` listener
- *    synchronously in `<head>` and posts `{ kind: "zenbu:view-ready" }`
- *    to its parent. This `<View>` listens for that ping and replies with
- *    `{ kind: "zenbu:view-args", args }`. The handshake guarantees the
- *    first args message can't be dropped: the child only announces
- *    readiness after its listener is attached.
- * 4. **Reactive updates via postMessage.** When `args` changes after
- *    mount, we re-post `{ kind: "zenbu:view-args", args }`. URL is
- *    never rewritten (iframe stays alive).
+ * Lifecycle: the injection lives in an in-memory registry populated
+ * by the Vite prelude pipeline (for `this.inject(…)`) and by
+ * `useRegisterInjection(…)` (for renderer-side reactive
+ * injections). `<View>` subscribes to the registry, so a re-render
+ * picks up replacements automatically.
  *
- * Child sessions die on unmount. There is no cache: if the consumer
- * unmounts the `<View>` element, any state inside it (e.g. PTY sockets)
- * is gone. Caller is responsible for explicit teardown via RPC if
- * needed.
+ * If no injection is registered under `name` yet, `fallback` is
+ * rendered (default: `null`). The injection runs inside the host's
+ * React tree and inherits the host's CSS scope directly — no
+ * iframe, no postMessage handshake, no theme forwarding.
  */
 export type ViewProps = {
-  /** Registered view type — first arg to `ViewRegistryService.register`. */
-  type: string;
-  /** Initial args; serialized into the child URL as base64-JSON. */
+  /** Injection name to render. Required. */
+  name: string;
+  /** Arbitrary props passed to the injection's component as `args`. */
   args?: Record<string, unknown>;
-  /** When false, sets `style.display: none`. Iframe is NOT unmounted. */
+  /** When false, sets `style.display: none`. The component stays
+   *  mounted — use this to preserve in-component state across
+   *  visibility toggles. */
   visible?: boolean;
   style?: CSSProperties;
   className?: string;
-  onLoad?: () => void;
-  /** Rendered while the view registry has not yet reported a URL for this type. */
+  /** Rendered when no injection is registered under `name` yet. */
   fallback?: ReactNode;
 };
 
-const VIEW_ARGS_MESSAGE_KIND = "zenbu:view-args";
-const VIEW_READY_MESSAGE_KIND = "zenbu:view-ready";
-const VIEW_THEME_MESSAGE_KIND = "zenbu:view-theme";
-
-/**
- * Shadcn-standard design tokens we forward from the host's `:root` into
- * every plugin iframe. The host *defines* these in its own CSS (it's
- * already shadcn or shadcn-compatible). The framework just reads them
- * off `getComputedStyle(document.documentElement)` and propagates them
- * to plugin views so the views automatically match the host's theme.
- *
- * Extending this list later doesn't break older plugins because they
- * just won't reference the newer vars.
- */
-const HOST_THEME_TOKENS: readonly string[] = [
-  "--background",
-  "--foreground",
-  "--card",
-  "--card-foreground",
-  "--popover",
-  "--popover-foreground",
-  "--primary",
-  "--primary-foreground",
-  "--secondary",
-  "--secondary-foreground",
-  "--muted",
-  "--muted-foreground",
-  "--accent",
-  "--accent-foreground",
-  "--destructive",
-  "--destructive-foreground",
-  "--border",
-  "--input",
-  "--ring",
-  "--radius",
-];
-
-const VIEW_BACKGROUND_TOKEN = "--zenbu-view-background";
-const VIEW_FOREGROUND_TOKEN = "--zenbu-view-foreground";
-const VIEW_COLOR_SCHEME_TOKEN = "--zenbu-view-color-scheme";
-
-
-/**
- * Read the configured set of host theme tokens off `:root`. Empty
- * strings are skipped — lets the host omit individual vars without
- * having to define every shadcn slot.
- */
-function isTransparentColor(value: string): boolean {
-  return (
-    value === "transparent" ||
-    value === "rgba(0, 0, 0, 0)" ||
-    value === "rgba(0,0,0,0)"
-  );
-}
-
-function inferColorScheme(rootStyle: CSSStyleDeclaration): "light" | "dark" {
-  const declared = rootStyle.colorScheme;
-  if (declared.split(/\s+/).includes("dark")) return "dark";
-  if (declared.split(/\s+/).includes("light")) return "light";
-  if (document.documentElement.classList.contains("dark")) return "dark";
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-}
-
-function readHostTheme(): Record<string, string> {
-  if (typeof document === "undefined") return {};
-  const rootStyle = getComputedStyle(document.documentElement);
-  const bodyStyle = document.body ? getComputedStyle(document.body) : rootStyle;
-  const tokens: Record<string, string> = {};
-  for (const name of HOST_THEME_TOKENS) {
-    const value = rootStyle.getPropertyValue(name).trim();
-    if (value) tokens[name] = value;
-  }
-
-  const tokenBackground = tokens["--background"];
-  const bodyBackground = bodyStyle.backgroundColor.trim();
-  const rootBackground = rootStyle.backgroundColor.trim();
-  const background = tokenBackground
-    || (!isTransparentColor(bodyBackground)
-      ? bodyBackground
-      : !isTransparentColor(rootBackground)
-        ? rootBackground
-        : undefined);
-  if (background) tokens[VIEW_BACKGROUND_TOKEN] = background;
-
-  const foreground = tokens["--foreground"] || bodyStyle.color.trim() || rootStyle.color.trim();
-  if (foreground) tokens[VIEW_FOREGROUND_TOKEN] = foreground;
-  tokens[VIEW_COLOR_SCHEME_TOKEN] = inferColorScheme(rootStyle);
-
-  return tokens;
-}
-
-function encodeViewTheme(tokens: Record<string, string>): string | null {
-  if (Object.keys(tokens).length === 0) return null;
-  try {
-    return btoa(unescape(encodeURIComponent(JSON.stringify(tokens))));
-  } catch (err) {
-    console.warn("[zenbu/View] failed to encode theme:", err);
-    return null;
-  }
-}
-
-function buildViewThemeCss(tokens: Record<string, string>): string {
-  const root =
-    ":root:root{" +
-    Object.keys(tokens)
-      .map((k) => `${k}:${tokens[k]}`)
-      .join(";") +
-    "}";
-  const background = `var(${VIEW_BACKGROUND_TOKEN}, var(--background, Canvas))`;
-  const foreground = `var(${VIEW_FOREGROUND_TOKEN}, var(--foreground, CanvasText))`;
-  const colorScheme = `var(${VIEW_COLOR_SCHEME_TOKEN}, normal)`;
-  return (
-    root +
-    `html,body,#root{width:100%;height:100%;background:${background};color:${foreground};color-scheme:${colorScheme}}` +
-    "body{margin:0}"
-  );
-}
-
-function buildPendingViewSrcDoc(tokens: Record<string, string>): string {
-  return `<!doctype html><html><head><style>${buildViewThemeCss(tokens)}</style></head><body><div id="root"></div></body></html>`;
-}
-
-function buildViewUrl(
-  baseUrl: string,
-  type: string,
-  encodedTheme: string | null,
-): string {
-  const trimmed = baseUrl.replace(/\/$/, "");
-  const parentParams = new URLSearchParams(window.location.search);
-  const params = new URLSearchParams();
-  const wsPort = parentParams.get("wsPort");
-  const wsToken = parentParams.get("wsToken");
-  if (wsPort) params.set("wsPort", wsPort);
-  if (wsToken) params.set("wsToken", wsToken);
-  params.set("type", type);
-  // NOTE: args intentionally NOT included — they go over postMessage so
-  // arbitrarily large payloads can't blow past URL length limits.
-  if (encodedTheme) params.set("theme", encodedTheme);
-  return `${trimmed}/?${params.toString()}`;
-}
-
-function shallowJSONEqual(a: unknown, b: unknown): boolean {
-  try {
-    return JSON.stringify(a) === JSON.stringify(b);
-  } catch {
-    return false;
-  }
-}
-
 export function View({
-  type,
+  name,
   args,
   visible = true,
   style,
   className,
-  onLoad,
   fallback = null,
 }: ViewProps): ReactElement {
-  // The view registry is replicated to the renderer via the core db slice.
-  // We read both the URL (iframe mode) and the rendering kind in one
-  // selector so the component branch doesn't have to wait on a separate
-  // round trip.
-  const entry = useDb((root) =>
-    (
-      root as unknown as {
-        core: {
-          lastKnownViewRegistry: Array<{
-            type: string;
-            url: string;
-            rendering?: "iframe" | "component";
-          }>;
-        };
-      }
-    ).core.lastKnownViewRegistry.find((v) => v.type === type) ?? null,
-  );
-  const rendering = entry?.rendering ?? "iframe";
-  const url = entry?.url ?? null;
-  const ComponentImpl = useViewComponent(type);
+  const ComponentImpl = useInjection<ViewComponent<any>>(name);
 
-  if (rendering === "component") {
-    // Component views bypass the iframe pipeline entirely: no Vite, no
-    // theme forwarding (we share the host's CSS scope), no postMessage
-    // bridge. We still honor `visible` so callers can flip a component
-    // view in/out the same way they can an iframe view.
-    if (!ComponentImpl) {
-      return createElement(
-        "span",
-        {
-          "data-zenbu-view-pending": type,
-          style: {
-            display: visible ? style?.display ?? "contents" : "none",
-            ...style,
-          },
-          className,
-        },
-        fallback,
-      );
-    }
-    const wrapperStyle: CSSProperties = {
-      ...style,
-      display: visible ? style?.display ?? "contents" : "none",
-    };
-    return createElement(
-      "div",
-      {
-        className,
-        style: wrapperStyle,
-        "data-zenbu-view": type,
-        "data-zenbu-view-rendering": "component",
-      },
-      createElement(
-        ViewArgsContext.Provider,
-        { value: (args ?? {}) as Record<string, unknown> },
-        createElement(ComponentImpl, { args: args ?? {} }),
-      ),
-    );
-  }
-
-  const rpc = useRpc();
-  // (iframe-mode path below)
-
-  // Lazy views start with an empty `url`. Fire `core.viewRegistry.ensure`
-  // to kick off the on-demand Vite server boot — the URL will appear in
-  // `lastKnownViewRegistry` once the server is listening and this hook
-  // will re-render with the real URL. Best-effort; eager views just
-  // hit the early-return path.
-  useEffect(() => {
-    if (url) return;
-    const ensure = rpc?.core?.viewRegistry?.ensure;
-    if (typeof ensure !== "function") return;
-    let cancelled = false;
-    void ensure({ type })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          console.warn(`[zenbu/View] ensure("${type}") failed:`, err);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [type, url, rpc]);
-
-  // Snapshot the iframe URL on first commit and never recompute. Changes to
-  // `args` after mount go via postMessage — rewriting `src` would reload
-  // the iframe and trash any in-flight state.
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const initialUrlRef = useRef<string | null>(null);
-  const lastThemeRef = useRef<Record<string, string> | null>(null);
-  const loadedRef = useRef(false);
-  // Always-current args reference so the `view-ready` handshake and the
-  // args-change effect both post the freshest value. React closures over
-  // `args` would otherwise risk responding to a ready ping with a stale
-  // snapshot if the parent re-rendered before the child finished loading.
-  const argsRef = useRef<Record<string, unknown>>(args ?? {});
-  argsRef.current = args ?? {};
-
-  if (initialUrlRef.current === null && url) {
-    const theme = readHostTheme();
-    const encodedTheme = encodeViewTheme(theme);
-    lastThemeRef.current = theme;
-    initialUrlRef.current = buildViewUrl(url, type, encodedTheme);
-  }
-
-  // Respond to the child's `zenbu:view-ready` ping with the current args.
-  // The child's prelude installs its listener synchronously at HTML parse
-  // time and pings us before any user code runs, so this handshake races
-  // ahead of `useViewArgs` mounting in the child and the first message is
-  // never dropped.
-  useEffect(() => {
-    const handler = (event: MessageEvent) => {
-      const iframe = iframeRef.current;
-      if (!iframe) return;
-      if (event.source !== iframe.contentWindow) return;
-      const data = event.data as { kind?: string } | null;
-      if (!data || data.kind !== VIEW_READY_MESSAGE_KIND) return;
-      iframe.contentWindow?.postMessage(
-        { kind: VIEW_ARGS_MESSAGE_KIND, args: argsRef.current },
-        "*",
-      );
-    };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
-  }, []);
-
-  // Push reactive updates whenever args change post-mount. Before the
-  // iframe has loaded, the ready handshake above will deliver the latest
-  // `argsRef.current` once the child pings us, so we don't need a
-  // separate `load`-event branch here.
-  const lastArgsJsonRef = useRef<string | null>(null);
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    if (!loadedRef.current) return;
-    let serialized: string;
-    try {
-      serialized = JSON.stringify(args ?? {});
-    } catch {
-      serialized = "";
-    }
-    if (serialized === lastArgsJsonRef.current) return;
-    lastArgsJsonRef.current = serialized;
-    iframe.contentWindow?.postMessage(
-      { kind: VIEW_ARGS_MESSAGE_KIND, args: args ?? {} },
-      "*",
-    );
-  }, [args]);
-
-  // Track host theme changes and push them into the iframe so plugin
-  // views automatically follow toggles (dark mode, theme picker, OS
-  // `prefers-color-scheme`). The *initial* paint is handled by the
-  // `?theme=` URL param above plus vite's `transformIndexHtml` (which
-  // inlines a synchronous `<style>` before any other CSS) — this hook
-  // is for live updates only.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const pushIfChanged = () => {
-      const tokens = readHostTheme();
-      if (shallowJSONEqual(tokens, lastThemeRef.current)) return;
-      lastThemeRef.current = tokens;
-      const iframe = iframeRef.current;
-      if (!iframe?.contentWindow) return;
-      const send = () =>
-        iframe.contentWindow?.postMessage(
-          { kind: VIEW_THEME_MESSAGE_KIND, tokens },
-          "*",
-        );
-      if (loadedRef.current) send();
-      else iframe.addEventListener("load", send, { once: true });
-    };
-
-    // Catches class / data-theme / inline style swaps on <html>, which
-    // is how shadcn-style theme pickers usually flip palettes.
-    const observer = new MutationObserver(pushIfChanged);
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class", "style", "data-theme"],
-    });
-
-    // Catches OS-level dark mode toggles when the host follows the
-    // system theme.
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    media.addEventListener("change", pushIfChanged);
-
-    return () => {
-      observer.disconnect();
-      media.removeEventListener("change", pushIfChanged);
-    };
-  }, []);
-
-  if (lastThemeRef.current === null) {
-    lastThemeRef.current = readHostTheme();
-  }
-
-  const frameBackground = lastThemeRef.current?.[VIEW_BACKGROUND_TOKEN];
-  const frameColorScheme = lastThemeRef.current?.[VIEW_COLOR_SCHEME_TOKEN];
-  const frameStyle: CSSProperties = {
-    border: "none",
-    backgroundColor: frameBackground,
-    colorScheme:
-      frameColorScheme === "dark" || frameColorScheme === "light"
-        ? frameColorScheme
-        : undefined,
+  const wrapperStyle: CSSProperties = {
     ...style,
-    display: visible ? style?.display ?? "block" : "none",
+    display: visible ? style?.display ?? "contents" : "none",
   };
 
-  if (!initialUrlRef.current) {
-    return createElement("iframe", {
-      ref: iframeRef,
-      srcDoc: buildPendingViewSrcDoc(lastThemeRef.current),
-      className,
-      style: frameStyle,
-      "data-zenbu-view-pending": type,
-      "aria-label": typeof fallback === "string" ? fallback : `Loading ${type}`,
-    });
+  if (!ComponentImpl) {
+    return createElement(
+      "span",
+      {
+        "data-zenbu-view-pending": name,
+        style: wrapperStyle,
+        className,
+      },
+      fallback,
+    );
   }
 
-  return createElement("iframe", {
-    ref: iframeRef,
-    src: initialUrlRef.current,
-    className,
-    style: frameStyle,
-    onLoad: () => {
-      loadedRef.current = true;
-      onLoad?.();
+  return createElement(
+    "div",
+    {
+      className,
+      style: wrapperStyle,
+      "data-zenbu-view": name,
     },
-  });
+    createElement(
+      ViewArgsContext.Provider,
+      { value: (args ?? {}) as Record<string, unknown> },
+      createElement(ComponentImpl, { args: args ?? {} }),
+    ),
+  );
 }
 
 /**
- * Read the current view args inside a child iframe rendered by `<View>`.
+ * Read the current `args` passed to the enclosing `<View>` injection.
+ * Equivalent to destructuring `args` from the component's props —
+ * exposed as a hook so consumers don't have to thread `args` down
+ * the tree manually.
  *
- * Args arrive entirely over `postMessage` — see the `<View>` doc-block
- * for the handshake. The early `installViewArgsListener` prelude
- * captures messages before any user code runs and stores them on
- * `window.__zenbuViewArgs`. `<ZenbuProvider>` gates rendering on the
- * first args message arriving, so by the time any component calls this
- * hook the global is guaranteed to be populated. That means the return
- * type is non-null and the consumer never has to handle a loading state.
+ * Re-renders when the parent passes a new `args` object.
  */
 export function useViewArgs<T extends Record<string, unknown>>(): T {
-  // Component-mode views are wrapped in `<ViewArgsContext.Provider>` by
-  // `<View>`. Iframe-mode views don't have a parent context (different
-  // realm) and fall back to the postMessage-fed global store.
   const ctxArgs = useContext(ViewArgsContext);
-  const store =
-    typeof window !== "undefined" ? window.__zenbuViewArgs : undefined;
-
-  const [args, setArgs] = useState<T>(() => {
-    if (ctxArgs) return ctxArgs as T;
-    return (store?.current ?? ({} as Record<string, unknown>)) as T;
-  });
-
-  // When the context value changes (parent re-rendered `<View args=...>`
-  // with new args), follow it. The postMessage subscription below only
-  // runs when there's no context — i.e. iframe-mode.
-  useEffect(() => {
-    if (ctxArgs) setArgs(ctxArgs as T);
-  }, [ctxArgs]);
-
-  useEffect(() => {
-    if (ctxArgs) return; // component-mode: the context path above wins.
-    if (!store) return;
-    // Catch the case where args arrived between our state initializer
-    // and the subscription below (shouldn't happen if ZenbuProvider
-    // gates correctly, but cheap to guard).
-    if (store.current && store.current !== (args as unknown)) {
-      setArgs(store.current as T);
-    }
-    const listener = (next: Record<string, unknown>) => {
-      setArgs(next as T);
-    };
-    store.listeners.add(listener);
-    return () => {
-      store.listeners.delete(listener);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctxArgs]);
-
-  return args;
+  return (ctxArgs ?? ({} as Record<string, unknown>)) as T;
 }

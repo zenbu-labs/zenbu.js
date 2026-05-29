@@ -1,0 +1,27 @@
+{
+  "id": "daffa26a-1c22-4397-aa70-20eeab9d0098",
+  "prevId": "c266ebb3-26e8-44e2-b1dc-b831480e9757",
+  "fields": {
+    "windowPrefs": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d15bbfd72cb9fe18",
+      "default": {}
+    },
+    "shortcuts": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "d2534dc6e73ef123",
+      "default": {}
+    },
+    "focus": {
+      "kind": "data",
+      "hasDefault": true,
+      "typeHash": "009e035028c96a15",
+      "default": {
+        "iframes": [],
+        "contexts": []
+      }
+    }
+  }
+}

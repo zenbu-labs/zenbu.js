@@ -1,52 +1,6 @@
 import zod from "zod";
 import { createSchema, f, type InferSchemaRoot } from "@zenbu/kyju/schema";
 
-/**
- * One entry in the function registry. The function itself lives only
- * in the renderer (it's not serializable across processes) — this
- * entry just describes *which* function should exist and any
- * meta the chrome / consumers want to filter on.
- */
-const functionRegistryEntrySchema = zod.object({
-  name: zod.string(),
-  meta: zod
-    .object({
-      kind: zod.string().optional(),
-      label: zod.string().optional(),
-    })
-    .catchall(zod.unknown())
-    .optional(),
-});
-
-const viewRegistryEntrySchema = zod.object({
-  type: zod.string(),
-  url: zod.string(),
-  port: zod.number(),
-  icon: zod.string().optional(),
-  /**
-   * How the renderer should mount this view. Defaults to `"iframe"` when
-   * omitted (existing behavior). `"component"` means the host renders a
-   * React component registered client-side under `type` — no Vite
-   * server, no iframe, args flow as a prop.
-   */
-  rendering: zod.enum(["iframe", "component"]).optional(),
-  /**
-   * Open by design — see `ViewMeta` in
-   * `services/view-registry.ts`. The framework only attaches
-   * meaning to a handful of well-known fields; everything else is
-   * userland metadata that round-trips through `passthrough()`.
-   */
-  meta: zod
-    .object({
-      kind: zod.string().optional(),
-      sidebar: zod.boolean().optional(),
-      bottomPanel: zod.boolean().optional(),
-      label: zod.string().optional(),
-    })
-    .passthrough()
-    .optional(),
-});
-
 const windowBoundsSchema = zod.object({
   x: zod.number(),
   y: zod.number(),
@@ -73,48 +27,21 @@ const shortcutBindingSchema = zod.object({
 });
 
 /**
- * One entry in a focused-view chain. The chain starts at the entrypoint
- * (outermost) and ends at whichever iframe currently owns focus.
- */
-const viewChainEntrySchema = zod.object({
-  viewType: zod.string(),
-  source: zod.string().optional(),
-});
-
-/**
- * Live focus state for the current window, written by the renderer
- * bridge and consumed by `ShortcutsService`'s dispatch + filtering.
+ * Live focus state for the current window, written by the
+ * renderer's shortcut dispatcher and consumed by
+ * `ShortcutsService`'s `when`-clause filtering.
  *
- * `iframes` is the iframe-level focus chain (outermost → innermost),
- * mirroring the legacy `focusedView.chain`. `contexts` is the *flat,
- * innermost-first* stack of `<FocusContext>` ids active across the
- * whole iframe tree (each iframe contributes its own DOM contexts;
- * inner-iframe contexts come first, then the parent's wrapping
- * contexts). Shortcuts with a `when` clause are filtered against this
- * stack; conflict resolution prefers the binding whose `when` matches
- * the innermost-active context.
+ * `contexts` is the flat, innermost-first stack of `<FocusContext>`
+ * ids active under the focused element. Shortcuts with a `when`
+ * clause are filtered against this stack; conflict resolution
+ * prefers the binding whose `when` matches the innermost-active
+ * context.
  */
 const focusStateSchema = zod.object({
-  iframes: zod.array(viewChainEntrySchema).default([]),
   contexts: zod.array(zod.string()).default([]),
 });
 
 const schema = createSchema({
-  /**
-   * Snapshot of the in-memory view registry, written by
-   * `ViewRegistryService.syncToDb` whenever the in-memory map
-   * changes. The renderer reads this to resolve `<View type="x">` to
-   * a URL (iframe mode) or to discover component-mode entries for
-   * chrome (sidebar slot, bottom-panel slot, label).
-   */
-  lastKnownViewRegistry: f.array(viewRegistryEntrySchema).default([]),
-  /**
-   * Mirror of `lastKnownViewRegistry` for renderer-side function
-   * registrations declared by services. Holds only metadata — the
-   * actual function lives in the iframe's `@zenbujs/core/react`
-   * client registry, populated by the prelude codegen.
-   */
-  lastKnownFunctionRegistry: f.array(functionRegistryEntrySchema).default([]),
   windowPrefs: f.record(zod.string(), windowPrefsSchema).default({}),
   /**
    * Per-shortcut binding override. The full list of available shortcuts
@@ -127,28 +54,24 @@ const schema = createSchema({
     .record(zod.string(), shortcutBindingSchema.nullable())
     .default({}),
   /**
-   * Live focus state. Includes both the iframe focus chain and the
-   * flattened `<FocusContext>` id stack so shortcuts can be filtered
+   * Live focus state — the flattened `<FocusContext>` id stack so
+   * shortcuts can be filtered
    * by `when`. See `focusStateSchema`. Updated by
    * `ShortcutsService.setFocus` from the renderer bridge.
    */
   focus: f
     .object({
-      iframes: zod.array(viewChainEntrySchema).default([]),
       contexts: zod.array(zod.string()).default([]),
     })
-    .default({ iframes: [], contexts: [] }),
+    .default({ contexts: [] }),
 });
 
 export default schema;
 export { schema };
 
-export type ViewRegistryEntry = zod.infer<typeof viewRegistryEntrySchema>;
-export type FunctionRegistryEntry = zod.infer<typeof functionRegistryEntrySchema>;
 export type WindowBounds = zod.infer<typeof windowBoundsSchema>;
 export type WindowPrefs = zod.infer<typeof windowPrefsSchema>;
 export type ShortcutBinding = zod.infer<typeof shortcutBindingSchema>;
-export type ViewChainEntry = zod.infer<typeof viewChainEntrySchema>;
 export type FocusState = zod.infer<typeof focusStateSchema>;
 export type SchemaRoot = InferSchemaRoot<typeof schema>;
 export type CoreSchema = typeof schema.shape;

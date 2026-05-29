@@ -291,21 +291,28 @@ export interface ReloaderEntry {
   viteServer: ViteDevServer
 }
 
-interface PendingSpec {
-  id: string
-  root: string
-  configFile: string | false
-  /** Resolves to the live entry once Vite is running. */
-  promise: Promise<ReloaderEntry> | null
-}
-
+/**
+ * Owns the host renderer's Vite server.
+ *
+ * In one-DOM mode there's exactly one Vite server — the one serving
+ * the host's `uiEntrypoint`. The legacy multi-server map and lazy
+ * startup helpers (`registerLazy` / `ensure` / `has` / `remove`) were
+ * iframe-era plumbing for per-view dev servers; they're gone.
+ *
+ * `id` survives as an opaque label in the API surface (`create(id, ...)`,
+ * `get(id)`) so the small number of internal callers (`http`,
+ * `advice-config`, `renderer-host`) didn't have to change shape, but
+ * in practice only the framework-managed `"app"` id is ever used.
+ */
 export class ReloaderService extends Service.create({ key: "reloader" }) {
-  private servers = new Map<string, ReloaderEntry>()
-  /** Specs that were registered with `lazy: true` and have not yet booted. */
-  private pending = new Map<string, PendingSpec>()
+  private entry: ReloaderEntry | null = null
 
-  async create(id: string, root: string, configFile?: string | false): Promise<ReloaderEntry> {
-    if (this.servers.has(id)) return this.servers.get(id)!
+  async create(
+    id: string,
+    root: string,
+    configFile?: string | false,
+  ): Promise<ReloaderEntry> {
+    if (this.entry) return this.entry
     const viteServer = await startRendererServer({
       id,
       root,
@@ -313,102 +320,38 @@ export class ReloaderService extends Service.create({ key: "reloader" }) {
       port: 0,
     })
     const address = viteServer.httpServer?.address()
-    const port = typeof address === "object" && address ? address.port : 5173
-    const entry: ReloaderEntry = { id, root, url: `http://localhost:${port}`, port, viteServer }
-    this.servers.set(id, entry)
-    log.verbose(`${id} ready at ${entry.url}`)
-    return entry
-  }
-
-  /**
-   * Register a view's Vite spec without starting the server. Returns
-   * immediately. The Vite server is created on the first call to
-   * `ensure(id)` (typically when the renderer's `<View>` actually mounts
-   * the iframe). Keeps non-entrypoint views off the boot critical path.
-   */
-  registerLazy(id: string, root: string, configFile?: string | false): void {
-    if (this.servers.has(id) || this.pending.has(id)) return
-    this.pending.set(id, {
+    const port =
+      typeof address === "object" && address ? address.port : 5173
+    this.entry = {
       id,
       root,
-      configFile: configFile ?? false,
-      promise: null,
-    })
-  }
-
-  /** Returns the entry, starting the Vite server on demand if it was lazy. */
-  async ensure(id: string): Promise<ReloaderEntry | undefined> {
-    if (this.servers.has(id)) return this.servers.get(id)
-    const pending = this.pending.get(id)
-    if (!pending) return undefined
-    if (!pending.promise) {
-      pending.promise = bootTrace.span(`reloader:lazy-start:${id}`, async () => {
-        const viteServer = await startRendererServer({
-          id: pending.id,
-          root: pending.root,
-          configFile: pending.configFile,
-          port: 0,
-        })
-        const address = viteServer.httpServer?.address()
-        const port = typeof address === "object" && address ? address.port : 5173
-        const entry: ReloaderEntry = {
-          id: pending.id,
-          root: pending.root,
-          url: `http://localhost:${port}`,
-          port,
-          viteServer,
-        }
-        this.servers.set(pending.id, entry)
-        this.pending.delete(pending.id)
-        return entry
-      })
+      url: `http://localhost:${port}`,
+      port,
+      viteServer,
     }
-    return pending.promise
+    log.verbose(`${id} ready at ${this.entry.url}`)
+    return this.entry
   }
 
-  /** Has the given id been declared (lazily or eagerly)? */
-  has(id: string): boolean {
-    return this.servers.has(id) || this.pending.has(id)
-  }
-
-  get(id: string): ReloaderEntry | undefined {
-    return this.servers.get(id)
-  }
-
-  async remove(id: string) {
-    const entry = this.servers.get(id)
-    if (entry) {
-      await entry.viteServer.close()
-      this.servers.delete(id)
-    }
+  get(_id?: string): ReloaderEntry | undefined {
+    return this.entry ?? undefined
   }
 
   evaluate() {
-    this.setup("vite-cleanup", () => {
-      return async () => {
-        // Close each server independently — a single throw must NOT
-        // skip the rest, otherwise orphan chokidar+fsevents watchers
-        // survive shutdown and trip `napi_call_function` in
-        // `fse_dispatch_event` once the V8 isolate tears down. Use
-        // `allSettled` so every server gets a close attempt and we can
-        // log every failure individually.
-        const entries = [...this.servers.values()]
-        this.servers.clear()
-        const results = await Promise.allSettled(
-          entries.map((entry) => entry.viteServer.close()),
-        )
-        results.forEach((res, i) => {
-          if (res.status === "rejected") {
-            log.error(
-              `viteServer.close failed for ${entries[i].id}:`,
-              res.reason,
-            )
-          }
-        })
+    this.setup("vite-cleanup", () => async () => {
+      const entry = this.entry
+      this.entry = null
+      if (!entry) return
+      try {
+        await entry.viteServer.close()
+      } catch (err) {
+        // Don't let close failures cascade — a thrown promise here
+        // strands chokidar+fsevents watchers and trips
+        // `napi_call_function` inside `fse_dispatch_event` during
+        // V8 isolate teardown.
+        log.error(`viteServer.close failed for ${entry.id}:`, err)
       }
     })
-
-    log.verbose(`service ready (${this.servers.size} servers)`)
   }
 }
 
