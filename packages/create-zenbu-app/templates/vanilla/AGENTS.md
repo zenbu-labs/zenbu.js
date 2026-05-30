@@ -110,7 +110,7 @@ export class CounterService extends Service.create({
   private count = 0
 
   evaluate() {
-    // Called when the service starts
+    // Called when the service starts.
   }
 
   increment() {
@@ -158,7 +158,7 @@ function App() {
   const rpc = useRpc()
 
   const handleClick = async () => {
-    const newCount = await rpc.counter.increment()
+    const newCount = await rpc.app.counter.increment()
     console.log(newCount)
   }
 
@@ -203,15 +203,21 @@ function Notifications() {
 }
 ```
 
+## Injections
+
+When a plugin wants to add UI to the app, it registers an [**injection**](/core/injections). The host already looks for injections in known places (sidebars, the bottom panel, the title bar, the footer) and renders them. A service registers one with `this.inject({ name, modulePath, meta })`, and any other plugin discovers it with `useInjections({ kind })` or renders it with `<View name="..." />`. The same primitive also covers [advice](/core/advice) and code that just needs to run at boot.
+
 
 # Advice
 Source: https://zenbulabs.mintlify.app/core/advice
 
 
 
-Advice lets a plugin wrap or replace a function or React component owned by another plugin, without modifying the original source.
+Advice lets a plugin wrap or replace a function or React component owned by another plugin, without modifying the original source. This API is inspired by Emacs, where [`defadvice`](https://www.gnu.org/software/emacs/manual/html_node/elisp/Advising-Functions.html) is used to modify existing functions without editing their source.
 
-This API is inspired from Emacs, where [`defadvice`](https://www.gnu.org/software/emacs/manual/html_node/elisp/Advising-Functions.html) is used to modify existing functions without editing their source.
+<Info>
+  Advice is a kind of [injection](/core/injections). `this.advise(...)` is sugar over `this.inject(...)` with `meta.kind: "advice"`.
+</Info>
 
 ## Registering advice
 
@@ -224,7 +230,6 @@ export class ChromeService extends Service.create({ key: "chrome" }) {
   evaluate() {
     this.setup("wrap-counter", () =>
       this.advise({
-        view: "entrypoint",
         moduleId: "App.tsx",
         name: "Counter",
         type: "around",
@@ -236,24 +241,28 @@ export class ChromeService extends Service.create({ key: "chrome" }) {
 }
 ```
 
-| Field        | Meaning                                                                 |
-| ------------ | ----------------------------------------------------------------------- |
-| `view`       | View type to apply the advice in. `"*"` for every view.                 |
-| `moduleId`   | Suffix of the source file that exports the target.                      |
-| `name`       | Name of the export to advise.                                           |
-| `type`       | One of `"replace"`, `"before"`, `"after"`, `"around"`.                  |
-| `modulePath` | Path to your wrapper module, relative to the plugin root (or absolute). |
-| `exportName` | Named export inside the wrapper module.                                 |
+| Field           | Meaning                                                                 |
+| --------------- | ----------------------------------------------------------------------- |
+| `moduleId`      | Suffix of the source file that exports the target.                      |
+| `name`          | Name of the export to advise.                                           |
+| `type`          | One of `"replace"`, `"before"`, `"after"`, `"around"`.                  |
+| `modulePath`    | Path to your wrapper module, relative to the plugin root (or absolute). |
+| `exportName`    | Named export inside the wrapper module. Defaults to `default`.          |
+| `injectionName` | Optional override for the synthetic injection name.                     |
 
-Returns an unregister function. Use it as a `setup` cleanup.
+Returns an unregister function. Wrap in `this.setup()` for hot-reload cleanup.
 
 ## Around advice
 
-Receives the original as `__original` in props, making it the most flexible advice type.
+Around-advice receives the next function in the chain (which is the original target, or the next around-advice if several are stacked) as the **first positional argument**. For React components, since React calls components as `Component(props)`, the signature is `(Original, props)`.
 
 ```tsx src/content/wrap-counter.tsx theme={null}
-export function WrapCounter(props) {
-  const Original = props.__original
+import type { ComponentType } from "react"
+
+export function WrapCounter<P>(
+  Original: ComponentType<P>,
+  props: P,
+) {
   return (
     <div className="bordered">
       <Original {...props} />
@@ -262,7 +271,21 @@ export function WrapCounter(props) {
 }
 ```
 
-Use this when you want to render the original but add structure around it or change its props.
+For a plain function `save({ path }: { path: string })`, around-advice would be:
+
+```typescript theme={null}
+export function aroundSave(
+  next: (args: { path: string }) => void,
+  args: { path: string },
+) {
+  console.log("before", args.path)
+  const result = next(args)
+  console.log("after", args.path)
+  return result
+}
+```
+
+Use around-advice when you want to render the original but add structure around it, change its props, or short-circuit it conditionally (skip the `next(...)` call).
 
 ## Replace advice
 
@@ -276,15 +299,18 @@ export function WrapCounter() {
 
 ## Before / After
 
-`before` and `after` advice run extra logic around the original function.
+`before` and `after` advice wrap a function without taking over the call.
+
+* `before` runs first with the original args (`...originalArgs`); its return value is ignored.
+* `after` runs last with the result followed by the original args (`result, ...originalArgs`). If it returns a value other than `undefined`, that value overrides the result.
 
 ```typescript theme={null}
-// before: runs your function, then calls the original
+// before: runs first, then the original
 export function beforeSave(args: { path: string }) {
   console.log("saving", args.path)
 }
 
-// after: calls the original, then runs your function with the result
+// after: runs last; return a value to override the result
 export function afterSave(result: void, args: { path: string }) {
   console.log("saved", args.path)
 }
@@ -292,83 +318,7 @@ export function afterSave(result: void, args: { path: string }) {
 
 ## Hot reloading
 
-Adding, removing, or editing a `this.advise(...)` call reloads the affected views so the new advice takes effect. Edits inside the advice module itself hot-replace through Vite's normal HMR.
-
-
-# Content Scripts
-Source: https://zenbulabs.mintlify.app/core/content-scripts
-
-
-
-A content script is JavaScript that gets injected into a page at runtime. It runs in the same environment as the page, so it can use React hooks, read from the database, and call RPC methods. Content scripts target views by type, so you can inject into specific views or use `"*"` to inject into all of them.
-
-## Use cases
-
-* Add UI that appears on every page, like a devtools panel or a chat overlay.
-* Add UI to a specific page without modifying that page's source code.
-* Let a plugin contribute visible elements to the host app.
-
-## Registering a content script
-
-Call `this.injectContentScript(...)` from a service:
-
-```typescript theme={null}
-import { Service } from "@zenbujs/core/runtime"
-
-export class DevtoolsService extends Service.create({ key: "devtools" }) {
-  evaluate() {
-    this.setup("inject", () =>
-      this.injectContentScript({
-        view: "*",
-        modulePath: "src/content/toolbar.tsx",
-      }),
-    )
-  }
-}
-```
-
-| Field        | Meaning                                                                                                                    |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `view`       | The view type to inject into. Pass `"*"` to inject into every view.                                                        |
-| `modulePath` | Path to the script. Relative paths resolve against the plugin's directory; absolute paths are accepted as an escape hatch. |
-
-The call returns an unsubscribe function, so wrapping it in `this.setup()` ensures cleanup on hot reload.
-
-## Authoring a content script
-
-A content script is a module that runs when the page loads. It can mount its own React tree into the DOM. This example adds a toolbar using a shadow root to keep its styles separate from the host page:
-
-```tsx src/content/toolbar.tsx theme={null}
-import { StrictMode } from "react"
-import { createRoot } from "react-dom/client"
-import { ZenbuProvider } from "@zenbujs/core/react"
-import { Toolbar } from "./Toolbar"
-
-function mount() {
-  if (document.body?.dataset.myToolbarMounted === "1") return
-  document.body.dataset.myToolbarMounted = "1"
-
-  const host = document.createElement("div")
-  document.body.appendChild(host)
-  const shadow = host.attachShadow({ mode: "closed" })
-  const reactRoot = document.createElement("div")
-  shadow.appendChild(reactRoot)
-
-  createRoot(reactRoot).render(
-    <StrictMode>
-      <ZenbuProvider>
-        <Toolbar />
-      </ZenbuProvider>
-    </StrictMode>
-  )
-}
-
-mount()
-```
-
-## Content scripts vs advice
-
-Content scripts add new UI alongside the host view's component tree. They cannot replace or wrap existing components. For that, use [advice](/guides/advice-functions) instead.
+Adding, removing, or editing a `this.advise(...)` call reloads the renderer so the new advice takes effect. Edits inside the advice module itself hot-replace through Vite's normal HMR.
 
 
 # Events
@@ -441,6 +391,138 @@ The returned function unsubscribes the listener, so return it from your effect's
 * **Database** is for state that should persist and drive your UI.
 
 
+# Injections
+Source: https://zenbulabs.mintlify.app/core/injections
+
+
+
+An injection is a named value a plugin registers for other code to find. The value can be a React component, a function, or anything else. Other code looks up injections by name, or filters them by optional metadata.
+
+## Registering an injection
+
+From a service, call `this.inject(...)`:
+
+```typescript src/main/services/my-plugin.ts theme={null}
+import { Service } from "@zenbujs/core/runtime"
+
+export class MyPluginService extends Service.create({ key: "myPlugin" }) {
+  evaluate() {
+    this.setup("inject", () =>
+      this.inject({
+        name: "my-plugin",
+        modulePath: "./src/views/my-view.tsx",
+        meta: { kind: "left-sidebar", label: "My plugin" },
+      }),
+    )
+  }
+}
+```
+
+| Field        | Required | Description                                                              |
+| ------------ | -------- | ------------------------------------------------------------------------ |
+| `name`       | yes      | Unique key in the registry. Last writer wins.                            |
+| `modulePath` | yes      | Path to the module. Relative paths resolve against the plugin directory. |
+| `exportName` | no       | Named export. Defaults to `default`.                                     |
+| `meta`       | no       | JSON-serializable object. Consumers filter on it.                        |
+
+The call returns an unregister function. Wrap it in `this.setup(...)` so it cleans up on hot reload.
+
+## Reading injections
+
+`useInjections({ kind })` returns the live list of injections whose `meta.kind` matches.
+
+```tsx theme={null}
+import { useInjections } from "@zenbujs/core/react"
+
+function LeftSidebar() {
+  const tabs = useInjections({ kind: "left-sidebar" })
+  return tabs.map((tab) => <Tab key={tab.name} label={tab.meta?.label} />)
+}
+```
+
+## Rendering an injection
+
+`<View name="...">` looks up the injection and renders its value as a React component. `args` is passed to the component as a prop and is also available via `useViewArgs()` in any child.
+
+```tsx theme={null}
+import { View } from "@zenbujs/core/react"
+
+<View name="my-plugin" args={{ workspaceId }} fallback={<Loading />} />
+```
+
+| Prop       | Description                                                             |
+| ---------- | ----------------------------------------------------------------------- |
+| `name`     | Injection name. Required.                                               |
+| `args`     | Object passed to the component as `args`.                               |
+| `visible`  | When `false`, hides the wrapper via `display: none` without unmounting. |
+| `fallback` | Rendered when nothing is registered under `name` yet.                   |
+
+## Meta conventions
+
+The framework does not read `meta`. Consumers do. The conventional keys are:
+
+| Key     | Used for                                                                                          |
+| ------- | ------------------------------------------------------------------------------------------------- |
+| `kind`  | Slot discriminator.                                                                               |
+| `label` | Display text on tabs, palette entries, buttons.                                                   |
+| `icon`  | Inline SVG. Auto-filled from the plugin's `icons:` map when the key matches the injection `name`. |
+| `order` | Sort hint within a slot. Lower comes first.                                                       |
+
+## Registering from React
+
+`useRegisterInjection` registers an injection while the calling component is mounted, and unregisters on unmount. Use it when the value can only be constructed inside React, for example a CodeMirror extension built from a hook's state.
+
+```tsx theme={null}
+import { useRegisterInjection } from "@zenbujs/core/react"
+
+function VimSentinel() {
+  useRegisterInjection("cm-vim", vim(), {
+    kind: "cm.composer-extension-editable",
+  })
+  return null
+}
+```
+
+## Injecting without a value
+
+With no `meta`, the framework just imports the module. The module's top-level code runs, but nothing is added to the registry.
+
+```typescript theme={null}
+this.inject({
+  name: "my-plugin/devtools",
+  modulePath: "./src/content/devtools.tsx",
+})
+```
+
+## Advice
+
+Advice is a kind of injection that replaces or wraps a specific exported function or component anywhere in the app. It is registered with `this.advise(...)`, which targets the export by its source file and export name.
+
+```typescript theme={null}
+this.setup("wrap-counter", () =>
+  this.advise({
+    moduleId: "Counter.tsx",
+    name: "Counter",
+    type: "around",
+    modulePath: "./src/wrap-counter.tsx",
+  }),
+)
+```
+
+The `type` field controls how the wrapper relates to the original:
+
+* `replace` substitutes the original entirely.
+* `around` runs in place of the original. It receives the next function in the chain as its first argument; call it (or don't) to decide whether the original runs.
+* `before` runs first with the original arguments.
+* `after` runs last and receives the result followed by the original arguments. Returning a value other than `undefined` overrides the result.
+
+`this.advise(...)` is sugar over `this.inject(...)` with `meta.kind: "advice"`. For the full reference, including how the wrapper module should be written for each `type`, see [Advice](/core/advice).
+
+## Hot reloading
+
+Adding, removing, or editing a `this.inject(...)` call invalidates the renderer prelude and reloads the window. Edits inside the injection module itself hot-replace through Vite.
+
+
 # Plugins
 Source: https://zenbulabs.mintlify.app/core/plugins
 
@@ -465,19 +547,24 @@ export default defineConfig({
       schema: "./src/main/schema.ts",
       events: "./src/main/events.ts",
       migrations: "./migrations",
+      icons: {
+        "my-view": '<svg ...>...</svg>',
+      },
     }),
   ],
 })
 ```
 
-| Field        | Required | Description                                                                                                                                                                                                                                 |
-| ------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`       | yes      | Unique plugin identifier. Used as the top-level namespace for the plugin's database section, RPC services, and events (e.g. `db.<name>`, `rpc.<name>.<service>`, `events.<name>.<event>`). Reserved value: `core` belongs to the framework. |
-| `services`   | yes      | Glob patterns for main process service files.                                                                                                                                                                                               |
-| `schema`     | no       | Path to the database schema definition.                                                                                                                                                                                                     |
-| `events`     | no       | Path to event type definitions.                                                                                                                                                                                                             |
-| `migrations` | no       | Directory of generated migration files.                                                                                                                                                                                                     |
-| `dependsOn`  | no       | Declares which other plugins this plugin needs type definitions from. See [Type dependencies](#type-dependencies).                                                                                                                          |
+| Field        | Required | Description                                                                                                                                                                                                                                       |
+| ------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`       | yes      | Unique plugin identifier. Used as the top-level namespace for the plugin's database section, RPC services, and events (e.g. `db.<name>`, `rpc.<name>.<service>`, `events.<name>.<event>`). Reserved value: `core` belongs to the framework.       |
+| `services`   | yes      | Glob patterns for main process service files.                                                                                                                                                                                                     |
+| `schema`     | no       | Path to the database schema definition.                                                                                                                                                                                                           |
+| `events`     | no       | Path to event type definitions.                                                                                                                                                                                                                   |
+| `migrations` | no       | Directory of generated migration files.                                                                                                                                                                                                           |
+| `preload`    | no       | Path to a renderer preload module.                                                                                                                                                                                                                |
+| `icons`      | no       | Map of inline SVG strings keyed by [injection](/core/injections) `name`. When you call `this.inject({ name })` and a matching key exists, the framework copies the SVG into `meta.icon` for you. Lookup is per-plugin (no cross-plugin fallback). |
+| `dependsOn`  | no       | Declares which other plugins this plugin needs type definitions from. See [Type dependencies](#type-dependencies).                                                                                                                                |
 
 ## Scaffolding a plugin
 
@@ -509,6 +596,39 @@ plugins: [
 
 Adding or removing a plugin in `zenbu.config.ts` is a hot-reloadable change that takes effect without restarting the app.
 
+## Local-only plugins (`localPlugins`)
+
+A `zenbu.config.ts` can opt into a per-developer overlay file that's gitignored and loaded only if it exists. Use this when you want to wire a local plugin (e.g. one cloned into `~/.zenbu/plugins/...`) into your app without committing the path:
+
+```typescript theme={null}
+export default defineConfig({
+  uiEntrypoint: "./src/renderer",
+  plugins: [
+    "./plugins/app/zenbu.plugin.ts",
+  ],
+  localPlugins: "./zenbu.local.ts", // gitignored; optional
+})
+```
+
+```typescript zenbu.local.ts theme={null}
+import type { LocalPluginsDefault } from "@zenbujs/core/config"
+
+const plugins: LocalPluginsDefault = [
+  "/Users/me/.zenbu/plugins/the-browser-plugin/zenbu.plugin.ts",
+  // or an inline definePlugin({...})
+]
+export default plugins
+```
+
+Rules:
+
+* The default export is a plugin entry, or an array of entries. Same shape as `plugins`.
+* Relative paths inside the overlay anchor to the **overlay file's** directory, not the project root.
+* `localPlugins` accepts a single string or an array of strings (multiple overlays).
+* If the overlay file doesn't exist, the field is silently ignored.
+* Editing the overlay file hot-reloads exactly like editing `zenbu.config.ts`.
+* `zen build:source` / `zen build:electron` / `zen publish:source` **skip** `localPlugins` entirely, so a developer's overlay can never ship in a build artefact.
+
 ## Plugin capabilities
 
 A plugin has the same capabilities as the host application:
@@ -516,9 +636,7 @@ A plugin has the same capabilities as the host application:
 * **Services** run in the main process and expose methods via RPC.
 * **Database schemas** define sections of the shared database.
 * **Events** can be emitted and listened to across plugins.
-* **Views** are iframe-mounted renderer entry points other plugins can embed.
-* **Content scripts** inject JavaScript into any view.
-* **Advice** lets a plugin wrap or replace any React component in the renderer.
+* **[Injections](/core/injections)** are the unified renderer-side surface. One primitive (`this.inject(...)` / `useRegisterInjection(...)`) covers React components other plugins can render via `<View>`, plain side-effect modules (the old "content script" pattern), plain functions/values, and [advice](/core/advice) (sugar for wrapping or replacing an existing export).
 
 ## Type dependencies
 
@@ -571,7 +689,7 @@ Under the hood, communication happens over a WebSocket, which means the same RPC
 Services are scoped under their owning plugin's name. For a plugin named `app`, the call site is `rpc.app.<service>.<method>(...)`. Core's own services live under `rpc.core.<service>`.
 
 ```typescript theme={null}
-// Main process — declared inside the `app` plugin
+// Main process. Declared inside the `app` plugin.
 export class MathService extends Service.create({
   key: "math",
 }) {
@@ -689,15 +807,17 @@ Services declare dependencies on other services through the `deps` field. The fr
 import { Service } from "@zenbujs/core/runtime"
 import { WindowService } from "@zenbujs/core/services"
 
-export class AppService extends Service.create({
-  key: "app",
+export class InitService extends Service.create({
+  key: "init",
   deps: { window: WindowService },
 }) {
   async evaluate() {
-    await this.ctx.window.openView({ type: "entrypoint" })
+    await this.ctx.window.openWindow({})
   }
 }
 ```
+
+`openWindow({})` boots a main window pointed at your `uiEntrypoint`. Pass `injection: "<name>"` to open a window whose entry route renders a specific [injection](/core/injections) instead.
 
 By the time `evaluate()` runs, all dependencies in `this.ctx` are fully initialized.
 
@@ -841,13 +961,13 @@ Inside `update()`, you mutate the root object directly, the same way you would w
 
 Regular data fields are always held in memory across every process. Collections are for data that can grow large (like agent messages or logs) and should only be loaded into memory when needed.
 
-Define a collection in your schema with `f.collection()`:
+Define a collection in your schema with `collection(...)`:
 
 ```typescript src/main/schema.ts theme={null}
-import { createSchema, f, z } from "@zenbujs/core/db"
+import { createSchema, collection, z } from "@zenbujs/core/db"
 
 export default createSchema({
-  messages: f.collection(
+  messages: collection(
     z.object({
       text: z.string(),
       author: z.string(),
@@ -896,13 +1016,13 @@ Collection data is only loaded into memory when you subscribe or read from it. T
 
 Blobs store binary data (`Uint8Array`) like files or images. Like collections, they live on disk and are only loaded into memory when you read them.
 
-Define a blob in your schema with `f.blob()`:
+Define a blob in your schema with `blob(...)`:
 
 ```typescript src/main/schema.ts theme={null}
-import { createSchema, f, z } from "@zenbujs/core/db"
+import { createSchema, blob, z } from "@zenbujs/core/db"
 
 export default createSchema({
-  avatar: f.blob({ debugName: "avatar" }),
+  avatar: blob({ debugName: "avatar" }),
 })
 ```
 
@@ -976,69 +1096,82 @@ Source: https://zenbulabs.mintlify.app/core/views
 
 
 
-<Warning>The Views API is under construction</Warning>
+`<View>` renders an [injection](/core/injections) as React. The injection registry is the source of truth. `<View name="...">` looks up the component registered under `name` (by a service's `this.inject(...)` or by `useRegisterInjection(...)`) and mounts it inside the host tree.
 
-A view is the rendering primitive in Zenbu.js. Every page your app renders is a view, including the main application itself, which is a view called `entrypoint` defined by your `uiEntrypoint` config.
-
-The `entrypoint` view runs directly in the renderer process. Additional views run in [out of process iframes](https://www.chromium.org/developers/design-documents/oop-iframes/), and connect to the same [RPC](/core/rpc), [events](/core/events), and [database](/core/state).
-
-Additional views are useful for:
-
-* Letting a plugin embed content into your app.
-* Isolating heavy features so a slow render in one view doesn't block the rest of the app.
-* Letting teams or plugins develop parts of the app independently.
-
-## Registering a view
-
-From a service, use `ViewRegistryService` to register a view type:
-
-```typescript theme={null}
-import path from "node:path"
-import { fileURLToPath } from "node:url"
-import { Service } from "@zenbujs/core/runtime"
-import { ViewRegistryService } from "@zenbujs/core/services"
-
-export class TerminalService extends Service.create({
-  key: "terminal",
-  deps: { viewRegistry: ViewRegistryService },
-}) {
-  async evaluate() {
-    const here = path.dirname(fileURLToPath(import.meta.url))
-    const viewRoot = path.resolve(here, "..", "..", "views", "terminal")
-    await this.ctx.viewRegistry.register({
-      type: "terminal",
-      root: viewRoot,
-      configFile: false,
-      meta: { kind: "view", label: "Terminal" },
-    })
-  }
-}
-```
-
-The view directory must contain an `index.html` and a `main.tsx` that mounts a React tree wrapped in `<ZenbuProvider>`.
+There's no separate "view registry", no iframes, no per-view Vite server. Everything is one React tree under `<ZenbuProvider>`, sharing the host's RPC, events, DB, theme, and CSS.
 
 ## Embedding a view
 
 ```tsx theme={null}
 import { View } from "@zenbujs/core/react"
 
-<View type="terminal" args={{ tabId }} />
+<View
+  name="terminal"
+  args={{ tabId }}
+  fallback={<Spinner />}
+/>
 ```
+
+| Prop                 | Meaning                                                                                                                                  |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`               | Injection name to render. Required.                                                                                                      |
+| `args`               | Object forwarded as the `args` prop and on `useViewArgs()`.                                                                              |
+| `visible`            | When `false`, hides the wrapper via `display: none` without unmounting. Use it to preserve in-component state across visibility toggles. |
+| `fallback`           | Rendered while no injection has registered under `name`.                                                                                 |
+| `className`, `style` | Forwarded to the wrapper.                                                                                                                |
+
+If no injection has registered yet, `<View>` renders the `fallback`
+(an empty `<span data-zenbu-view-pending={name}>` if you don't pass
+one). Once a registration lands, it swaps in automatically.
 
 ## Reading view args
 
-Inside the child view, use `useViewArgs` to read the args passed by the parent:
+Inside the rendered component, both the `args` prop and the
+`useViewArgs()` hook are populated with the same object:
 
 ```tsx theme={null}
-import { useViewArgs } from "@zenbujs/core/react"
+import { useViewArgs, type ViewComponentProps } from "@zenbujs/core/react"
 
-function TerminalApp() {
-  const { tabId } = useViewArgs<{ tabId: string }>()
-  // ...
+export default function TerminalApp({ args }: ViewComponentProps<{ tabId: string }>) {
+  // Either of these works:
+  const fromProps = args.tabId
+  const fromHook = useViewArgs<{ tabId: string }>().tabId
+  // …
 }
 ```
 
-When the parent updates `args`, the hook re-renders with the new values.
+`useViewArgs` is the convenient escape hatch for deeply nested children that don't want to thread `args` down manually. The hook re-renders when the parent `<View>` passes a new `args` object.
+
+## Registering the component a view renders
+
+A view is just an injection. Use the API that fits your situation:
+
+* **Inside a service** (most plugins): `this.inject({ name, modulePath, meta })` from [Injections](/core/injections).
+* **From the React tree**: `useRegisterInjection(name, Component, meta)`.
+
+```typescript theme={null}
+// From a service.
+this.setup("inject", () =>
+  this.inject({
+    name: "terminal",
+    modulePath: "./src/views/terminal-view.tsx",
+    meta: { kind: "bottom-panel", label: "Terminal" },
+  }),
+)
+```
+
+```tsx theme={null}
+// From React.
+useRegisterInjection("terminal", TerminalView, {
+  kind: "bottom-panel",
+  label: "Terminal",
+})
+```
+
+## See also
+
+* [Injections](/core/injections) for the full registration surface and `meta` conventions.
+* [Advice](/core/advice) for wrapping or replacing another plugin's view.
 
 
 # Releasing to Production
@@ -1386,9 +1519,9 @@ my-app/
 ├── tsconfig.json
 └── src/
     ├── main/
-    │   ├── schema.ts     # Zod schema for the database
     │   └── services/
-    │       └── app.ts    # Opens the main window on boot
+    │       ├── init.ts   # Opens the main window on boot
+    │       └── cwd.ts    # RPC service that returns process.cwd()
     └── renderer/
         ├── index.html
         ├── main.tsx
@@ -1401,17 +1534,17 @@ The `zenbu.config.ts` file is the entry point. It tells Zenbu.js where everythin
 import { defineConfig, definePlugin } from "@zenbujs/core/config"
 
 export default defineConfig({
-  db: "./.zenbu/db",
   uiEntrypoint: "./src/renderer",
   plugins: [
     definePlugin({
       name: "app",
       services: ["./src/main/services/*.ts"],
-      schema: "./src/main/schema.ts",
     }),
   ],
 })
 ```
+
+Add a `schema: "./src/main/schema.ts"` field to the plugin when you're ready to introduce a database. The top-level `db` field is optional and defaults to `./.zenbu/db`.
 
 ## Available scripts
 
