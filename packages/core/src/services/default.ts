@@ -24,5 +24,6 @@ export async function defaultServices(): Promise<void> {
     bootTrace.span("import:./updater", () => import("./updater")),
     bootTrace.span("import:./plugin-updater", () => import("./plugin-updater")),
     bootTrace.span("import:./shortcuts", () => import("./shortcuts")),
+    bootTrace.span("import:./plugin-manager", () => import("./plugin-manager")),
   ]);
 }

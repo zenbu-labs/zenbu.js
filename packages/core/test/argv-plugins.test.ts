@@ -10,17 +10,15 @@ import {
 } from "../src/cli/lib/load-config"
 
 /**
- * Tests for the `--plugin=<path>` argv loader path added alongside
- * `localPlugins`. The flag is the runtime contract the in-app
- * "Run in Dev" button relies on \u2014 the host spawns itself with
- * `--plugin=<manifest>` and the framework loads that plugin
- * alongside the configured set.
+ * Tests for the `--plugin=<path>` argv loader path. The flag is the
+ * runtime contract the in-app "Run in Dev" button relies on — the host
+ * spawns itself with `--plugin=<manifest>` and the framework loads
+ * that plugin alongside whatever the JSONC manifests declare.
  *
  * The unit-level checks (`collectArgvPlugins`) are cheap and
  * deterministic; the integration check (`loadConfig`) writes a
- * tiny zenbu.config + plugin manifest into `os.tmpdir()` and runs
- * the loader end-to-end so we exercise the resolve-and-validate
- * path, including the "file doesn't exist" failure mode.
+ * tiny `zenbu.config.ts` + `zenbu.plugins.jsonc` + plugin manifest
+ * into `os.tmpdir()` and runs the loader end-to-end.
  */
 
 describe("collectArgvPlugins", () => {
@@ -31,23 +29,17 @@ describe("collectArgvPlugins", () => {
     ).toEqual([])
   })
 
-  it("extracts a single --plugin path", () => {
-    expect(
-      collectArgvPlugins(["node", "main.mjs", "--plugin=/abs/path.ts"]),
-    ).toEqual(["/abs/path.ts"])
-  })
-
-  it("extracts multiple --plugin paths in argv order", () => {
+  it("captures every --plugin= value in order", () => {
     expect(
       collectArgvPlugins([
-        "--plugin=/a/zenbu.plugin.ts",
-        "--project=/proj",
-        "--plugin=./relative/zenbu.plugin.ts",
+        "--plugin=./a.ts",
+        "--something=else",
+        "--plugin=/abs/b.ts",
       ]),
-    ).toEqual(["/a/zenbu.plugin.ts", "./relative/zenbu.plugin.ts"])
+    ).toEqual(["./a.ts", "/abs/b.ts"])
   })
 
-  it("ignores empty values (e.g. `--plugin=` with no value)", () => {
+  it("ignores empty values", () => {
     expect(
       collectArgvPlugins(["--plugin=", "--plugin=ok.ts"]),
     ).toEqual(["ok.ts"])
@@ -59,9 +51,6 @@ describe("loadConfig --plugin= integration", () => {
   let originalArgv: string[]
   let originalCwd: string
 
-  // Resolve once: the config file the sandbox writes imports
-  // `defineConfig` / `definePlugin` by absolute path so it works
-  // regardless of where the tmpdir lives.
   const configModuleAbs = path.resolve(
     __dirname,
     "..",
@@ -73,21 +62,31 @@ describe("loadConfig --plugin= integration", () => {
     sandbox = await fsp.mkdtemp(
       path.join(os.tmpdir(), "zenbu-argv-plugins-"),
     )
-    // Minimal project: config + uiEntrypoint + one inline plugin so the
-    // happy path returns a usable ResolvedConfig.
     await fsp.mkdir(path.join(sandbox, "ui"), { recursive: true })
     await fsp.writeFile(
       path.join(sandbox, "ui", "index.html"),
       "<!doctype html><html><body></body></html>",
     )
+    // Base plugin file referenced by the tracked manifest.
+    await fsp.writeFile(
+      path.join(sandbox, "base.plugin.ts"),
+      `import { definePlugin } from "${configModuleAbs}"\n` +
+        `export default definePlugin({ name: "base", services: [] })\n`,
+    )
+    await fsp.writeFile(
+      path.join(sandbox, "zenbu.plugins.jsonc"),
+      JSON.stringify(
+        { plugins: [{ path: "./base.plugin.ts", enabled: true }] },
+        null,
+        2,
+      ),
+    )
     await fsp.writeFile(
       path.join(sandbox, "zenbu.config.ts"),
-      `import { defineConfig, definePlugin } from "${configModuleAbs}"\n` +
+      `import { defineConfig } from "${configModuleAbs}"\n` +
         `export default defineConfig({\n` +
         `  uiEntrypoint: "./ui",\n` +
-        `  plugins: [\n` +
-        `    definePlugin({ name: "base", services: [] }),\n` +
-        `  ],\n` +
+        `  pluginsFiles: ["./zenbu.plugins.jsonc"],\n` +
         `})\n`,
     )
     originalArgv = process.argv.slice()
@@ -102,9 +101,7 @@ describe("loadConfig --plugin= integration", () => {
     }
   })
 
-  it("loads a --plugin=<absolute path> alongside the configured plugins", async () => {
-    // Drop an extra plugin manifest somewhere off-tree to make sure
-    // we resolve absolute paths and the result lands in `plugins[]`.
+  it("loads a --plugin=<absolute path> alongside the manifest plugins", async () => {
     const extra = path.join(sandbox, "extra.plugin.ts")
     await fsp.writeFile(
       extra,
@@ -115,7 +112,7 @@ describe("loadConfig --plugin= integration", () => {
     process.argv = [...originalArgv, `--plugin=${extra}`]
     const { resolved, pluginSourceFiles } = await loadConfig(sandbox)
 
-    expect(resolved.plugins.map(p => p.name)).toEqual(["base", "extra"])
+    expect(resolved.plugins.map((p) => p.name)).toEqual(["base", "extra"])
     expect(pluginSourceFiles).toContain(extra)
   })
 
@@ -124,9 +121,7 @@ describe("loadConfig --plugin= integration", () => {
       ...originalArgv,
       `--plugin=${path.join(sandbox, "does-not-exist.plugin.ts")}`,
     ]
-    await expect(loadConfig(sandbox)).rejects.toThrow(
-      /does not exist/,
-    )
+    await expect(loadConfig(sandbox)).rejects.toThrow(/does not exist/)
   })
 
   it("hard-fails when --plugin= points at a non-.ts/.js file", async () => {
@@ -138,7 +133,7 @@ describe("loadConfig --plugin= integration", () => {
     )
   })
 
-  it("skips --plugin= when called with skipLocalPlugins (build path)", async () => {
+  it("skips --plugin= when called with skipLocalManifests (build path)", async () => {
     const extra = path.join(sandbox, "extra.plugin.ts")
     await fsp.writeFile(
       extra,
@@ -147,8 +142,146 @@ describe("loadConfig --plugin= integration", () => {
     )
     process.argv = [...originalArgv, `--plugin=${extra}`]
     const { resolved } = await loadConfig(sandbox, {
-      skipLocalPlugins: true,
+      skipLocalManifests: true,
     })
-    expect(resolved.plugins.map(p => p.name)).toEqual(["base"])
+    expect(resolved.plugins.map((p) => p.name)).toEqual(["base"])
+  })
+})
+
+describe("loadConfig JSONC manifest semantics", () => {
+  let sandbox: string
+  const configModuleAbs = path.resolve(__dirname, "..", "src", "config.ts")
+
+  beforeEach(async () => {
+    sandbox = await fsp.mkdtemp(
+      path.join(os.tmpdir(), "zenbu-jsonc-manifests-"),
+    )
+    await fsp.mkdir(path.join(sandbox, "ui"), { recursive: true })
+    await fsp.writeFile(
+      path.join(sandbox, "ui", "index.html"),
+      "<!doctype html><html><body></body></html>",
+    )
+    await fsp.writeFile(
+      path.join(sandbox, "a.plugin.ts"),
+      `import { definePlugin } from "${configModuleAbs}"\n` +
+        `export default definePlugin({ name: "a", services: [] })\n`,
+    )
+    await fsp.writeFile(
+      path.join(sandbox, "b.plugin.ts"),
+      `import { definePlugin } from "${configModuleAbs}"\n` +
+        `export default definePlugin({ name: "b", services: [] })\n`,
+    )
+    await fsp.writeFile(
+      path.join(sandbox, "zenbu.config.ts"),
+      `import { defineConfig } from "${configModuleAbs}"\n` +
+        `export default defineConfig({\n` +
+        `  uiEntrypoint: "./ui",\n` +
+        `  pluginsFiles: ["./tracked.jsonc", "./local.jsonc"],\n` +
+        `})\n`,
+    )
+  })
+
+  afterEach(async () => {
+    await fsp.rm(sandbox, { recursive: true, force: true })
+  })
+
+  it("tolerates comments and trailing commas", async () => {
+    await fsp.writeFile(
+      path.join(sandbox, "tracked.jsonc"),
+      `// header comment\n` +
+        `{\n` +
+        `  /* both kinds of comments */\n` +
+        `  "plugins": [\n` +
+        `    { "path": "./a.plugin.ts", "enabled": true, }, // trailing comma\n` +
+        `  ],\n` +
+        `}\n`,
+    )
+    const { resolved } = await loadConfig(sandbox)
+    expect(resolved.plugins.map((p) => p.name)).toEqual(["a"])
+  })
+
+  it("filters out entries with enabled: false", async () => {
+    await fsp.writeFile(
+      path.join(sandbox, "tracked.jsonc"),
+      JSON.stringify(
+        {
+          plugins: [
+            { path: "./a.plugin.ts", enabled: true },
+            { path: "./b.plugin.ts", enabled: false },
+          ],
+        },
+        null,
+        2,
+      ),
+    )
+    const { resolved } = await loadConfig(sandbox)
+    expect(resolved.plugins.map((p) => p.name)).toEqual(["a"])
+  })
+
+  it("local manifest overrides tracked manifest's enabled flag", async () => {
+    await fsp.writeFile(
+      path.join(sandbox, "tracked.jsonc"),
+      JSON.stringify(
+        { plugins: [{ path: "./a.plugin.ts", enabled: true }] },
+        null,
+        2,
+      ),
+    )
+    await fsp.writeFile(
+      path.join(sandbox, "local.jsonc"),
+      JSON.stringify(
+        { plugins: [{ path: "./a.plugin.ts", enabled: false }] },
+        null,
+        2,
+      ),
+    )
+    const { resolved } = await loadConfig(sandbox)
+    expect(resolved.plugins).toEqual([])
+  })
+
+  it("watches missing manifest files for creation", async () => {
+    await fsp.writeFile(
+      path.join(sandbox, "tracked.jsonc"),
+      JSON.stringify(
+        { plugins: [{ path: "./a.plugin.ts", enabled: true }] },
+        null,
+        2,
+      ),
+    )
+    // local.jsonc deliberately absent
+    const { pluginSourceFiles } = await loadConfig(sandbox)
+    expect(pluginSourceFiles).toContain(path.join(sandbox, "local.jsonc"))
+  })
+
+  it("passes args through to ResolvedPlugin", async () => {
+    await fsp.writeFile(
+      path.join(sandbox, "tracked.jsonc"),
+      JSON.stringify(
+        {
+          plugins: [
+            { path: "./a.plugin.ts", enabled: true, args: { x: 42 } },
+          ],
+        },
+        null,
+        2,
+      ),
+    )
+    const { resolved } = await loadConfig(sandbox)
+    expect(resolved.plugins[0]!.args).toEqual({ x: 42 })
+  })
+
+  it("rejects the legacy `plugins` array with a migration hint", async () => {
+    await fsp.writeFile(
+      path.join(sandbox, "zenbu.config.ts"),
+      `import { defineConfig, definePlugin } from "${configModuleAbs}"\n` +
+        `export default defineConfig({\n` +
+        `  uiEntrypoint: "./ui",\n` +
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        `  plugins: [definePlugin({ name: "a", services: [] })],\n` +
+        `} as any)\n`,
+    )
+    await expect(loadConfig(sandbox)).rejects.toThrow(
+      /\`plugins\` array is no longer supported/,
+    )
   })
 })

@@ -39,6 +39,7 @@ import {
 import {
   migrationPlugin,
   sectionMigrationPlugin,
+  runSectionMigrations,
 } from "../core-plugins/migration";
 
 export type { DbPlugin, PluginContext } from "./handlers/plugins";
@@ -61,6 +62,13 @@ export type CreateDbConfig<TShape extends SchemaShape = SchemaShape> = {
 export type Db<TShape extends SchemaShape = SchemaShape> = {
   postMessage: (event: ServerEvent) => Promise<void>;
   reconnectClients: () => Promise<void>;
+  addSection: (section: SectionConfig) => Promise<void>;
+  removeSection: (
+    name: string,
+    opts?: { deleteData?: boolean },
+  ) => Promise<void>;
+  /** Snapshot of currently-registered section names. */
+  listSections: () => string[];
   /**
    * Drain the lagged-persistence queue: writes that were applied to the
    * in-memory root cache but not yet committed to disk. Idempotent and
@@ -252,9 +260,7 @@ const buildSchemaRoot = function* (
       const blobId = nanoid();
       const debugName =
         (fs_obj.debugName as string | undefined) ??
-        ((entry as Record<string, unknown>)?.debugName as
-          | string
-          | undefined) ??
+        ((entry as Record<string, unknown>)?.debugName as string | undefined) ??
         key;
       root[key] = { blobId, debugName };
       yield* createBlob({ fs, config, blobId, data: new Uint8Array(0) });
@@ -301,7 +307,12 @@ const finalizeAndWriteRoot = function* (
     yield* createCollection({ fs, config, collectionId });
   }
 
-  yield* writeJsonFile({ fs, config, path: paths.root({ config }), data: finalRoot });
+  yield* writeJsonFile({
+    fs,
+    config,
+    path: paths.root({ config }),
+    data: finalRoot,
+  });
 };
 
 const initializeDbIfNeeded = (
@@ -417,6 +428,16 @@ const createDbEffect = <TShape extends SchemaShape>(
     const blobMutex = yield* Effect.makeSemaphore(1);
     const latch = yield* Effect.makeLatch(false);
 
+    // Tracks which sections are currently registered. Populated at boot
+    // from `userConfig.sections` and mutated by `addSection` /
+    // `removeSection` at runtime. Read by `listSections` and used by
+    // `addSection`'s idempotency check.
+    const currentSections = yield* Ref.make(
+      new Map<string, SectionConfig>(
+        (userConfig.sections ?? []).map((s) => [s.name, s]),
+      ),
+    );
+
     // Hydrate the in-memory root cache from disk. Must run AFTER
     // `initializeDbIfNeeded` (which writes the initial root if missing) so
     // there's something to read; runs BEFORE `runPlugins` (which executes
@@ -454,10 +475,15 @@ const createDbEffect = <TShape extends SchemaShape>(
           case "read":
             return yield* handleRead(ctx, event);
         }
-      }).pipe(Effect.catchAll((err) => {
-        console.error("[kyju:db] unhandled error in postMessage handler:", err);
-        return Effect.void;
-      }));
+      }).pipe(
+        Effect.catchAll((err) => {
+          console.error(
+            "[kyju:db] unhandled error in postMessage handler:",
+            err,
+          );
+          return Effect.void;
+        }),
+      );
 
     const reconnectClientsEffect = Effect.gen(function* () {
       const sessions = yield* Ref.get(sessionsRef);
@@ -495,6 +521,178 @@ const createDbEffect = <TShape extends SchemaShape>(
     const client = createClient<TShape>(localReplica);
     const effectClient = createEffectClient<TShape>(localReplica);
 
+    // -----------------------------------------------------------------
+    //                  Runtime section add / remove
+    // -----------------------------------------------------------------
+    //
+    // Concurrency model: addSection / removeSection serialize against
+    // each other (one at a time per Db instance). Inside, each
+    // sub-operation (schema init, individual migrations) goes through
+    // `client.update` which acquires `rootMutex` per write — those are
+    // the only writes that need to be atomic. We deliberately do NOT
+    // hold rootMutex across the whole addSection because
+    // `runSectionMigrations` itself issues many writes via
+    // `client.update`, and holding the mutex outside would deadlock
+    // each inner acquire.
+    //
+    // A simple promise-chain serializes section operations. Calls
+    // queue behind the most recent in-flight op; same-name concurrent
+    // calls thus naturally collapse to the idempotency check in turn.
+    let sectionOpsChain: Promise<void> = Promise.resolve();
+    const enqueueSectionOp = <T>(op: () => Promise<T>): Promise<T> => {
+      const next = sectionOpsChain.then(op, op);
+      sectionOpsChain = next.then(
+        () => {},
+        () => {},
+      );
+      return next;
+    };
+
+    const sectionsEqualByMigrations = (
+      a: SectionConfig,
+      b: SectionConfig,
+    ): boolean => {
+      if (a.migrations.length !== b.migrations.length) return false;
+      for (let i = 0; i < a.migrations.length; i++) {
+        if (
+          (a.migrations[i] as { version?: unknown })?.version !==
+          (b.migrations[i] as { version?: unknown })?.version
+        ) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    /**
+     * Initialize a section's slot in `root` from its schema. Uses the
+     * same `buildSchemaRoot` + collection-bootstrap path the
+     * construction-time initializer uses, then writes the result via
+     * `client.update` so connected replicas observe a normal
+     * `db-update` for the new top-level key.
+     */
+    const initSectionRootEffect = (section: SectionConfig) =>
+      Effect.gen(function* () {
+        const built = yield* buildSchemaRoot(fs, config, section.schema);
+        // Walk the built object the same way `finalizeAndWriteRoot`
+        // does so any nested collections get real ids + on-disk
+        // bootstrap before we publish the section to clients.
+        const pendingCollections: Array<{ collectionId: string }> = [];
+        const initNestedCollections = (obj: any): any => {
+          if (obj == null || typeof obj !== "object") return obj;
+          if (Array.isArray(obj)) return obj.map(initNestedCollections);
+          if (
+            typeof obj.collectionId === "string" &&
+            typeof obj.debugName === "string" &&
+            !obj.collectionId
+          ) {
+            const collectionId = nanoid();
+            pendingCollections.push({ collectionId });
+            return { ...obj, collectionId };
+          }
+          const result: Record<string, any> = {};
+          for (const [k, v] of Object.entries(obj)) {
+            result[k] = initNestedCollections(v);
+          }
+          return result;
+        };
+        const finalBuilt = initNestedCollections(built);
+        for (const { collectionId } of pendingCollections) {
+          yield* createCollection({ fs, config, collectionId });
+        }
+        // Publish via the normal write path — client.update goes
+        // through handleWrite, which acquires rootMutex internally
+        // and broadcasts the change to every connected replica as
+        // an ordinary `db-update` event. Replicas merge the new
+        // top-level key into their local root with no special
+        // protocol handling.
+        yield* Effect.promise(() =>
+          client.update((r: any) => {
+            r[section.name] = finalBuilt;
+          }),
+        );
+      });
+
+    const addSectionEffect = (section: SectionConfig) =>
+      Effect.gen(function* () {
+        if (section.name === "_plugins") {
+          throw new Error(
+            `Section name "_plugins" is reserved by kyju (bookkeeping namespace).`,
+          );
+        }
+        const current = yield* Ref.get(currentSections);
+        const existing = current.get(section.name);
+        if (existing) {
+          if (sectionsEqualByMigrations(existing, section)) {
+            // Idempotent no-op.
+            return;
+          }
+          throw new Error(
+            `Section "${section.name}" is already registered with different migrations. ` +
+              `Call removeSection() first if you intend to replace it.`,
+          );
+        }
+
+        // 1. Initialize the section's slot in root if it doesn't already
+        //    exist. (It can already exist if the section was previously
+        //    removed with `deleteData: false`, in which case data
+        //    + migration bookkeeping should be preserved.)
+        const rootSnapshot = yield* rootCache.read();
+        const alreadyOnDisk =
+          (rootSnapshot as Record<string, unknown>)[section.name] !== undefined;
+        if (!alreadyOnDisk) {
+          yield* initSectionRootEffect(section);
+        }
+
+        // 2. Run any pending migrations. Idempotent: if the section was
+        //    already migrated to head (from a previous run that
+        //    persisted bookkeeping), this returns immediately.
+        yield* Effect.promise(() =>
+          runSectionMigrations({
+            section,
+            client,
+            pluginPath: ["_plugins", "sectionMigrator"],
+          }),
+        );
+
+        // 3. Register in the in-memory section map.
+        yield* Ref.update(currentSections, (m) =>
+          new Map(m).set(section.name, section),
+        );
+      });
+
+    const removeSectionEffect = (
+      name: string,
+      opts: { deleteData?: boolean } = {},
+    ) =>
+      Effect.gen(function* () {
+        const current = yield* Ref.get(currentSections);
+        if (!current.has(name)) return; // unknown name — no-op
+
+        if (opts.deleteData) {
+          // Wipe both the section's data slot and its migration
+          // bookkeeping so a future addSection re-runs from scratch.
+          yield* Effect.promise(() =>
+            client.update((r: any) => {
+              delete r[name];
+              if (
+                r._plugins &&
+                r._plugins.sectionMigrator &&
+                r._plugins.sectionMigrator[name]
+              ) {
+                delete r._plugins.sectionMigrator[name];
+              }
+            }),
+          );
+        }
+        // Always drop from the in-memory registry.
+        yield* Ref.update(currentSections, (m) => {
+          const next = new Map(m);
+          next.delete(name);
+          return next;
+        });
+      });
+
     // Best-effort lock release on hard process exit (Ctrl+C, kill -TERM,
     // unhandled exception). Won't run on `kill -9` — that's why the next
     // boot also tolerates a stale lock whose PID is dead. The exit hook
@@ -526,6 +724,22 @@ const createDbEffect = <TShape extends SchemaShape>(
         Effect.runPromise(postMessageEffect(event)),
       reconnectClients: (): Promise<void> =>
         Effect.runPromise(reconnectClientsEffect),
+      addSection: (section: SectionConfig): Promise<void> =>
+        enqueueSectionOp(() => Effect.runPromise(addSectionEffect(section))),
+      removeSection: (
+        name: string,
+        opts?: { deleteData?: boolean },
+      ): Promise<void> =>
+        enqueueSectionOp(() =>
+          Effect.runPromise(removeSectionEffect(name, opts)),
+        ),
+      listSections: (): string[] => {
+        // Synchronous snapshot — a `Ref.unsafeGet` would be ideal but
+        // we use the runPromise form for consistency. Cheap because
+        // currentSections is a tiny Map.
+        const snap = Effect.runSync(Ref.get(currentSections));
+        return [...snap.keys()];
+      },
       flush: (): Promise<void> => Effect.runPromise(rootCache.flush()),
       close,
       client,

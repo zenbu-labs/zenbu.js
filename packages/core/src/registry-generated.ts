@@ -6,6 +6,7 @@ import type {
   BootTraceService,
   DbService,
   HttpService,
+  PluginManagerService,
   PluginUpdaterService,
   RpcService,
   ServerService,
@@ -41,6 +42,7 @@ export type CoreServiceRouter = {
     bootTrace: ExtractRpcMethods<BootTraceService>;
     db: ExtractRpcMethods<DbService>;
     http: ExtractRpcMethods<HttpService>;
+    pluginManager: ExtractRpcMethods<PluginManagerService>;
     pluginUpdater: ExtractRpcMethods<PluginUpdaterService>;
     rpc: ExtractRpcMethods<RpcService>;
     server: ExtractRpcMethods<ServerService>;

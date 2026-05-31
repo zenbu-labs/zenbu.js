@@ -252,6 +252,7 @@ interface ResolvedPluginRecord {
   preloadPath?: string;
   eventsPath?: string;
   icons?: Record<string, string>;
+  args?: unknown;
 }
 
 interface RegistryPayload {
@@ -662,6 +663,7 @@ function loadImpl(
         } imports, ${watchPaths.size} watches)`,
       );
     }
+
     return {
       format: "module",
       source,

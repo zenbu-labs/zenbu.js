@@ -86,14 +86,23 @@ export const createServer = <
             runtime: options.runtime,
           });
         } catch (err) {
-          console.error(`[zenrpc] request handler failed for ${msg.path?.join(".")}:`, err);
+          /**
+           * this is hacky and should be removed, temporary work around
+           */
+
+          const message = err instanceof Error ? err.message : String(err);
+          const isExpectedRace = /^Method not found:/.test(message);
+          if (!isExpectedRace) {
+            console.error(
+              `[zenrpc] request handler failed for ${msg.path?.join(".")}:`,
+              err,
+            );
+          }
           options.send(
             serialize({
               type: "error-response",
               id: msg.id,
-              error: {
-                message: err instanceof Error ? err.message : String(err),
-              },
+              error: { message },
             }),
             clientId,
           );

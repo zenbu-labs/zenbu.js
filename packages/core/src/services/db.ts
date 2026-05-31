@@ -326,8 +326,16 @@ export class DbService extends Service.create({
 }) {
   db: Db | null = null;
   dbRouter: ReturnType<typeof createRouter> | null = null;
-  private sectionsHash = "";
   private _dbPath: string | null = null;
+  /**
+   * Names of sections currently registered with kyju, mirrored from
+   * the kyju Db. Used by `armPluginSetWatcher` to compute the
+   * add/remove diff when the plugin set changes. Single source of
+   * truth for the in-memory section set lives inside kyju
+   * (`db.listSections()`); this Map is just the cached cross-snapshot
+   * comparison input.
+   */
+  private knownSections = new Map<string, SectionConfig>();
 
   /**
    * Resolved DB path. Throws if accessed before `evaluate()` has run — the
@@ -378,6 +386,28 @@ export class DbService extends Service.create({
   }
 
   async evaluate() {
+    await this.bootDb();
+    this.armKyjuCloseOnCleanup();
+    this.armMigrationsWatcher();
+    this.armPluginSetWatcher();
+    this.armWsTransport();
+  }
+
+  /**
+   * Create the kyju `Db` instance once, with whatever sections the
+   * plugin set currently declares. After this completes, the
+   * instance is alive for the entire lifetime of this DbService
+   * — plugin enable/disable mutates it in place via
+   * `db.addSection` / `db.removeSection` rather than rebuilding,
+   * so existing renderer sessions stay valid across toggles.
+   *
+   * Only the database path itself ever justifies a rebuild (a
+   * different on-disk file is fundamentally a different db). The
+   * dbPath is resolved here once and stashed; changes require a
+   * full process restart, which is the right granularity for that
+   * kind of change.
+   */
+  private async bootDb(): Promise<void> {
     const configPath = resolveConfigPath();
     const configDir = path.dirname(configPath);
     const configDbAbs = await loadAppDbField(configPath);
@@ -391,72 +421,60 @@ export class DbService extends Service.create({
       }),
     ]);
     const sections = [coreSec, ...pluginSections];
-    const sectionsHash = JSON.stringify(
-      sections.map((s) => ({ name: s.name, v: s.migrations.length })),
-    );
     const dbPath = resolved.path;
 
-    if (
-      !this.db ||
-      this.sectionsHash !== sectionsHash ||
-      this._dbPath !== dbPath
-    ) {
-      // If we're replacing an existing Db (sectionsHash or path changed
-      // mid-process), close the old one first so it flushes and releases
-      // its lock-file nonce. Without this, the abandoned Db would still
-      // have its `process.on("exit")` handler attached and could
-      // unintentionally release the lock the new instance is about to
-      // acquire (or vice versa).
-      if (this.db) {
-        try {
-          await this.db.close();
-        } catch (err) {
-          log.error("close of previous db failed:", err);
-        }
-      }
-      this.dbRouter = createRouter();
-      this.db = await this.trace("create-db", () =>
-        createDb({
-          sections,
-          path: dbPath,
-          send: (event) => this.dbRouter!.send(event),
-        }),
-      );
-      this.sectionsHash = sectionsHash;
-      this._dbPath = dbPath;
-      addDb(dbPath).catch((err) => {
-        log.error("failed to bump registry lastUsedAt:", err);
-      });
-      log.verbose(
-        `ready at ${dbPath} (source: ${resolved.source}, sections: ${sections
-          .map((s) => `${s.name}@v${s.migrations.length}`)
-          .join(", ")})`,
-      );
-    }
+    this.dbRouter = createRouter();
+    this.db = await this.trace("create-db", () =>
+      createDb({
+        sections,
+        path: dbPath,
+        send: (event) => this.dbRouter!.send(event),
+      }),
+    );
+    this._dbPath = dbPath;
+    // Seed the section cache so the plugin-set-watcher's initial
+    // "diff against last snapshot" produces an empty delta against
+    // boot (everything in the boot snapshot is already installed).
+    this.knownSections = new Map(sections.map((s) => [s.name, s]));
+    addDb(dbPath).catch((err) => {
+      log.error("failed to bump registry lastUsedAt:", err);
+    });
+    log.verbose(
+      `ready at ${dbPath} (source: ${resolved.source}, sections: ${sections
+        .map((s) => `${s.name}@v${s.migrations.length}`)
+        .join(", ")})`,
+    );
+  }
 
-    const { http } = this.ctx;
-    const wsDbConnections = new Map<
-      string,
-      { receive: (event: any) => Promise<void>; close: () => void }
-    >();
-
-    // On any teardown (hot-reload OR shutdown), drain kyju's lagged
-    // writes AND release the cross-process lock. Without `close()`, in-
-    // memory writes that haven't reached setImmediate's flush would
-    // vanish, AND the next process attempting to open this DB would
-    // either be blocked by a stale lock or (in the same-process re-init
-    // case) would race against the abandoned writer.
+  /**
+   * On any teardown (hot-reload OR shutdown), drain kyju's lagged
+   * writes AND release the cross-process lock. Without `close()`, in-
+   * memory writes that haven't reached setImmediate's flush would
+   * vanish, AND the next process attempting to open this DB would
+   * either be blocked by a stale lock or (in the same-process re-init
+   * case) would race against the abandoned writer.
+   */
+  private armKyjuCloseOnCleanup(): void {
     this.setup("kyju-close-on-cleanup", () => async () => {
       await this.close();
     });
+  }
 
-    // Watch each plugin's migrations directory so `zen db generate` —
-    // which writes a fresh file plus updates `meta/_journal.json` — kicks
-    // DbService into a re-evaluate. Edits to *existing* migration files
-    // are already covered by dynohot's per-file dep tracking; we only
-    // care about adds/removes here, plus journal churn (which fires on
-    // every generate even when paths look unchanged due to atomic
-    // rename-replace writes).
+  /**
+   * Watch each plugin's migrations directory so `zen db generate` —
+   * which writes a fresh file plus updates `meta/_journal.json` —
+   * picks up the newly-generated migration without a process
+   * restart.
+   *
+   * Implementation: re-discover the current section list (which now
+   * has the new migration in its `migrations` array) and re-call
+   * `db.addSection(section)` for each. `addSection` is idempotent
+   * — sections already at head version are a no-op, sections with
+   * pending migrations get them applied in place. No kyju instance
+   * is rebuilt, no sessions are touched, replicas see the migration
+   * writes as ordinary `db-update` events.
+   */
+  private armMigrationsWatcher(): void {
     this.setup("migrations-watcher", () => {
       const subs: AsyncSubscription[] = [];
       let closed = false;
@@ -470,7 +488,9 @@ export class DbService extends Service.create({
           queued = true;
           return;
         }
-        inFlight = runtime.reload("db").catch((err) => {
+        inFlight = (async () => {
+          await this.applyCurrentSectionsToDb("migrations-watcher");
+        })().catch((err) => {
           log.error("migrations-watcher reload failed:", err);
         });
         try {
@@ -557,48 +577,136 @@ export class DbService extends Service.create({
         );
       };
     });
+  }
 
-    // Pick up plugin-set changes from `zenbu.config.ts` (a plugin
-    // added, removed, or its schema/migrations paths swapped). The
-    // plugin barrel auto-re-imports new plugins' service files via
-    // dynohot, but DbService doesn't have an ESM dep on the plugin
-    // registry — `discoverSections` reads `getPlugins()` at evaluate-
-    // time only. Without this watcher, a freshly added plugin's
-    // schema/migrations would never be wired into the DB until some
-    // other change (e.g. editing an existing schema file) happened to
-    // trigger a DbService re-evaluate.
-    //
-    // Hash on `{ name, schemaPath, migrationsPath }` so we react to
-    // both adds/removes and to a plugin pointing at a different
-    // schema/migrations path. Initial subscribe fires synchronously
-    // with the current snapshot — the hash dedup makes that a no-op.
+  /**
+   * Pick up plugin-set changes from `zenbu.config.ts` (a plugin
+   * added, removed, or its schema/migrations paths swapped) and
+   * apply them as a delta against the live kyju Db.
+   *
+   * For each enabled plugin not already registered with kyju:
+   * `db.addSection(...)` (idempotent; if its data slot already
+   * exists on disk from a previous run, it's preserved and only
+   * pending migrations run). For each previously-registered plugin
+   * that disappeared from the snapshot: `db.removeSection(name)`
+   * with the default `deleteData: false`, so the plugin's data
+   * survives the toggle and re-enabling restores it instantly.
+   *
+   * No kyju instance is rebuilt. Renderer sessions stay valid.
+   * Connected replicas observe the section-init writes + any
+   * migration writes as ordinary `db-update` broadcasts.
+   */
+  private armPluginSetWatcher(): void {
     this.setup("plugin-set-watcher", () => {
-      const fingerprint = (snap: { plugins: Array<{ name: string; schemaPath?: string; migrationsPath?: string }> }) =>
-        JSON.stringify(
-          [...snap.plugins]
-            .map((p) => ({
-              name: p.name,
-              schemaPath: p.schemaPath ?? null,
-              migrationsPath: p.migrationsPath ?? null,
-            }))
-            .sort((a, b) => a.name.localeCompare(b.name)),
-        );
-      let lastHash: string | null = null;
-      return subscribeConfig((snap) => {
-        const hash = fingerprint(snap);
-        if (lastHash === null) {
-          lastHash = hash;
+      let initialFire = true;
+      return subscribeConfig(() => {
+        if (initialFire) {
+          // First fire happens synchronously inside subscribeConfig;
+          // boot has already loaded the initial section set.
+          initialFire = false;
           return;
         }
-        if (hash === lastHash) return;
-        lastHash = hash;
-        void runtime.reload("db").catch((err) => {
-          log.error("plugin-set-watcher reload failed:", err);
+        void this.applyCurrentSectionsToDb("plugin-set").catch((err) => {
+          log.error("plugin-set-watcher apply failed:", err);
         });
-      });
+      }, "db/plugin-set-watcher");
     });
+  }
 
+  /**
+   * Re-discover the current section set (from the live
+   * `runtime.getPlugins()` map) and apply the delta to kyju via
+   * `addSection` / `removeSection`. Called by the plugin-set
+   * watcher (when the config changes) and the migrations watcher
+   * (when `zen db generate` lands a new migration file).
+   *
+   * Idempotent and reentrancy-safe: kyju's section ops are
+   * serialized internally, and `addSection` against an already-
+   * registered section with the same migrations is a no-op.
+   */
+  private async applyCurrentSectionsToDb(reason: string): Promise<void> {
+    const db = this.db;
+    if (!db) return;
+    const [coreSec, pluginSections] = await Promise.all([
+      buildCoreSection(),
+      discoverSections(),
+    ]);
+    const next = new Map<string, SectionConfig>(
+      [coreSec, ...pluginSections].map((s) => [s.name, s]),
+    );
+
+    const added: string[] = [];
+    const removed: string[] = [];
+    const changed: string[] = [];
+    for (const [name, section] of next) {
+      const prev = this.knownSections.get(name);
+      if (!prev) {
+        added.push(name);
+        continue;
+      }
+      if (prev.migrations.length !== section.migrations.length) {
+        changed.push(name);
+      }
+    }
+    for (const name of this.knownSections.keys()) {
+      if (!next.has(name)) removed.push(name);
+    }
+
+    if (added.length === 0 && removed.length === 0 && changed.length === 0) {
+      return;
+    }
+    log.verbose(
+      `apply sections (${reason}): +[${added.join(",")}] -[${removed.join(",")}] ~[${changed.join(",")}]`,
+    );
+
+    // For changed migration sets (the same name with more migrations
+    // than we last saw), we need to feed kyju the *new* section
+    // config so its idempotency check uses the new migration list.
+    // `addSection` rejects an already-registered name with different
+    // migrations to catch caller mistakes — so first removeSection
+    // (data-preserving), then addSection with the new config.
+    for (const name of changed) {
+      const section = next.get(name)!;
+      try {
+        await db.removeSection(name);
+        await db.addSection(section);
+      } catch (err) {
+        log.error(`apply sections: re-add "${name}" failed:`, err);
+      }
+    }
+    for (const name of added) {
+      const section = next.get(name)!;
+      try {
+        await db.addSection(section);
+      } catch (err) {
+        log.error(`apply sections: addSection("${name}") failed:`, err);
+      }
+    }
+    for (const name of removed) {
+      try {
+        await db.removeSection(name);
+      } catch (err) {
+        log.error(`apply sections: removeSection("${name}") failed:`, err);
+      }
+    }
+    this.knownSections = next;
+  }
+
+  /**
+   * Wire each ws connection up to the kyju replication router.
+   *
+   * One-shot setup — since kyju is no longer rebuilt on plugin
+   * toggles (it grows/shrinks sections in place via
+   * `addSection`/`removeSection`), the `dbRouter` is stable for the
+   * service's lifetime and the transport never needs to re-arm.
+   */
+  private armWsTransport(): void {
+    const http = this.ctx.http;
     this.setup("ws-transport", () => {
+      const wsDbConnections = new Map<
+        string,
+        { receive: (event: any) => Promise<void>; close: () => void }
+      >();
       const onConnected = (id: string, ws: WebSocket) => {
         const dbConn = this.dbRouter!.connection({
           send: (event: any) => {

@@ -378,12 +378,15 @@ type LoaderData = {
       preloadPath?: string;
       eventsPath?: string;
       icons?: Record<string, string>;
+      args?: unknown;
     }>;
     appEntrypoint: string;
     splashPath?: string;
     installingPath?: string;
   };
   pluginSourceFiles: string[];
+
+  manifestPaths: string[];
 };
 
 /**
@@ -438,12 +441,14 @@ async function loadConfigPhase(
         preloadPath: p.preloadPath,
         eventsPath: p.eventsPath,
         icons: p.icons,
+        args: p.args,
       })),
       appEntrypoint: resolved.uiEntrypointPath,
       splashPath: resolved.splashPath,
       installingPath: resolved.installingPath,
     },
     pluginSourceFiles,
+    manifestPaths: resolved.manifestPaths,
   };
   (
     globalThis as unknown as { __zenbu_main_resolved_config__?: LoaderData }

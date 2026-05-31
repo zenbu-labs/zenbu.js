@@ -10,14 +10,6 @@ import {
   type InjectionEntry,
 } from "./services/advice-config";
 
-/**
- * Wires two things into the host renderer's `<head>`:
- *   1. Inline boot-trace prelude.
- *   2. The injection prelude at `/@injections-prelude` — a virtual
- *      module regenerated from the injection registry on every
- *      registration change.
- */
-
 const PRELUDE_PREFIX = "/@injections-prelude";
 const RESOLVED_PREFIX = "\0@injections-prelude";
 
@@ -68,23 +60,24 @@ function getStaticPreludeBody(): string {
 function buildInlinePreludeScript(): string | null {
   const body = getStaticPreludeBody();
   if (!body) return null;
-  // Boot-trace is the only inline prelude left in one-DOM mode.
-  // Shortcut handling, view-args, and theme forwarding all moved
-  // into the React tree (see `ShortcutDispatcher` in `react.ts`
-  // and the `<View args=>` context in the same file).
   return `${body}\ninstallBootTraceRenderer();`;
 }
 
-/* ---------- Injection prelude codegen ---------- */
-
-/**
- * One import + one dispatch per injection. Advice -> @zenbu/advice/runtime;
- * no-meta / `kind: "bootstrap"` -> bare side-effect import (the module
- * usually has no default export); everything else -> in-renderer
- * `registerInjection(name, value, meta)`.
+/* ---------- Injection prelude codegen ----------
+ *
+ * Generates the body of `@injections-prelude`. Every registration
+ * returns a disposer pushed onto `__zb_disposers`; the module self-
+ * accepts via HMR. On dispose, the disposer array is stashed on
+ * `import.meta.hot.data`; the new module body unwinds the previous
+ * round inside a single `beginInjectionBatch()` and re-registers the
+ * current set so React subscribers see one notification with the
+ * final state.
  */
 function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
-  if (entries.length === 0) return "";
+  if (entries.length === 0) {
+    // Empty → still emit the HMR boundary so N>0 → 0 can dispose.
+    return "if (import.meta.hot) { import.meta.hot.accept() }\n";
+  }
 
   const isBootstrap = (e: InjectionEntry): boolean =>
     e.meta === undefined || e.meta?.kind === "bootstrap";
@@ -98,56 +91,78 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
 
   const imports: string[] = [];
   if (hasAdvice) {
-    imports.push('import { replace, advise } from "@zenbu/advice/runtime"');
-  }
-  if (hasValue) {
     imports.push(
-      'import { registerInjection as __zb_registerInjection } from "@zenbujs/core/react"',
+      'import { replace, unreplace, advise } from "@zenbu/advice/runtime"',
     );
+    // around-advice runs as its own React component (its own fiber)
+    // so its hooks don't shift the advised component's hook indices.
+    imports.push('import { createElement as __zb_createElement } from "react"');
   }
+  const reactImports: string[] = [
+    "  beginInjectionBatch as __zb_beginInjectionBatch,",
+    "  endInjectionBatch as __zb_endInjectionBatch,",
+  ];
+  if (hasValue) {
+    reactImports.unshift("  registerInjection as __zb_registerInjection,");
+  }
+  imports.push(
+    `import {\n${reactImports.join("\n")}\n} from "@zenbujs/core/react"`,
+  );
 
+  const setup: string[] = [
+    "const __zb_prevDisposers = (import.meta.hot && import.meta.hot.data && import.meta.hot.data.__zb_disposers) || []",
+    "const __zb_disposers = []",
+    "__zb_beginInjectionBatch()",
+    "for (const u of __zb_prevDisposers) { try { u() } catch {} }",
+  ];
+  const setupAliases: Array<{ alias: string; index: number }> = [];
   const calls: string[] = [];
+  let needsAroundWrapper = false;
   entries.forEach((entry, i) => {
-    // Side-effect-only: bare `import` (no default binding to fail on).
-    if (isBootstrap(entry)) {
-      imports.push(`import ${JSON.stringify(entry.modulePath)}`);
-      return;
-    }
+    // Namespace import per entry: gives us `.setup` plus `.default` /
+    // `.<named>` for the registered value off the same alias.
+    const ns = `__m${i}`;
+    imports.push(
+      `import * as ${ns} from ${JSON.stringify(entry.modulePath)}`,
+    );
+    setupAliases.push({ alias: ns, index: i });
 
-    const alias = `__i${i}`;
-    if (entry.exportName === "default") {
-      imports.push(
-        `import ${alias} from ${JSON.stringify(entry.modulePath)}`,
-      );
-    } else {
-      imports.push(
-        `import { ${entry.exportName} as ${alias} } from ${JSON.stringify(
-          entry.modulePath,
-        )}`,
-      );
-    }
+    if (isBootstrap(entry)) return; // work lives in `setup`
+
+    const valueExpr =
+      entry.exportName === "default"
+        ? `${ns}.default`
+        : `${ns}.${entry.exportName}`;
 
     if (isAdvice(entry)) {
       const wraps = entry.meta?.wraps as
         | { moduleId: string; name: string }
         | undefined;
       const adviceType = entry.meta?.adviceType as
-        | "replace" | "before" | "after" | "around" | undefined;
-      if (!wraps || !adviceType) {
-        // Misconfigured — keep the import side-effect, skip dispatch.
-        return;
-      }
-      if (adviceType === "replace") {
+        | "replace"
+        | "before"
+        | "after"
+        | "around"
+        | undefined;
+      if (!wraps || !adviceType) return;
+      const modIdLit = JSON.stringify(wraps.moduleId);
+      const nameLit = JSON.stringify(wraps.name);
+      if (adviceType === "around") {
+        needsAroundWrapper = true;
         calls.push(
-          `replace(${JSON.stringify(wraps.moduleId)}, ${JSON.stringify(
-            wraps.name,
-          )}, ${alias})`,
+          `__zb_disposers.push(advise(${modIdLit}, ${nameLit}, "around", __zb_wrapAround(${valueExpr})))`,
+        );
+      } else if (adviceType === "replace") {
+        // `replace` doesn't return a disposer; synthesize one via
+        // `unreplace`. Stack-shaped storage in @zenbu/advice would let
+        // this match `advise()`'s shape — see follow-up.
+        calls.push(`replace(${modIdLit}, ${nameLit}, ${valueExpr})`);
+        calls.push(
+          `__zb_disposers.push(() => unreplace(${modIdLit}, ${nameLit}))`,
         );
       } else {
         calls.push(
-          `advise(${JSON.stringify(wraps.moduleId)}, ${JSON.stringify(
-            wraps.name,
-          )}, ${JSON.stringify(adviceType)}, ${alias})`,
+          `__zb_disposers.push(advise(${modIdLit}, ${nameLit}, ${JSON.stringify(adviceType)}, ${valueExpr}))`,
         );
       }
       return;
@@ -155,11 +170,64 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
 
     const metaLiteral = JSON.stringify(entry.meta);
     calls.push(
-      `__zb_registerInjection(${JSON.stringify(entry.name)}, ${alias}, ${metaLiteral})`,
+      `__zb_disposers.push(__zb_registerInjection(${JSON.stringify(
+        entry.name,
+      )}, ${valueExpr}, ${metaLiteral}))`,
     );
   });
 
-  return imports.join("\n") + "\n" + calls.join("\n") + "\n";
+  // Per (aroundFn, Original) memoized React component. Stable identity
+  // across renders inside one chain incarnation; fresh component when
+  // the chain rebuilds so React mounts/unmounts cleanly.
+  if (needsAroundWrapper) {
+    setup.unshift(
+      "const __zb_aroundCache = new WeakMap()",
+      "function __zb_wrapAround(aroundFn) {",
+      "  return function(Original, props) {",
+      "    let perFn = __zb_aroundCache.get(aroundFn)",
+      "    if (!perFn) { perFn = new WeakMap(); __zb_aroundCache.set(aroundFn, perFn) }",
+      "    let Comp = perFn.get(Original)",
+      "    if (!Comp) {",
+      "      Comp = function (p) { return aroundFn(Original, p) }",
+      "      try { Object.defineProperty(Comp, 'name', { value: aroundFn.name || 'AroundAdvice' }) } catch {}",
+      "      perFn.set(Original, Comp)",
+      "    }",
+      "    return __zb_createElement(Comp, props)",
+      "  }",
+      "}",
+    );
+  }
+
+  // Uniform `setup` hook — runs after prev-disposers + new
+  // registrations. Return value (if a function) is captured as the
+  // next round's disposer. Same shape as `Service.setup(name, () =>
+  // cleanup)` in main-process services.
+  for (const { alias, index } of setupAliases) {
+    calls.push(
+      `if (typeof ${alias}.setup === "function") { const __r${index} = ${alias}.setup(); if (typeof __r${index} === "function") __zb_disposers.push(__r${index}) }`,
+    );
+  }
+
+  const hmrTail = [
+    "__zb_endInjectionBatch()",
+    "if (import.meta.hot) {",
+    // Stash; don't unregister now — that'd commit an empty state
+    // to React before the new body runs.
+    "  import.meta.hot.dispose((data) => { data.__zb_disposers = __zb_disposers })",
+    "  import.meta.hot.accept()",
+    "}",
+  ].join("\n");
+
+  return (
+    imports.join("\n") +
+    "\n" +
+    setup.join("\n") +
+    "\n" +
+    calls.join("\n") +
+    "\n" +
+    hmrTail +
+    "\n"
+  );
 }
 
 export function resolveAdviceRuntime(): Plugin {
@@ -175,10 +243,6 @@ export function resolveAdviceRuntime(): Plugin {
 }
 
 /* ---------- Injection prelude virtual module ---------- */
-
-// Body regenerated on demand from the injection registry.
-// Registration changes call `emitReload()` which invalidates this
-// module and reloads the renderer.
 export function advicePreludePlugin(): Plugin {
   return {
     name: "zenbu-injections-prelude",
@@ -198,8 +262,9 @@ export function advicePreludePlugin(): Plugin {
     },
 
     handleHotUpdate({ file, server }) {
-      // Injection source edits need a full reload — registration is a
-      // side effect of the prelude script that only runs at boot.
+      // Editing an injection's source file needs a full reload —
+      // registration is a side effect of the prelude script that only
+      // runs at boot.
       if (getAllInjectionPaths().includes(file)) {
         server.ws.send({ type: "full-reload" });
         return [];
@@ -227,9 +292,7 @@ export function advicePreludePlugin(): Plugin {
       });
     },
 
-    transformIndexHtml(html, ctx) {
-     
-
+    transformIndexHtml(html) {
       const tags: Array<{
         tag: string;
         attrs?: Record<string, string>;
@@ -237,38 +300,26 @@ export function advicePreludePlugin(): Plugin {
         injectTo: "head" | "head-prepend" | "body" | "body-prepend";
       }> = [];
 
-      // The host renderer's own CSS owns `:root` (shadcn tokens,
-      // etc.) and is loaded by `index.html` directly. No iframe
-      // theme forwarding needed.
-
-      // Boot-trace prelude inlined as one sync `<script>` block.
+      // Boot-trace prelude: inline sync `<script>`. Falls back to the
+      // virtual module path when dist files are missing (cold checkout
+      // before `pnpm build`).
       const inlinePrelude = buildInlinePreludeScript();
-      if (inlinePrelude) {
-        tags.push({
-          tag: "script",
-          children: inlinePrelude,
-          injectTo: "head",
-        });
-      } else {
-        // Fallback: dist files missing (shouldn't happen in dev once
-        // `pnpm build` has run once). Fall back to the virtual module
-        // path so the listeners still install, just slower.
-        tags.push({
-          tag: "script",
-          attrs: { type: "module", src: PRELUDE_PREFIX },
-          injectTo: "head",
-        });
-      }
-
-      // 3. The injection prelude. Imports every registered module
-      //    before `main.tsx` runs, so by the time React mounts the
-      //    in-memory injection registry is fully populated.
+      tags.push(
+        inlinePrelude
+          ? { tag: "script", children: inlinePrelude, injectTo: "head" }
+          : {
+              tag: "script",
+              attrs: { type: "module", src: PRELUDE_PREFIX },
+              injectTo: "head",
+            },
+      );
+      // Injection prelude. Imports every registered module before
+      // `main.tsx` runs so the registry is populated by mount time.
       tags.push({
         tag: "script",
         attrs: { type: "module", src: PRELUDE_PREFIX },
         injectTo: "head",
       });
-
       return { html, tags };
     },
   };
@@ -310,14 +361,11 @@ export function zenbuVitePlugins(): Plugin[] {
   ];
 }
 
-/**
- * Drop Vite's cold-boot `full-reload` ws message when no HMR client is
- * connected yet. The optimizer's first commit races Electron's
- * `loadURL`; the ws message is only useful to clients with already-
- * fetched bundle URLs, and `moduleGraph.invalidateAll()` already ran
- * server-side. Gating on `clients.size === 0` keeps later edits
- * working normally.
- */
+// Drop Vite's cold-boot `full-reload` ws message when no HMR client
+// is connected. The optimizer's first commit races Electron's
+// `loadURL`; the message is only useful to clients with already-
+// fetched bundle URLs. Gating on `clients.size === 0` keeps later
+// edits working normally.
 function bootReloadGuardPlugin(): Plugin {
   return {
     name: "zenbu-boot-reload-guard",
@@ -336,23 +384,20 @@ function bootReloadGuardPlugin(): Plugin {
           p &&
           typeof p === "object" &&
           (p as { type?: string }).type === "full-reload";
-        if (isFullReload && (ws.clients?.size ?? 0) === 0) {
-          // No client connected → no stale URLs to invalidate.
-          return undefined as unknown as void;
-        }
+        if (isFullReload && (ws.clients?.size ?? 0) === 0) return;
         return orig(...args);
       }) as typeof ws.send;
     },
   };
 }
 
-/* ---------- Tailwind @source registry for component-mode plugins ----
+/* ---------- Tailwind @source registry ----------
  *
- * Backs `@import "@zenbujs/core/plugin-sources.css"`. Writes a list of
- * Tailwind v4 `@source` directives — one per registered plugin's
- * `src/**` tree — to a per-host sidecar file under `node_modules/.zenbu/`.
- * Aliased via vite `resolve.alias` so each worktree gets its own file
- * (sharing one in core's dist caused cross-worktree HMR reloads).
+ * Backs `@import "@zenbujs/core/plugin-sources.css"`. Writes Tailwind
+ * v4 `@source` directives — one per registered plugin's `src/**` —
+ * to a per-host sidecar file under `node_modules/.zenbu/`. Aliased so
+ * each worktree gets its own file (sharing one in core's dist caused
+ * cross-worktree HMR reloads).
  */
 
 const PLUGIN_SOURCES_EXTS = "{ts,tsx,js,jsx,mts,mjs,cjs}";
@@ -437,8 +482,14 @@ export function pluginSourcesCssPlugin(): Plugin {
           primed = true;
           return;
         }
-        if (changed) server.ws.send({ type: "full-reload" });
-      });
+        if (!changed) return;
+        // CSS HMR via `reloadModule` patches the stylesheet in place.
+        // Avoids a `full-reload` that would close+reopen the window.
+        try {
+          const mod = server.moduleGraph.getModuleById(sourcesFile);
+          if (mod) server.reloadModule(mod);
+        } catch {}
+      }, "vite-plugins/pluginSourcesCss");
     },
 
     buildStart() {

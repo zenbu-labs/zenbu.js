@@ -842,6 +842,14 @@ export interface PluginRecord {
   preloadPath?: string;
   eventsPath?: string;
   icons?: Record<string, string>;
+
+  args?: unknown;
+}
+
+interface ConfigSubscriberEntry {
+  fn: (snapshot: ConfigSnapshot) => void;
+ 
+  label: string;
 }
 
 interface PluginRegistry {
@@ -851,8 +859,9 @@ interface PluginRegistry {
   /** Absolute path of `splash.html` inside the entrypoint dir. */
   splashPath: string | null;
   /** Subscribers that fire on every replacePlugins / registerAppEntrypoint. */
-  subscribers: Set<(snapshot: ConfigSnapshot) => void>;
+  subscribers: Set<ConfigSubscriberEntry>;
 }
+let configSubscriberSeq = 0;
 
 /**
  * Live snapshot of the resolved Zenbu config. Returned by `getConfig()` and
@@ -955,11 +964,11 @@ function snapshotConfig(reg: PluginRegistry): ConfigSnapshot {
 function notifySubscribers(reg: PluginRegistry): void {
   if (reg.subscribers.size === 0) return;
   const snapshot = snapshotConfig(reg);
-  for (const cb of reg.subscribers) {
+  for (const sub of reg.subscribers) {
     try {
-      cb(snapshot);
+      sub.fn(snapshot);
     } catch (err) {
-      console.error("[zenbu config subscriber] threw:", err);
+      console.error(`[zenbu config subscriber ${sub.label}] threw:`, err);
     }
   }
 }
@@ -1097,9 +1106,15 @@ export function getConfig(): ConfigSnapshot {
  */
 export function subscribeConfig(
   callback: (snapshot: ConfigSnapshot) => void,
+  label?: string,
 ): () => void {
   const reg = getPluginRegistry();
-  reg.subscribers.add(callback);
+  configSubscriberSeq += 1;
+  const entry: ConfigSubscriberEntry = {
+    fn: callback,
+    label: label ?? `anon#${configSubscriberSeq}`,
+  };
+  reg.subscribers.add(entry);
   // Fire once with the current snapshot so callers can initialize from a
   // single place instead of `cb(getConfig()); subscribeConfig(cb)`.
   try {
@@ -1108,6 +1123,6 @@ export function subscribeConfig(
     console.error("[zenbu config subscriber] initial fire threw:", err);
   }
   return () => {
-    reg.subscribers.delete(callback);
+    reg.subscribers.delete(entry);
   };
 }

@@ -243,7 +243,7 @@ function waitForAppEntrypoint(timeoutMs = 30000): Promise<string | null> {
         clearTimeout(timer)
         resolve(snapshot.appEntrypoint)
       }
-    })
+    }, "vite/waitForAppEntrypoint")
     const timer = setTimeout(() => {
       if (settled) return
       settled = true

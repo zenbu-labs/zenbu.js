@@ -230,6 +230,12 @@ export interface ResolvedPlugin {
   /** Plugin-author-defined SVG icons. */
   icons?: Record<string, string>;
   /**
+   * Opaque payload passed through from the manifest entry's `args` field.
+   * Surfaced on the runtime `PluginRecord` so services that want
+   * per-plugin configuration can read it without re-parsing the manifest.
+   */
+  args?: unknown;
+  /**
    * Type-time dependencies, with `from` already absolute. The upstream
    * plugin itself is NOT loaded here — `zen link` does that lazily so the
    * runtime path (`getConfig()`, plugin barrel emission) doesn't pay the
@@ -267,19 +273,39 @@ export interface Config {
   /** Defaults to `./.zenbu/db` relative to the config file. */
   db?: string;
   uiEntrypoint: string;
-  plugins: Array<Plugin | string>;
   /**
-   * Path(s) to gitignored overlay file(s) whose default export is a
-   * plugin entry or array of entries (same shape as `plugins`). Missing
-   * files are silently ignored. Edits hot-reload like `zenbu.config.ts`.
-   * Skipped by `build:source` / `build:electron` / `publish:source`.
+   * Path(s) to JSONC files declaring which plugins are loaded.
+   *
+   * When omitted, defaults to:
+   *   - `./zenbu.plugins.jsonc`        (tracked, required if it exists)
+   *   - `./zenbu.plugins.local.jsonc`  (gitignored, optional)
+   *
+   * Entries are layered by their absolute resolved `path` — later files
+   * override earlier ones. Missing files are silently skipped. Edits and
+   * file creation both hot-reload through the same machinery as edits to
+   * `zenbu.config.ts` itself.
+   *
+   * Build/publish commands consume the **tracked** manifest (the first
+   * declared file). Local overlay files are excluded so per-developer
+   * toggles don't ship.
    */
-  localPlugins?: string | string[];
+  pluginsFiles?: string | string[];
   build?: BuildConfig;
 }
 
-/** Default export shape for a `localPlugins` file. */
+/**
+ * Back-compat alias kept so existing user code that imports the type
+ * from `@zenbujs/core/config` still typechecks after the switch to
+ * JSONC manifests. Not used by anything in core.
+ *
+ * @deprecated Plugins now live in `zenbu.plugins.jsonc`; this type is
+ *             a stub so old `zenbu.local.ts` files keep typechecking
+ *             until they're deleted.
+ */
 export type LocalPluginsDefault = Plugin | string | Array<Plugin | string>;
+
+export const DEFAULT_TRACKED_MANIFEST = "./zenbu.plugins.jsonc";
+export const DEFAULT_LOCAL_MANIFEST = "./zenbu.plugins.local.jsonc";
 
 export function defineConfig(config: Config): Config {
   return config;
@@ -326,6 +352,12 @@ export interface ResolvedConfig {
    */
   updatingPath?: string;
   plugins: ResolvedPlugin[];
+  /**
+   * Absolute paths of every JSONC manifest the loader consulted. Includes
+   * paths whose file is currently missing (those still hot-watch for
+   * creation events). Index 0 is the tracked manifest.
+   */
+  manifestPaths: string[];
   /** Resolved build config; defaults filled in even when user omits. */
   build: ResolvedBuildConfig;
 }

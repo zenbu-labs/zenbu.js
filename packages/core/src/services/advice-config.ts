@@ -55,7 +55,10 @@ export interface AdviceSpec {
   injectionName?: string
 }
 
-const RESOLVED_PREFIX = "\0@injections-prelude/"
+// Must match `RESOLVED_PREFIX` in `vite-plugins.ts` byte-for-byte — the
+// codegen plugin writes virtual modules under this id, and we look
+// them up here by exact `startsWith`. 
+const RESOLVED_PREFIX = "\0@injections-prelude"
 
 // Source of truth, keyed by `name`. Last registration wins; dispose
 // only clears if we still own the slot.
@@ -76,8 +79,11 @@ function resolveAgainstPlugin(
   return path.resolve(pluginDir, modulePath)
 }
 
-// Invalidate the virtual prelude module so the next request
-// regenerates it from the live registry.
+// Invalidate the virtual prelude module AND ask Vite to push an HMR
+// update for it. The prelude module self-accepts and disposes its
+// previous registrations on `import.meta.hot.dispose`, so a single
+// HMR update is enough to swap the renderer's injection registry from
+// the old set to the new set with no page reload.
 function invalidatePrelude() {
   try {
     const vite = runtime.getSlot("vite")?.instance as
@@ -86,12 +92,27 @@ function invalidatePrelude() {
     const server = vite?.viteServer
     if (!server) return
     const graph = server.moduleGraph
+    const preludeModules: unknown[] = []
     for (const id of graph.idToModuleMap.keys()) {
       if (typeof id !== "string") continue
       if (id.startsWith(RESOLVED_PREFIX)) {
         const mod = graph.getModuleById(id)
-        if (mod) graph.invalidateModule(mod)
+        if (mod) {
+          graph.invalidateModule(mod)
+          preludeModules.push(mod)
+        }
       }
+    }
+    if (preludeModules.length === 0) return
+    // Push an HMR `update` message for each prelude module. Vite's
+    // CSS / module HMR pipeline already knows how to ship one, so we
+    // reuse its `reloadModule` API. The module's own
+    // `import.meta.hot.accept()` keeps the change scoped to the
+    // prelude — no page reload, no other modules invalidated.
+    for (const mod of preludeModules) {
+      try {
+        ;(server as { reloadModule: (m: unknown) => unknown }).reloadModule(mod)
+      } catch {}
     }
   } catch {}
 }
@@ -101,26 +122,31 @@ function invalidatePrelude() {
 // reload is the simplest way to apply changes.
 
 function emitReload() {
+  // Surgical path. `invalidatePrelude` invalidates the virtual
+  // `@injections-prelude` module in Vite's graph and pushes an HMR
+  // update for it. The prelude self-accepts and runs its `dispose`
+  // hook to unregister the previous round's renderer-side
+  // `registerInjection` slots, then re-evaluates with the current
+  // entries. Net: the renderer's injection registry tracks the
+  // main-side `injections` Map without any full page reload.
   invalidatePrelude()
+  // In-process bus for main-side listeners (e.g. the Vite prelude
+  // codegen plugin uses this to know when to regenerate). Cheap and
+  // doesn't touch the renderer.
   for (const cb of injectionChangeListeners) {
     try {
       cb()
     } catch {}
   }
-  try {
-    const rpc = runtime.getSlot("rpc")?.instance as
-      | {
-          emit: {
-            core: { advice: { reload(payload: { type: string }): void } }
-          }
-        }
-      | undefined
-    // The host renderer's reload signal is the legacy
-    // `core.advice.reload` event; keeping the wire-level event name
-    // unchanged means the in-renderer listener doesn't have to change
-    // while we're shuffling the prelude.
-    rpc?.emit?.core?.advice?.reload({ type: "*" })
-  } catch {}
+  // The legacy `rpc.emit.core.advice.reload({ type: "*" })` path
+  // was here. It triggered `location.reload()` in the renderer,
+  // which re-fetched the prelude through a page refresh. With the
+  // HMR-self-accepting prelude above, that's strictly redundant —
+  // and on top of the surgical update it causes a visible page
+  // reload (splash flash, scroll position lost, React state
+  // discarded). Removed. The renderer-side listener in
+  // `react.ts` is now a no-op; safe to delete in a follow-up but
+  // harmless to leave.
 }
 
 /** Subscribe to registry changes from main-side services. */

@@ -28,6 +28,7 @@ async function main(): Promise<void> {
       preloadPath: p.preloadPath,
       eventsPath: p.eventsPath,
       icons: p.icons,
+      args: p.args,
     })),
     appEntrypoint: resolved.uiEntrypointPath,
     splashPath: resolved.splashPath,

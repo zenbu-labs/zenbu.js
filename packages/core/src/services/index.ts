@@ -9,6 +9,10 @@ export { WindowService } from "./window";
 export { UpdaterService } from "./updater";
 export { PluginUpdaterService } from "./plugin-updater";
 export {
+  PluginManagerService,
+  type PluginManifestRow,
+} from "./plugin-manager";
+export {
   ShortcutsService,
   type ShortcutDef,
   type ShortcutListing,

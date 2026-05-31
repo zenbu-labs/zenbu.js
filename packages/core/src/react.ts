@@ -776,7 +776,35 @@ export type ViewComponent<
 const injectionRegistry = new Map<string, InjectionEntry<unknown>>();
 const injectionRegistryListeners = new Set<() => void>();
 
+// When > 0, `emitInjectionRegistryChange()` queues a
+// single deferred notification
+let injectionBatchDepth = 0;
+let injectionBatchPending = false;
+
 function emitInjectionRegistryChange() {
+  if (injectionBatchDepth > 0) {
+    injectionBatchPending = true;
+    return;
+  }
+  for (const cb of injectionRegistryListeners) {
+    try {
+      cb();
+    } catch {}
+  }
+}
+
+
+export function beginInjectionBatch(): void {
+  injectionBatchDepth++;
+}
+
+
+export function endInjectionBatch(): void {
+  if (injectionBatchDepth === 0) return;
+  injectionBatchDepth--;
+  if (injectionBatchDepth > 0) return;
+  if (!injectionBatchPending) return;
+  injectionBatchPending = false;
   for (const cb of injectionRegistryListeners) {
     try {
       cb();
