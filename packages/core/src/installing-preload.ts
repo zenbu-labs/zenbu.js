@@ -8,6 +8,11 @@
  *
  *   const off = window.zenbuInstall.on("step", (p) => { ... })
  *   window.zenbuInstall.off("step", cb)
+ *   window.zenbuInstall.relaunch()   // restart the app from scratch
+ *
+ * `relaunch()` exists for the case where the cold-boot install/clone hangs:
+ * the page can show a "Restart to launch" button after a timeout and call
+ * this to fully relaunch the Electron app (app.relaunch + app.exit).
  *
  * Events emitted by the launcher (channel name `zenbu:install:<event>`):
  *
@@ -67,5 +72,8 @@ contextBridge.exposeInMainWorld("zenbuInstall", {
       ipcRenderer.off(channelFor(event), wrapper);
       wrappers.delete(cb);
     }
+  },
+  relaunch(): void {
+    ipcRenderer.send("zenbu:install:relaunch");
   },
 });

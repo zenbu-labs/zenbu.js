@@ -23,7 +23,7 @@
  * at runtime), and `isomorphic-git` (bundled into this file by tsdown — see
  * `packages/core/tsdown.config.ts` `neverBundle: ["electron"]`).
  */
-import { app, BaseWindow, WebContentsView, nativeTheme } from "electron";
+import { app, BaseWindow, WebContentsView, nativeTheme, ipcMain } from "electron";
 import { existsSync } from "node:fs";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -283,8 +283,26 @@ async function maybeOpenInstallingWindow(
     } catch {}
   };
   nativeTheme.on("updated", onThemeChange);
+
+  // Escape hatch for the niche cold-boot hang: the page can show a
+  // "Restart to launch" button (typically after a timeout) and call
+  // `window.zenbuInstall.relaunch()`. Fully restart the Electron app so the
+  // clone / install is retried from scratch. Guard against double-fire.
+  let relaunching = false;
+  const onRelaunch = (): void => {
+    if (relaunching) return;
+    relaunching = true;
+    _logStream.write("[installer] relaunch requested from installing screen\n");
+    try {
+      app.relaunch();
+    } catch {}
+    app.exit(0);
+  };
+  ipcMain.on("zenbu:install:relaunch", onRelaunch);
+
   win.on("closed", () => {
     nativeTheme.removeListener("updated", onThemeChange);
+    ipcMain.removeListener("zenbu:install:relaunch", onRelaunch);
   });
 
   // Buffer events emitted before the page has finished loading. `loadFile`
