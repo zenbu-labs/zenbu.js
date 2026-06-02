@@ -2,6 +2,7 @@ import { z as _z } from "zod";
 import {
   createSchema,
   collection,
+  makeCollection,
   blob,
   type Schema as _Schema,
   type SchemaShape as _SchemaShape,
@@ -21,7 +22,7 @@ import type {
   CollectionNode as _CollectionNode,
 } from "@zenbu/kyju";
 
-export { createSchema, collection, blob, dbStringify, dbParse };
+export { createSchema, collection, makeCollection, blob, dbStringify, dbParse };
 export const z = _z;
 
 export type Schema<TShape extends _SchemaShape = _SchemaShape> =
