@@ -1,6 +1,6 @@
 {
   "name": "create-zenbu-app",
-  "version": "0.0.35",
+  "version": "0.0.36",
   "description": "Scaffold a new Zenbu app",
   "type": "module",
   "publishConfig": {
@@ -26,7 +26,7 @@
   "scripts": {
     "test:desktop": "bash scripts/test-desktop.sh",
     "build": "pnpm run build:agents && tsdown",
-    "build:agents": "sh -c 'for d in vanilla tailwind plugin; do { printf \"# Zenbu.js docs\\n\\n\"; curl -fsSL https://zenbulabs.mintlify.app/llms-full.txt; printf \"\\n\\n# General rules\\n\\n- never use any, every api in the app is fully type safe\\n- use zen link after making changes to sync types if it did not happen automatically\\n- always use <pm> run db:generate after making a schema change otherwise it will not take affect\\n- always prefer to make db updates via the replica so that updates are instant. if you used rpc to update a replica it would serve 0 purpose and just add an extra round trip\\n- prefer one component per file\\n\"; } > templates/$d/AGENTS.md; done'",
+    "build:agents": "sh -c 'for d in vanilla tailwind plugin; do { printf \"# Zenbu.js docs\\n\\n\"; if [ \"$d\" = plugin ]; then printf \"# Plugin rules\\n\\n- do not add this plugin to the host config (the plugins array in zenbu.config.ts, a zenbu.local.ts overlay, or any zenbu.plugins*.jsonc manifest). build it in its own folder and leave it there. the user enables or installs it themselves when they are ready, or will ask you to. do not edit their config files on your own.\\n\\n\"; fi; curl -fsSL https://zenbulabs.mintlify.app/llms-full.txt; printf \"\\n\\n# General rules\\n\\n- never use any, every api in the app is fully type safe\\n- use zen link after making changes to sync types if it did not happen automatically\\n- always use <pm> run db:generate after making a schema change otherwise it will not take affect\\n- always prefer to make db updates via the replica so that updates are instant. if you used rpc to update a replica it would serve 0 purpose and just add an extra round trip\\n- prefer one component per file\\n\"; } > templates/$d/AGENTS.md; done'",
     "prepublishOnly": "pnpm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

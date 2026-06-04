@@ -1,5 +1,9 @@
 # Zenbu.js docs
 
+# Plugin rules
+
+- do not add this plugin to the host config (the plugins array in zenbu.config.ts, a zenbu.local.ts overlay, or any zenbu.plugins*.jsonc manifest). build it in its own folder and leave it there. the user enables or installs it themselves when they are ready, or will ask you to. do not edit their config files on your own.
+
 # Overview
 Source: https://zenbulabs.mintlify.app/api-reference/overview
 
@@ -1387,15 +1391,15 @@ Source: https://zenbulabs.mintlify.app/introduction
 
 
 
-Zenbu.js is a framework for building hackable desktop apps.
+Zenbu.js is the framework for building extensible applications, powering [Zenbu](https://zenbu.dev).
 
-Apps built with Zenbu.js are designed to be modified after they ship. Users can edit the source code directly, or install plugins that extend the app with new functionality.
+Apps and plugins built with Zenbu.js are designed to be modified after they are installed. Users can edit the source code directly, or install plugins that extend the app with new functionality.
 
-The framework also handles the hard parts of desktop development for you, like syncing state between processes, RPC, and hot-reloading everything as you make changes.
+The SDK also handles the hard parts of application development, like syncing state between processes, RPC, and hot-reloading everything as you make changes.
 
-### Why build a hackable app
+### Why build with Zenbu.js
 
-* Coding agents can generate and customize software on demand for a specific use case. A hackable app gives them full access to do that.
+* Coding agents can generate and customize software on demand for a specific use case. An app built on Zenbu.js gives them full access to do that.
 * Letting people modify your app means more directions get explored than you could reach on your own.
 * Extensible code tends to be more maintainable, because it's already written to be changed.
 
