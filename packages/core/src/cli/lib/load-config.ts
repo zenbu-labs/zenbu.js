@@ -297,9 +297,21 @@ export async function loadConfig(
   for (const entry of enabledEntries) {
     if (seen.has(entry.absPath)) continue
     seen.add(entry.absPath)
-    const resolved = await resolvePluginFile(entry.absPath, entry.args)
-    plugins.push(resolved)
+    // Always watch the entry path, even if it fails to resolve, so that
+    // creating/fixing the plugin file triggers a fresh re-link.
     pluginSourceFiles.push(entry.absPath)
+    try {
+      const resolved = await resolvePluginFile(entry.absPath, entry.args)
+      plugins.push(resolved)
+    } catch (err) {
+      // A missing or malformed plugin entry must never take down the whole
+      // app. Skip it with a warning and keep loading the rest; the watcher
+      // above will re-link once the file appears or is fixed.
+      const reason = err instanceof Error ? err.message : String(err)
+      console.warn(
+        `[zenbu] skipping plugin (declared in ${path.basename(entry.sourceFile)}): ${reason}`,
+      )
+    }
   }
 
   // Argv-driven plugin entries: any number of `--plugin=<path>` flags on

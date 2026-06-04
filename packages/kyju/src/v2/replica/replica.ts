@@ -1,5 +1,4 @@
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -587,14 +586,33 @@ export const createReplica = (args: CreateReplicaArgs) => {
     Effect.runSync(Ref.set(stateRef, state));
   };
 
+  // One shared listener set + one long-lived fiber draining
+  // `stateRef.changes`, instead of forking a fiber per subscriber. Every
+  // reactive read (`useDb`, `useCollection`, `client.*.subscribe`) routes
+  // through here; a fiber-per-subscriber meant O(subscribers) scheduler
+  // overhead per write plus async teardown that leaked under mount churn.
+  const listeners = new Set<(state: ClientState) => void>();
+  Effect.runFork(
+    Stream.runForEach(stateRef.changes, (state) =>
+      // Snapshot the set so a listener that (un)subscribes mid-notify
+      // can't perturb the iteration, and isolate listener throws.
+      Effect.sync(() => {
+        for (const l of Array.from(listeners)) {
+          try {
+            l(state);
+          } catch {}
+        }
+      }),
+    ),
+  );
+
   const subscribe = (cb: (state: ClientState) => void): (() => void) => {
-    const fiber = Effect.runFork(
-      Stream.runForEach(stateRef.changes, (state) =>
-        Effect.sync(() => cb(state)),
-      ),
-    );
+    listeners.add(cb);
+    // Replay the current value once — mirrors `SubscriptionRef.changes`'
+    // emit-current-then-changes contract that lazy-init callers rely on.
+    cb(Effect.runSync(Ref.get(stateRef)));
     return () => {
-      Effect.runFork(Fiber.interrupt(fiber));
+      listeners.delete(cb);
     };
   };
 

@@ -97,12 +97,8 @@ export class PluginManagerService extends Service.create({
     const rows: PluginManifestRow[] = entries.map((entry) => ({
       path: entry.absPath,
       manifestPath: entry.sourceFile,
-      // A plugin's name is a static property of its manifest
-      // (`definePlugin({ name })`), so it must not depend on whether
-      // the plugin is currently loaded. Prefer the runtime name when
-      // the plugin is enabled (cheap, authoritative); otherwise read
-      // it statically from the manifest source so disabled plugins
-      // keep a stable identity instead of going nameless.
+      // Runtime name when loaded; else read it statically from the
+      // manifest so disabled plugins keep a stable name.
       name:
         nameByPath.get(path.dirname(entry.absPath)) ??
         readManifestName(entry.absPath),
@@ -214,15 +210,8 @@ export class PluginManagerService extends Service.create({
 //                                  helpers
 // =============================================================================
 
-/**
- * Statically read a plugin's declared name from its manifest source
- * (`definePlugin({ name: "..." })`) without loading the module. Used
- * as a fallback for disabled plugins, which aren't in the runtime's
- * loaded-plugin registry but still have a stable name on disk.
- *
- * Cached by path + mtime since `list()` is polled by the UI and a
- * manifest's name effectively never changes between writes.
- */
+// Read `definePlugin({ name })` from the manifest source without
+// loading it (fallback for disabled plugins). Cached by path + mtime.
 const manifestNameCache = new Map<string, { mtimeMs: number; name: string | null }>()
 
 function readManifestName(absPath: string): string | null {
@@ -238,9 +227,7 @@ function readManifestName(absPath: string): string | null {
   let name: string | null = null
   try {
     const src = fs.readFileSync(absPath, "utf8")
-    // Match the first `name: "..."` inside a `definePlugin({ ... })`
-    // call. Non-greedy up to the name field; tolerant of whitespace
-    // and single/double/back quotes.
+    // First `name: "..."` inside `definePlugin({ ... })`.
     const match = src.match(
       /definePlugin\s*\(\s*\{[\s\S]*?\bname\s*:\s*["'`]([^"'`]+)["'`]/,
     )
