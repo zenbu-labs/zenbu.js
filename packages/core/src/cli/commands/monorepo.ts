@@ -2,9 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { execFileSync } from "node:child_process"
-/**
- * todo: should only be exposed when an env var is passed
- */
+// todo: should only be exposed when an env var is passed.
 
 const MARKER_FILE = ".zenbu-dev-link"
 const DEFAULT_MONOREPO = path.join(os.homedir(), ".zenbu", "plugins", "zenbu")

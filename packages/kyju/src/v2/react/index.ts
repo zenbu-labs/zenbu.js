@@ -111,30 +111,16 @@ export function createKyjuReact<
     const { client, replica } = useKyjuContext();
     const collectionId = ref?.collectionId || null;
 
-    // Drive subscription lifecycle from an effect (post-render so we
-    // don't side-effect the replica during render). The actual
-    // displayed data is read directly off the replica via
-    // useSyncExternalStore below — see the comment on `getSnapshot`
-    // for why mirroring into React state isn't safe here.
-    //
-    // We go through `client.subscribeCollection` rather than posting
-    // raw subscribe/unsubscribe messages on the replica so the
-    // refcount in the client is honored. Without this, two
-    // `useCollection(ref)` instances pointing at the same collection
-    // (e.g. the same chat shown in two split panes) would each
-    // independently unsubscribe on unmount — and the replica drops
-    // its local copy of the collection on every `unsubscribe-collection`
-    // it sees, blanking out any other still-mounted consumer.
+    // Subscribe via `client.subscribeCollection` (not raw replica messages)
+    // so the client refcount is honored: two consumers of the same collection
+    // (e.g. one chat in two split panes) must not unsubscribe each other.
     useEffect(() => {
       if (!collectionId) return;
       return client.subscribeCollection(collectionId);
     }, [collectionId, client]);
 
-    // Cache for useSyncExternalStore: getSnapshot must return
-    // `Object.is`-stable values across calls when nothing changed, or
-    // React will warn and re-render forever. We key the cache on
-    // `collectionId` + the underlying `CollectionState` reference so
-    // we hand out the same wrapper object until either changes.
+    // getSnapshot must be `Object.is`-stable when nothing changed, so cache
+    // keyed on `collectionId` + the `CollectionState` reference.
     type Snapshot = {
       items: Item[];
       totalCount: number;
@@ -151,17 +137,9 @@ export function createKyjuReact<
       [replica],
     );
 
-    // Read the current collection state synchronously from the replica
-    // on every render. The previous implementation mirrored the
-    // collection's items into React state via setState in an effect:
-    // when `collectionId` flipped (e.g. switching between two chats'
-    // event logs), the stale items from the previous collection
-    // remained in state until the new subscribe-collection ack landed,
-    // which renderers painted as a one-frame flicker of the wrong
-    // collection's data. Reading directly from the replica's state
-    // closes that window — a `collectionId` change shows the new
-    // collection's data (or empty, if it isn't loaded yet) on the
-    // very same render.
+    // Read collection state synchronously from the replica every render.
+    // Mirroring into React state instead caused a one-frame flicker of the
+    // previous collection's items when `collectionId` flipped.
     const getSnapshot = useCallback((): Snapshot => {
       if (!collectionId) {
         const cached = cacheRef.current;

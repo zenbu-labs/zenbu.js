@@ -139,16 +139,9 @@ function trimAgentsMdIfRequested(projectDir: string): void {
   fs.writeFileSync(target, original.slice(0, AGENTS_MD_MAX_CHARS));
 }
 
-// =============================================================================
-//                              config options
-// =============================================================================
-//
-// Each entry describes one user-facing scaffolding choice. To add a new
-// option:
-//   1. Append a `ConfigOption` to `CONFIG_OPTIONS`.
-//   2. Add the corresponding template copies under `templates/<slug>/`.
-//
-// `--yes` short-circuits every `ask()` and uses the declared `default`.
+// config options
+// Each entry is one user-facing scaffolding choice; `--yes` skips every
+// `ask()` and uses the declared `default`.
 
 interface ConfigOption<T> {
   id: string;
@@ -185,9 +178,7 @@ function resolveSlug(answers: ResolvedAnswers): string {
   return parts.length > 0 ? parts.join("-") : "vanilla";
 }
 
-// =============================================================================
-//                          package manager detection
-// =============================================================================
+// package manager detection
 
 type PmType = "pnpm" | "npm" | "yarn" | "bun";
 
@@ -291,9 +282,7 @@ async function resolveNpmAmbiguity(
   return installed.find((p) => p.type === pick)!;
 }
 
-// =============================================================================
-//                          template rendering helpers
-// =============================================================================
+// template rendering helpers
 
 type TemplateCtx = Record<string, string>;
 
@@ -440,9 +429,7 @@ function gitInitWithInitialCommit(projectDir: string): void {
   });
 }
 
-// =============================================================================
-//                       Host zenbu.config.ts mutation
-// =============================================================================
+// Host zenbu.config.ts mutation
 
 /**
  * Append a path-form plugin entry to the host's `plugins: [ ... ]` array.
@@ -570,9 +557,7 @@ function runZenLink(
   return res.status === 0;
 }
 
-// =============================================================================
-//                              prompts
-// =============================================================================
+// prompts
 
 function bail(reason: string): never {
   p.cancel(reason);
@@ -620,9 +605,7 @@ function defaultAnswers(): ResolvedAnswers {
   return answers;
 }
 
-// =============================================================================
-//                                    main
-// =============================================================================
+// main
 
 function slugify(name: string): string {
   return name

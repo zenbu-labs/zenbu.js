@@ -1,22 +1,13 @@
 /**
- * Hang-guarded child-process spawn for package-manager installs.
+ * Hang-guarded child-process spawn for package-manager installs. pnpm
+ * sometimes prints its final `Done in X` line but never exits; this helper
+ * watches stdout/stderr for that sentinel, arms a grace timer, SIGTERMs the
+ * child, and resolves as success. Incidents are logged to
+ * `~/.zenbu/.internal/install-incidents.log` and
+ * `globalThis.__zenbu_install_incident__`.
  *
- * Why this exists: pnpm sometimes prints its final
- * `Done in X using pnpm vY` line and then never `process.exit(0)`s —
- * the install actually completed but the parent sits there forever.
- * This helper watches stdout/stderr for that sentinel, arms a short
- * grace timer, SIGTERMs the child if it hasn't exited by then, and
- * resolves the promise as if the install succeeded. Every
- * short-circuit is appended to
- * `~/.zenbu/.internal/install-incidents.log` and surfaced on
- * `globalThis.__zenbu_install_incident__` so plugins can quantify how
- * often this happens.
- *
- * The framework's launcher / updater install path uses this through
- * `runInstall` (in `shared/pm-install.ts`). Plugins that shell out to
- * `pnpm install` themselves (e.g. `plugin-installer` cloning + installing
- * a user-supplied repo) should import this helper directly instead of
- * re-implementing the same watchdog.
+ * Plugins shelling out to `pnpm install` should import this directly rather
+ * than re-implementing the watchdog.
  */
 import { spawn } from "node:child_process"
 import fs from "node:fs"

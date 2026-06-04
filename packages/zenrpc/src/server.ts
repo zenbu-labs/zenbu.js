@@ -86,10 +86,7 @@ export const createServer = <
             runtime: options.runtime,
           });
         } catch (err) {
-          /**
-           * this is hacky and should be removed, temporary work around
-           */
-
+          // Workaround: swallow the expected "Method not found" race below.
           const message = err instanceof Error ? err.message : String(err);
           const isExpectedRace = /^Method not found:/.test(message);
           if (!isExpectedRace) {

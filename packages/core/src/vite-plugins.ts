@@ -64,14 +64,10 @@ function buildInlinePreludeScript(): string | null {
 }
 
 /* ---------- Injection prelude codegen ----------
- *
- * Generates the body of `@injections-prelude`. Every registration
- * returns a disposer pushed onto `__zb_disposers`; the module self-
- * accepts via HMR. On dispose, the disposer array is stashed on
- * `import.meta.hot.data`; the new module body unwinds the previous
- * round inside a single `beginInjectionBatch()` and re-registers the
- * current set so React subscribers see one notification with the
- * final state.
+ * Generates the body of `@injections-prelude`. Registrations push disposers
+ * onto `__zb_disposers` and the module self-accepts via HMR; on dispose the
+ * previous round is unwound inside one `beginInjectionBatch()` so React
+ * subscribers see a single notification with the final state.
  */
 function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   if (entries.length === 0) {

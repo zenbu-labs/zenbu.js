@@ -110,26 +110,13 @@ function buildSource(imports: string[]): string {
 }
 
 /**
- * Matches the canonical service declaration shape after the upstream HMR
- * loader (dynohot) has transformed the module. Dynohot strips the
- * `export` keyword and minifies the source, so the regex must not
- * require `export` and must tolerate a non-whitespace separator (e.g.
- * `;class Foo extends Service.create(...)`). The `\b` boundary still
- * rejects `subclass Foo` matches inside identifiers/comments.
- *
- *     export class FooService extends Service.create({ ... }) { ... }
- *     ;class FooService extends Service.create({...}) {...}        // post-dynohot
- *
- * `zen link` runs on the original on-disk source (pre-dynohot), so it
- * keeps the `export` requirement in `discoverServices` to avoid matching
- * non-exported helper classes.
+ * Matches a service class declaration after dynohot has stripped `export` and
+ * minified the source, so it can't require `export`. (`zen link` runs on
+ * pre-dynohot source and keeps the `export` requirement separately.)
  */
 const SERVICE_CLASS_RE = /\bclass\s+(\w+)\s+extends\s+Service\.create\s*\(/g;
 
-/**
- * Decode the loader's `source` payload (which Node permits as string,
- * Buffer, ArrayBuffer, or any TypedArray) into a plain UTF-8 string.
- */
+/** Decode the loader's `source` payload (string/Buffer/ArrayBuffer/TypedArray) to UTF-8. */
 function decodeSource(source: unknown): string {
   if (typeof source === "string") return source;
   if (source instanceof Uint8Array) return Buffer.from(source).toString("utf8");
@@ -139,17 +126,9 @@ function decodeSource(source: unknown): string {
 }
 
 /**
- * Tail-append a `runtime.register(<Class>, import.meta)` call to the
- * loader result so user service files don't have to carry the boilerplate.
- *
- * - Idempotent: if the source already contains `runtime.register(`
- *   (manual migration leftover, or a user choosing to register
- *   explicitly), we leave it untouched.
- * - Errors loudly when zero or multiple service classes are found, since
- *   the runtime's HMR model is "one slot per import.meta".
- * - The runtime singleton imported here resolves through the loader's
- *   own `@zenbujs/core` short-circuit in `resolve()`, so the registered
- *   class lands in the same registry the rest of the framework reads.
+ * Tail-append `runtime.register(<Class>, import.meta)` so service files don't
+ * carry the boilerplate. Idempotent if `runtime.register(` is already present;
+ * errors on multiple classes since HMR allows one service per import.meta.
  */
 function appendAutoRegister(downstream: unknown, filePath: string): unknown {
   if (!downstream || typeof downstream !== "object") return downstream;
@@ -262,20 +241,15 @@ interface RegistryPayload {
 }
 
 /**
- * Read the resolved config from the process global. setup-gate populates
- * this before registering our loader, so by the time `load()` is invoked
- * the snapshot is always present.
- *
- * We can't `await import("zenbu.config.ts")` from inside `load()` because
- * Node's ESM loader serializes load hooks — a dynamic import re-enters the
- * loader chain and deadlocks. Pre-resolving in setup-gate sidesteps that.
+ * Re-resolve the config in a subprocess. We can't `import()` it from inside
+ * `load()`: Node serializes load hooks, so a dynamic import re-enters the
+ * loader chain and deadlocks.
  */
 function resolveConfigViaSubprocess(projectDir: string): {
   payload: RegistryPayload;
   pluginSourceFiles: string[];
 } {
-  // Locate the bundled resolver script. It sits next to this file in
-  // `dist/cli/resolve-config.mjs` (peer of `dist/loaders/zenbu.mjs`).
+  // The bundled resolver sits at `dist/cli/resolve-config.mjs`.
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
     path.resolve(here, "..", "cli", "resolve-config.mjs"),
@@ -289,9 +263,7 @@ function resolveConfigViaSubprocess(projectDir: string): {
       )})`,
     );
   }
-  /**
-   * this takes ~100ms and can be heavily optimized, but its a fine solution for now
-   */
+  // ~100ms; optimizable but fine for now.
   const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
   const out = execFileSync(process.execPath, [resolverScript, projectDir], {
     encoding: "utf8",
@@ -309,8 +281,7 @@ function getResolvedConfig(configPath: string): {
   payload: RegistryPayload;
   pluginSourceFiles: string[];
 } {
-  // First call: use the payload sent through `register()`'s `data` channel
-  // by setup-gate. Cheap, no subprocess.
+  // First call: use the payload setup-gate sent via `register()`'s `data` channel.
   if (pluginsRootInvocations === 0) {
     pluginsRootInvocations += 1;
     if (!resolvedPayload) {
@@ -324,11 +295,8 @@ function getResolvedConfig(configPath: string): {
       pluginSourceFiles: resolvedPluginSourceFiles,
     };
   }
-  // Subsequent calls (dynohot invalidation): re-evaluate the user's
-  // zenbu.config.ts from disk by shelling out to `resolve-config.mjs`. This
-  // is what makes adding/removing plugins or changing service globs in
-  // zenbu.config.ts hot-reload — without re-reading the file, the loader
-  // would just keep emitting the same stale barrel forever.
+  // Subsequent calls (dynohot invalidation): re-resolve from disk so plugin/glob
+  // changes in zenbu.config.ts hot-reload instead of emitting a stale barrel.
   pluginsRootInvocations += 1;
   const projectDir = path.dirname(configPath);
   const fresh = resolveConfigViaSubprocess(projectDir);

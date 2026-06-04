@@ -5,23 +5,10 @@ import { fileURLToPath } from "node:url"
 const includeRe = /\.[jt]sx?$/
 const excludeRe = /node_modules|packages\/advice\//
 
-/**
- * Cheap precheck: does this file have any *adviseable* top-level
- * structure? The transform only rewrites top-level
- * `function Foo()`/`export function Foo()`/`export const X = () => ...`
- * declarations; everything else short-circuits through babel without
- * any AST mutation. Babel's parser is the expensive part (~20-50ms per
- * file) so cheaper to do a string-level filter first.
- *
- * Matches any of:
- *   - `export function` / `function` at column 0
- *   - `export default function`
- *   - `export const X = (` / `const X = (` at column 0 (arrow / fn expr)
- *
- * False positives are fine — they just fall through to babel, same as
- * before. False negatives are NOT fine: a missed export becomes
- * unadviseable. The regex above is intentionally permissive.
- */
+// Cheap string-level precheck for adviseable top-level function/const
+// declarations, run before babel (whose parser is ~20-50ms/file). Kept
+// intentionally permissive: false positives just fall through to babel, but a
+// false negative would silently make an export unadviseable.
 const hasAdviseableRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+[A-Za-z_$]|^\s*(?:export\s+)?const\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:function\b|\(|<)/m
 // Transform root. Anchored to the kernel's project root via env var (set by
 // apps/kernel/src/shell/index.ts) instead of process.cwd(), so the advice
@@ -65,15 +52,9 @@ export async function load(
     ? loaded.source
     : new TextDecoder().decode(loaded.source)
 
-  // Fast-path: skip babel entirely for files that obviously have no
-  // adviseable top-level functions. The babel parser is the dominant
-  // cost in this loader — even though `zenbuAdviceTransform` is a
-  // no-op when there's nothing to wrap, the parse runs unconditionally.
-  // On a real app boot this cut the loader's blocked-event-loop
-  // contribution from ~2200ms to ~100ms because most main-process
-  // service files don't define any top-level functions — they're
-  // class-only with a single `runtime.register(...)` call at the
-  // bottom.
+  // Fast-path: skip the (unconditional, dominant-cost) babel parse for files
+  // with no adviseable top-level functions. On a real boot this cut the
+  // loader's blocked-event-loop time from ~2200ms to ~100ms.
   if (!hasAdviseableRe.test(source)) {
     return loaded
   }

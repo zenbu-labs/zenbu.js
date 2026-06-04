@@ -28,20 +28,9 @@ import { bootTrace } from "../boot-trace";
 const log = createLogger("window");
 
 /**
- * Boot-time snapshot of how the host was launched.
- *
- * Captured at module load so HMR can't desync these between the
- * `WindowService` instance and the real Electron process state.
- * `respawnSelf` re-uses these to start an isolated child instance
- * of the same app in either dev or prod:
- *
- *  - **Dev**: `execPath` is `node_modules/electron/.../Electron`
- *    and `bootArgv` starts with the project directory (whose
- *    `package.json#main` is `setup-gate.mjs`).
- *  - **Prod**: `execPath` is the bundled binary inside `.app/` and
- *    `bootArgv` is the bundled entry path. Either way, spawning
- *    `execPath` with `bootArgv + extras` re-launches the same
- *    code path the user double-clicked.
+ * Boot-time snapshot of how the host was launched, captured at module load so
+ * HMR can't desync it from the real process state. `respawnSelf` spawns
+ * `execPath` with `bootArgv + extras` to re-launch the same code path in dev or prod.
  */
 const BOOT_EXEC_PATH: string = process.execPath;
 const BOOT_ARGV: ReadonlyArray<string> = Object.freeze(

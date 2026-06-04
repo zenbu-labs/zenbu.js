@@ -82,25 +82,13 @@ export abstract class Service {
   static deps: Record<string, DepEntry> = {};
 
   /**
-   * Define a Service base class. The returned abstract class has
-   * `static key`, `static deps`, and a typed `this.ctx` already set up;
-   * extend it and add your `evaluate()` body.
+   * Define a Service base class with `static key`, `static deps`, and a typed
+   * `this.ctx`; extend it and add your `evaluate()` body.
    *
    *     export class WindowService extends Service.create({
    *       key: "window",
-   *       deps: {
-   *         baseWindow: BaseWindowService,
-   *         http: HttpService,
-   *       },
-   *     }) {
-   *       evaluate() {
-   *         this.ctx.baseWindow  // BaseWindowService
-   *         this.ctx.http        // HttpService
-   *       }
-   *     }
-   *
-   * `key` is a required field on the config object, so TypeScript errors
-   * if you forget it. `deps` is optional (defaults to no deps).
+   *       deps: { http: HttpService },
+   *     }) {}
    *
    * For dynamic / optional access to another service, use
    * `runtime.get(SomeService, cb)` instead of declaring it in `deps`.
@@ -760,27 +748,15 @@ export class ServiceRuntime {
     return levels;
   }
 }
-/**
- * fixme: i don't think these commments make sense
- */
-
-// The runtime is a process-singleton. On a hot reload of THIS file, dynohot
-// re-evaluates the module body — but `??=` keeps the existing instance so we
-// don't lose every registered service. The old instance still points at the
-// previous `ServiceRuntime.prototype` though, so any new methods/fixes we add
-// here would be invisible to the live instance until the next process
-// restart. `setPrototypeOf` after the `??=` rebinds the instance to the
-// freshly-evaluated prototype, so HMR of runtime.ts itself works.
+// Process-singleton. On hot reload of THIS file, dynohot re-evaluates the
+// module but we keep the existing instance (so registered services survive)
+// and `setPrototypeOf` rebinds it to the fresh prototype, so new methods on
+// ServiceRuntime take effect without a process restart.
 
 /**
- * Devtools-only handles, attached to the global so they aren't part of the
- * public `ServiceRuntime` autocomplete surface. Same shape React DevTools
- * uses (`__REACT_DEVTOOLS_GLOBAL_HOOK__`): user code reading
- * `runtime.<...>` never lands on these methods; you only find them if you
- * specifically type `globalThis.__zenbu_dev__`. Kept here (next to the
- * runtime that owns the state) because the hook reaches into private
- * implementation details — `scheduleReconcile` stays `private` on the
- * class; the cast lives inside the encapsulation boundary.
+ * Devtools-only handles on `globalThis.__zenbu_dev__`, kept off the public
+ * `ServiceRuntime` autocomplete surface. Lives here because it reaches into
+ * private internals (`scheduleReconcile`) inside the encapsulation boundary.
  */
 function installDevHook(rt: ServiceRuntime): void {
   const internals = rt as unknown as {
@@ -813,20 +789,10 @@ export const runtime: ServiceRuntime = (() => {
   return fresh;
 })();
 
-// =============================================================================
-//                        Plugin / app-entrypoint registry
-// =============================================================================
-//
-// The single source of truth for plugin metadata at runtime. Populated by the
-// generated barrel (see `loaders/zenbu.ts`), which emits one
-// `registerPlugin({...})` call per resolved plugin BEFORE any of that
-// plugin's service files import. Consumers (services/db, vite-plugins,
-// advice-config) read from here instead of walking the filesystem looking
-// for `zenbu.plugin.json`.
-//
-// Module-singleton via `globalThis.__zenbu_plugin_registry__`, same trick as
-// the service runtime, so a hot reload of THIS file keeps the existing
-// registry contents.
+// Plugin / app-entrypoint registry. Single source of truth for plugin
+// metadata at runtime, populated by the generated barrel (`loaders/zenbu.ts`)
+// before any plugin's service files import. Module-singleton via
+// `globalThis.__zenbu_plugin_registry__` so HMR of this file keeps contents.
 
 /**
  * A plugin manifest after the loader has resolved every relative path to

@@ -11,22 +11,11 @@ import type {
   ResolvedPlugin,
 } from "../lib/build-config";
 
-// ================================================================
-// Layout
-//
-//   <plugin>/.zenbu/types/
-//     own/{services,db-sections,events,preloads,index}.ts
-//     deps/<other>/{services,db-sections,events,preloads,index}.ts
-//     zenbu-register.ts        # composite — augments @zenbujs/core/registry
-//
-// All `import type` paths resolve to the actual upstream source files on
-// disk. Nothing is copied; the whole `.zenbu/types/` tree is gitignored
-// and regenerated on every `zen link`. If a plugin moves, link is rerun.
-//
-// Composites import only their own `./own` and `./deps/<other>` indices —
-// never another plugin's composite — so the graph is a strict DAG even
-// with mutual `dependsOn`.
-// ================================================================
+// Emits `<plugin>/.zenbu/types/` (own + deps surfaces + a zenbu-register.ts
+// composite augmenting @zenbujs/core/registry). All `import type` paths point
+// at upstream source on disk; nothing is copied, and the tree is gitignored
+// and regenerated on every `zen link`. Composites import only own/dep indices
+// (never another composite), keeping the graph a strict DAG under mutual deps.
 
 const DOTZENBU_TYPES = path.join(".zenbu", "types");
 
@@ -63,9 +52,7 @@ interface WriteOpts {
   quiet: boolean;
 }
 
-// =============================================================================
-//                                Discovery
-// =============================================================================
+// Discovery
 
 function expandGlob(baseDir: string, pattern: string): string[] {
   if (!pattern.includes("*")) {
@@ -123,9 +110,7 @@ function discoverOwnSurface(plugin: ResolvedPlugin): OwnSurface {
   };
 }
 
-// =============================================================================
-//                                Helpers
-// =============================================================================
+// Helpers
 
 function relImport(from: string, to: string): string {
   let r = path.relative(from, to).split(path.sep).join("/");
@@ -168,14 +153,10 @@ function readJsonLoose(raw: string): any {
   return JSON.parse(stripped);
 }
 
-// =============================================================================
-//                          Surface generation (own AND deps)
-//
-// `own/` and `deps/<other>/` are the same shape — both are a per-plugin
-// service/db/events/preloads bundle. The only difference is the `surfaceDir`
-// (where the files are written) and which plugin's source paths they
-// `import type` from. So one generator services both.
-// =============================================================================
+// Surface generation (own AND deps)
+// `own/` and `deps/<other>/` are the same per-plugin bundle, differing only in
+// `surfaceDir` and which plugin's source they `import type` from — so one
+// generator services both.
 
 function generateServicesFile(
   surfaceDir: string,
@@ -334,9 +315,7 @@ function writeSurface(
   );
 }
 
-// =============================================================================
-//                          Composite generation
-// =============================================================================
+// Composite generation
 
 interface CompositeDep {
   name: string;
@@ -407,9 +386,7 @@ function generateCompositeFile(args: {
   return lines.join("\n");
 }
 
-// =============================================================================
-//                          tsconfig.json + .gitignore bootstrap
-// =============================================================================
+// tsconfig.json + .gitignore bootstrap
 
 const REGISTER_INCLUDE = "./.zenbu/types/zenbu-register.ts";
 
@@ -473,9 +450,7 @@ function bootstrapGitignore(pluginDir: string, opts: WriteOpts): void {
   if (!opts.quiet) console.log(`  Updated ${gitignorePath}`);
 }
 
-// =============================================================================
-//                          --types-config (core's self-link)
-// =============================================================================
+// --types-config (core's self-link)
 
 type LinkConfig = {
   name: string;
@@ -588,9 +563,7 @@ function writeCoreSurfaceFiles(args: {
   writeIfChanged(args.augmentOut, generateCoreAugmentFile(), args.opts);
 }
 
-// =============================================================================
-//                                Argv parsing
-// =============================================================================
+// Argv parsing
 
 function parseLinkArgs(argv: string[]): {
   manifestArg: string | null;
@@ -643,9 +616,7 @@ function parseLinkArgs(argv: string[]): {
   };
 }
 
-// =============================================================================
-//                                linkProject
-// =============================================================================
+// linkProject
 
 export type LinkProjectResult = {
   /** Legacy field. Points at the host's primary `.zenbu/types` directory. */
@@ -827,9 +798,7 @@ export async function linkSinglePlugin(
   await processOnePlugin(plugin, writeOpts, log);
 }
 
-// =============================================================================
-//                                CLI entrypoint
-// =============================================================================
+// CLI entrypoint
 
 const CONFIG_NAMES = [
   "zenbu.config.ts",

@@ -1,21 +1,11 @@
 /**
- * Boot-trace — opt-in, low-overhead startup tracer.
+ * Boot-trace — opt-in startup tracer (`ZENBU_BOOT_TRACE=1`). Records spans and
+ * marks across the main process; `flush()` prints an ASCII flame graph and
+ * writes JSON to `<project>/traces/boot/`. Anchored to process start via
+ * `process.uptime()` so the pre-JS Electron spin-up gap is visible.
  *
- * Records spans (durations) and marks (points in time) across the main
- * process, with renderer events ingested through `addEvents()` after the
- * websocket connects. On `flush()` it renders an ASCII flame graph to
- * stdout and writes a JSON snapshot to `<project>/traces/boot/`.
- *
- * Anchored to process start via `performance.now()` + `process.uptime()`
- * so the "electron is just spinning up" gap before our code runs is
- * visible too.
- *
- * Stored on `globalThis.__zenbu_boot_trace__` so:
- *   - HMR re-evaluating this module doesn't reset the trace
- *   - the tsx loader worker (different module graph) sees the same buffer
- *   - the user can `globalThis.__zenbu_boot_trace__.flush()` from devtools
- *
- * Enabled with `ZENBU_BOOT_TRACE=1`.
+ * Stored on `globalThis.__zenbu_boot_trace__` so HMR and the tsx loader worker
+ * (separate module graph) share one buffer.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -126,10 +116,8 @@ function init(): BootTraceState {
 
 const state = init();
 
-// ---------------------------------------------------------------------------
-// Event-loop lag sampler & CPU usage tracking. These let us tell apart
-// "X is slow because there's other work" from "X is slow intrinsically".
-// ---------------------------------------------------------------------------
+// Event-loop lag sampler & CPU usage tracking — distinguishes "slow because of
+// other work" from "slow intrinsically".
 
 interface LagBlock {
   /** When the block started (ms since process start). */
@@ -159,11 +147,8 @@ const lagState: LagState = {
   topBlocks: [],
 };
 
-/** Start polling the event loop every 5ms. Each tick reports how much
- * wall-clock has elapsed since the last tick beyond the expected 5ms;
- * anything > 50ms means the JS thread was busy in sync code or a long
- * task and couldn't service timers. Total "blockedMs" is a proxy for
- * how saturated the event loop was during boot. */
+/** Poll the event loop every 5ms; lag beyond ~50ms over the expected interval
+ * means the JS thread was blocked. `blockedMs` proxies boot saturation. */
 function startLagSampler(): void {
   if (lagState.stop) return;
   const intervalMs = 5;

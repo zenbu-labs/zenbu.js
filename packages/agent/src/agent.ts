@@ -58,44 +58,18 @@ export type AgentConfig = {
   clientConfig: AcpClientConfig;
   cwd: string;
   mcpServers?: acp.McpServer[];
-  /**
-   * Kyju-backed persistence. Structurally, the host's section-scoped
-   * client (e.g. `kernelClient.plugin.kernel`) satisfies this shape.
-   * When omitted the agent runs in ephemeral mode: sessionId + first-prompt
-   * latch live in-memory only, event log writes are no-ops, and no
-   * agent/config record state is synced to the DB.
-   */
+  /** Kyju-backed persistence; when omitted the agent runs ephemeral (in-memory, no DB writes). */
   db?: AgentDb;
-  /**
-   * Absolute path to a node-compatible runtime (node, bun, etc.) used to
-   * execute the MCP proxy script. The proxy is a small `require("net")` CJS
-   * shim that bridges stdio to the agent's unix socket.
-   *
-   * If omitted, the proxy MCP server is not registered
-   */
+  /** Path to a node-compatible runtime for the MCP proxy script; if omitted, the proxy server isn't registered. */
   mcpProxyCommand?: string;
-  /**
-   * Called when the agent transitions between states. Pure observer — the
-   * Agent class handles its own DB state sync (status/processState fields
-   * on the agent record) when `db` is present.
-   */
+  /** Pure observer of state transitions; the Agent handles its own DB state sync when `db` is present. */
   onStateChange?: (state: AgentState) => void;
-  /**
-   * Called for every ACP session update the agent receives. Used by one-shot
-   * sub-agents (e.g. title summarization) that need to observe the stream
-   * but don't persist anything. In the default flow the DB-backed event log
-   * is the observer.
-   */
+  /** Observes every ACP session update without persisting; used by one-shot sub-agents. */
   onSessionUpdate?: (update: acp.SessionUpdate) => void;
   /**
-   * Invoked once on the first prompt to this agent. Returned content blocks
-   * are prepended to the user's prompt. Use for skill routing metadata or
-   * other "system-prompt-ish" preamble that ACP has no first-class slot for.
-   * Blocks the send until it resolves; failures are non-fatal (logged).
-   *
-   * The "has this already fired" decision is durable via `db` when present
-   * (checks / writes `firstPromptSentAt` on the agent record); otherwise
-   * scoped to this Agent instance.
+   * Invoked once on the first prompt; returned blocks are prepended to the
+   * prompt. Blocks the send (failures non-fatal); "already fired" is durable
+   * via `db` when present, else scoped to this instance.
    */
   firstPromptPreamble?: () => Promise<acp.ContentBlock[]>;
 };

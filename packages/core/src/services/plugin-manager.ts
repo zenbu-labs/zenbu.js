@@ -28,7 +28,12 @@ export interface PluginManifestRow {
   path: string
   /** Manifest file this row currently lives in. */
   manifestPath: string
-  /** Resolved plugin name when the plugin is currently enabled, else null. */
+  /**
+   * The plugin's declared name. Resolved from the runtime when the
+   * plugin is enabled, else read statically from the manifest source.
+   * `null` only when the name can't be determined (unreadable or
+   * unparseable manifest).
+   */
   name: string | null
   enabled: boolean
   args?: unknown
@@ -92,7 +97,15 @@ export class PluginManagerService extends Service.create({
     const rows: PluginManifestRow[] = entries.map((entry) => ({
       path: entry.absPath,
       manifestPath: entry.sourceFile,
-      name: entry.enabled ? (nameByPath.get(path.dirname(entry.absPath)) ?? null) : null,
+      // A plugin's name is a static property of its manifest
+      // (`definePlugin({ name })`), so it must not depend on whether
+      // the plugin is currently loaded. Prefer the runtime name when
+      // the plugin is enabled (cheap, authoritative); otherwise read
+      // it statically from the manifest source so disabled plugins
+      // keep a stable identity instead of going nameless.
+      name:
+        nameByPath.get(path.dirname(entry.absPath)) ??
+        readManifestName(entry.absPath),
       enabled: entry.enabled,
       args: entry.args,
     }))
@@ -200,6 +213,44 @@ export class PluginManagerService extends Service.create({
 // =============================================================================
 //                                  helpers
 // =============================================================================
+
+/**
+ * Statically read a plugin's declared name from its manifest source
+ * (`definePlugin({ name: "..." })`) without loading the module. Used
+ * as a fallback for disabled plugins, which aren't in the runtime's
+ * loaded-plugin registry but still have a stable name on disk.
+ *
+ * Cached by path + mtime since `list()` is polled by the UI and a
+ * manifest's name effectively never changes between writes.
+ */
+const manifestNameCache = new Map<string, { mtimeMs: number; name: string | null }>()
+
+function readManifestName(absPath: string): string | null {
+  let mtimeMs: number
+  try {
+    mtimeMs = fs.statSync(absPath).mtimeMs
+  } catch {
+    return null
+  }
+  const cached = manifestNameCache.get(absPath)
+  if (cached && cached.mtimeMs === mtimeMs) return cached.name
+
+  let name: string | null = null
+  try {
+    const src = fs.readFileSync(absPath, "utf8")
+    // Match the first `name: "..."` inside a `definePlugin({ ... })`
+    // call. Non-greedy up to the name field; tolerant of whitespace
+    // and single/double/back quotes.
+    const match = src.match(
+      /definePlugin\s*\(\s*\{[\s\S]*?\bname\s*:\s*["'`]([^"'`]+)["'`]/,
+    )
+    name = match?.[1] ?? null
+  } catch {
+    name = null
+  }
+  manifestNameCache.set(absPath, { mtimeMs, name })
+  return name
+}
 
 interface ManifestState {
   plugins: Array<{ path: string; enabled?: boolean; args?: unknown }>

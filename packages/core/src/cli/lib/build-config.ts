@@ -143,18 +143,12 @@ export function resolveBuildConfig(config: BuildConfig): ResolvedBuildConfig {
   };
 }
 
-// =============================================================================
-//                                Plugin shape
-// =============================================================================
+// Plugin shape
 
 /**
- * A Zenbu plugin's main-process surface. Plugins are pure main-process: they
- * register services + side-effect modules (schema, preload, events). UI is
- * handled exclusively at the outer config level via `uiEntrypoint` — there
- * is exactly one HTML entrypoint per app.
- *
- * `services` is an array of glob patterns (relative to the plugin file's
- * directory). `schema` / `preload` / `events` are optional file paths.
+ * A Zenbu plugin's main-process surface (services + optional schema/preload/
+ * events). `services` is glob patterns relative to the plugin file's dir; the
+ * other paths are optional. UI lives at the config level (`uiEntrypoint`).
  */
 export interface Plugin {
   name: string;
@@ -169,31 +163,16 @@ export interface Plugin {
    */
   icons?: Record<string, string>;
   /**
-   * Other plugins whose **own type surface** this plugin needs at compile time.
-   *
-   * Each entry names an upstream plugin (`name`) and a relative path
-   * (`from`) to the file that defines it — either a `zenbu.plugin.ts`
-   * (whose default export is a `definePlugin(...)`) or a `zenbu.config.ts`
-   * (in which case `name` disambiguates which entry of `plugins:` to use).
-   *
-   * `zen link` materializes each declared dep as a vendored, committed copy
-   * inside `<plugin>/types/deps/<name>/`. The plugin's composite augmentation
-   * (`<plugin>/types/zenbu-register.ts`) then wires the vendored own surface
-   * into `ZenbuRegister`, so `useDb` / `useRpc` / `useEvents` selectors work
-   * even when the plugin is opened in isolation (no host context required).
-   *
-   * Composites never depend on other composites — only on **own** surfaces —
-   * so the dependency graph is a strict DAG and mutual deps are legal.
+   * Other plugins whose type surface this plugin needs at compile time.
+   * `zen link` vendors each declared dep so `useDb`/`useRpc`/`useEvents`
+   * resolve even when the plugin is opened in isolation.
    */
   dependsOn?: PluginDependency[];
 }
 
 /**
- * A type-time dependency on another plugin. `from` is the path to the
- * upstream's manifest file; `name` selects which plugin if `from` is a
- * `zenbu.config.ts` with multiple entries. Both fields are required so
- * the resolver never has to guess between same-named plugins in different
- * trees.
+ * A type-time dependency on another plugin. `from` is the upstream manifest
+ * path; `name` selects the plugin when `from` is a multi-entry config.
  */
 export interface PluginDependency {
   name: string;
@@ -250,44 +229,18 @@ export interface ResolvedPluginDependency {
   fromPath: string;
 }
 
-// =============================================================================
-//                                 Top-level config
-// =============================================================================
+// Top-level config
 
-/**
- * The whole-app `zenbu.config.ts` shape. Authored by user code; imported
- * (and re-imported on every change) by the loader and CLI.
- *
- * - `db`: directory the kyju database lives in (relative to the config file).
- * - `uiEntrypoint`: path to the boot-window's HTML file. Exactly one — there
- *   is no per-plugin UI (today's per-plugin `uiEntrypoint` was effectively a
- *   bug that the new shape disallows at the type level).
- * - `plugins`: flat list. Each entry is either an inline `definePlugin({...})`
- *   or a path to a `zenbu.plugin.ts` whose default export is a plugin. The
- *   "host plugin" is just `plugins[0]` by convention; nothing structurally
- *   distinguishes it.
- * - `build`: shipped as `defineBuildConfig({...})`. Drives `zen build:source`
- *   and `zen build:electron`.
- */
+/** The whole-app `zenbu.config.ts` shape, authored by user code. */
 export interface Config {
   /** Defaults to `./.zenbu/db` relative to the config file. */
   db?: string;
   uiEntrypoint: string;
   /**
-   * Path(s) to JSONC files declaring which plugins are loaded.
-   *
-   * When omitted, defaults to:
-   *   - `./zenbu.plugins.jsonc`        (tracked, required if it exists)
-   *   - `./zenbu.plugins.local.jsonc`  (gitignored, optional)
-   *
-   * Entries are layered by their absolute resolved `path` — later files
-   * override earlier ones. Missing files are silently skipped. Edits and
-   * file creation both hot-reload through the same machinery as edits to
-   * `zenbu.config.ts` itself.
-   *
-   * Build/publish commands consume the **tracked** manifest (the first
-   * declared file). Local overlay files are excluded so per-developer
-   * toggles don't ship.
+   * Path(s) to JSONC manifests declaring loaded plugins. Defaults to
+   * `./zenbu.plugins.jsonc` (tracked) + `./zenbu.plugins.local.jsonc`
+   * (gitignored). Later files override earlier; build/publish use only the
+   * first (tracked) file so per-developer overlays don't ship.
    */
   pluginsFiles?: string | string[];
   build?: BuildConfig;
@@ -330,25 +283,15 @@ export interface ResolvedConfig {
    */
   splashPath?: string;
   /**
-   * Absolute path to `installing.html` inside the entrypoint directory, if
-   * the user provided one. Optional. Production launcher loads this raw
-   * during clone + first install (before the user's source even exists in
-   * the apps-dir). Receives IPC progress events via the framework's
-   * built-in `installing-preload.cjs`. Not used in dev mode — `pnpm dev`
-   * doesn't clone or install.
+   * Absolute path to optional `installing.html`. Production launcher loads it
+   * raw during clone + first install; receives progress via
+   * `installing-preload.cjs`. Not used in dev.
    */
   installingPath?: string;
   /**
-   * Absolute path to `updating.html` inside the entrypoint directory, if
-   * the user provided one. Optional. Shown by the plugin-update supervisor
-   * (`packages/core/src/shared/plugin-update-supervisor.ts`) when an in-app
-   * update is applied at runtime — git fast-forward + optional dep refresh
-   * + relaunch. Shares the `installing-preload.cjs` API surface with
-   * `installing.html` so the page only needs to listen to one event
-   * (`error`) to surface failures.
-   *
-   * Used in both dev (resolved via `getAppEntrypoint()`) and prod (staged
-   * into Resources/ by `zen build:electron`).
+   * Absolute path to optional `updating.html`. Shown by the plugin-update
+   * supervisor during an in-app update. Shares the `installing-preload.cjs`
+   * API surface with `installing.html`.
    */
   updatingPath?: string;
   plugins: ResolvedPlugin[];

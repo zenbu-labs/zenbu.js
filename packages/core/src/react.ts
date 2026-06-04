@@ -255,11 +255,8 @@ export function ZenbuProvider({
                   timeOrigin: bt.timeOrigin,
                 }).catch(() => {});
               }
-              // Keep draining for a few seconds after connect. App-level
-              // readiness marks often happen after <ZenbuProvider> flips to
-              // connected (children mount, Suspense resolves, first frame / FCP
-              // fires). A single 1200ms drain made the flame graph look
-              // "ready" while visible app work was still happening.
+              // Keep draining after connect: readiness marks often fire later
+              // (children mount, Suspense resolves, first frame).
               const started = Date.now();
               const drainLateMarks = () => {
                 const more = bt.drain();
@@ -604,21 +601,9 @@ export type { CollectionRefValue };
 // ---- <FocusContext>: focus-context primitive for shortcut `when` ----
 
 /**
- * Declares a named focus region. The region is *active* whenever
- * DOM focus is anywhere inside the wrapper element. Shortcuts
- * registered with a matching `when` clause only fire while the
- * region is active.
- *
- * Multiple `<FocusContext>` instances nest naturally — the active
- * stack is innermost-first. You can declare more than one id at
- * the same level by passing an array (`id={["app.sidebar",
- * "app.workspace"]}`), which is exposed as a space-separated
- * `data-zenbu-focus-context` attribute (same convention as `class`)
- * that `ShortcutDispatcher` walks at keydown time.
- *
- * `<FocusContext>` renders a `<div>` wrapper by default. Pass
- * `tabIndex={-1}` and a `ref` (or use `useFocusContext`) if you want
- * the wrapper itself to be programmatically focusable.
+ * Declares a named focus region, active whenever DOM focus is inside it.
+ * Contexts nest (active stack is innermost-first); pass an array for multiple
+ * ids at one level. Renders a `<div>` wrapper.
  */
 export interface FocusContextProps {
   id: string | string[];
@@ -648,20 +633,14 @@ export function FocusContext({
       style,
       tabIndex,
       "data-zenbu-focus-context": dataValue,
-      // Route pointerdown on non-focusable children back to the wrapper
-      // so clicking an unfocusable list row still "enters" the context.
-      // We only steal focus when the click target isn't itself focusable
-      // — buttons, inputs, links handle their own focus.
+      // Clicking a non-focusable child focuses the wrapper so it "enters" the
+      // context; focusable targets (buttons, inputs, links) handle their own focus.
       onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => {
         const target = e.target as HTMLElement | null;
         if (!target) return;
-        // Already focusable? Let the native behavior take over.
         if (isFocusable(target)) return;
         const wrapper = e.currentTarget;
         if (wrapper && wrapper.tabIndex >= 0) {
-          // preventScroll keeps lists from jumping when the user just
-          // wanted to click a row, and preventDefault below would
-          // otherwise also kill text selection.
           try { wrapper.focus({ preventScroll: true }); } catch {}
         }
       },
@@ -693,17 +672,8 @@ function isFocusable(el: HTMLElement): boolean {
 }
 
 /**
- * Hook companion for `<FocusContext>`. Returns:
- *
- *   - `ref`     : attach to your container (or pass to `<FocusContext
- *                 innerRef={...} tabIndex={-1}>`) so callers can
- *                 programmatically focus the region.
- *   - `active`  : true while DOM focus is inside `ref.current`.
- *                 Reactive — the component re-renders on transitions.
- *   - `focus()` : imperatively focus the container with `preventScroll`.
- *
- * The `active` flag tracks the *single* element this hook owns; for
- * "is the global stack including this id active" use
+ * Hook companion for `<FocusContext>`. Returns `{ ref, active, focus() }` where
+ * `active` tracks only this element's focus. For the global stack use
  * `useDb(root => root.core.focus.contexts.includes(id))`.
  */
 export function useFocusContext(_id: string | string[]) {

@@ -6,20 +6,7 @@ import { createLogger } from "../shared/log";
 
 const log = createLogger("shortcuts");
 
-/**
- * `when` clause for a shortcut. Filters the shortcut against the
- * currently-active focus context stack (see `FocusContext` in
- * `@zenbujs/core/react`).
- *
- *   undefined         → always active (current behavior)
- *   "sidebar"         → "sidebar" must be in the active stack
- *   ["a", "b"]        → both "a" AND "b" must be active
- *   { any: ["a","b"]} → at least one of the listed ids must be active
- *   { all: [...] }    → every listed id must be active
- *   { not: "modal" }  → "modal" must NOT be active
- *
- * Composable: `{ all: ["sidebar"], not: "modal" }`.
- */
+/** Filters a shortcut against the active focus-context stack. Composable, e.g. `{ all: ["sidebar"], not: "modal" }`. */
 export type When =
   | string
   | string[]
@@ -29,56 +16,22 @@ export type When =
       not?: string | string[];
     };
 
-/**
- * Plugin-facing shortcut definition. Plugins call
- * `runtime.get(ShortcutsService).register({...})` (or grab the service via
- * deps) from inside `evaluate()` to declare what shortcuts exist; the
- * service stores the def in memory and persists only user overrides.
- *
- * `handler` is a fire-and-forget callback that runs in the main process
- * when the shortcut fires. The typical implementation is
- *   `() => this.ctx.rpc.emit.<plugin>.<event>({ source })`
- * so existing renderer subscriptions keep working.
- *
- * `when` (optional) restricts the shortcut to a focus context. Without
- * a `when`, the binding is global. With one, it only fires while the
- * named context is in the active stack — and a scoped binding always
- * beats an unscoped one for the same key, so global `Space` can
- * coexist with a sidebar-scoped `Space`.
- */
+/** Plugin-facing shortcut definition, registered via `register()` from a service's `evaluate()`. */
 export interface ShortcutDef {
-  /**
-   * Stable id used in the DB as the override key and in the settings UI
-   * as the canonical pointer. Convention: `<plugin>.<verb-noun>` (e.g.
-   * `app.toggleCommandPalette`).
-   */
+  /** Stable id, also the DB override key. Convention: `<plugin>.<verb-noun>`. */
   id: string;
-  /** Human label shown in the settings UI. */
   name: string;
   description?: string;
-  /** Optional UI category for grouping (e.g. "Navigation", "Panels"). */
   category?: string;
-  /**
-   * The factory default. Single binding or a list of equivalent
-   * accelerators (e.g. Cmd+/ and Cmd+\\ both opening the same split).
-   */
+  /** Single binding or a list of equivalent accelerators. */
   defaultBinding: ShortcutBinding | ShortcutBinding[];
-  /** Optional focus-context filter. See {@link When}. */
+  /** A scoped binding beats an unscoped one for the same key. See {@link When}. */
   when?: When;
-  /**
-   * Called when the resolved binding matches a keystroke. Errors are
-   * caught and logged so a buggy handler can't take down the dispatch
-   * loop.
-   */
+  /** Errors are caught and logged so a buggy handler can't break the dispatch loop. */
   handler: () => void | Promise<void>;
 }
 
-/**
- * Wire-friendly shape of one keystroke event, sent up by the prelude's
- * keydown forwarder. Matches `KeyboardEvent` plus the modifier flags we
- * actually care about. Stays a plain object so it serializes through
- * postMessage and RPC.
- */
+/** Serializable keystroke event forwarded by the renderer's keydown handler. */
 export interface KeyboardInput {
   key: string;
   code?: string;
@@ -88,11 +41,7 @@ export interface KeyboardInput {
   shift?: boolean;
 }
 
-/**
- * Settings-UI shape. Combines a registered definition with the current
- * effective binding (override if present, otherwise default[0]) and the
- * full list of defaults so the UI can render the reset button correctly.
- */
+/** Settings-UI shape: a def plus its current effective binding and defaults. */
 export interface ShortcutListing {
   id: string;
   name: string;
@@ -100,19 +49,13 @@ export interface ShortcutListing {
   category?: string;
   defaultBindings: ShortcutBinding[];
   binding: ShortcutBinding | null;
-  /** True if a row has a user-set override in the DB. */
   isCustom: boolean;
   /** True when the override is `null`, i.e. explicitly disabled. */
   isDisabled: boolean;
-  /** The `when` clause attached to the def, if any. */
   when?: When;
 }
 
-/**
- * Snapshot returned by `bindings()`. The prelude uses this to decide
- * whether to `preventDefault()` a keystroke synchronously. `when` is
- * passed through so the prelude can do the same filtering locally.
- */
+/** Snapshot returned by `bindings()`; lets the renderer decide `preventDefault()` locally. */
 export interface ShortcutBindingsSnapshot {
   id: string;
   bindings: ShortcutBinding[];
@@ -123,18 +66,12 @@ function inputMatchesBinding(
   input: KeyboardInput,
   binding: ShortcutBinding,
 ): boolean {
-  // Modifier comparison treats `undefined` on the binding side as "must be
-  // false" — a binding that doesn't mention shift requires shift to be
-  // *up*. This keeps Cmd+P distinct from Cmd+Shift+P.
+  // An unset modifier on the binding means it must be up (keeps Cmd+P distinct from Cmd+Shift+P).
   if (!!binding.meta !== !!input.meta) return false;
   if (!!binding.control !== !!input.control) return false;
   if (!!binding.alt !== !!input.alt) return false;
   if (!!binding.shift !== !!input.shift) return false;
-  // `key` is the post-layout character. We match case-insensitively so
-  // Shift+P and Shift+p both work. `code` is the physical key code (e.g.
-  // `KeyP`, `BracketLeft`) — matched verbatim when the binding specifies
-  // it, so e.g. bracket shortcuts still work on keyboard layouts where
-  // the typed character differs.
+  // `key` matches case-insensitively; `code` (physical key) matches verbatim for layout-independent bindings.
   if (binding.code && input.code !== binding.code) return false;
   if (binding.key) {
     const want = binding.key.toLowerCase();
@@ -155,13 +92,7 @@ function effectiveBindings(
     : [def.defaultBinding];
 }
 
-/**
- * Test a `when` clause against the active focus-context stack.
- *
- * The active stack is innermost-first: index 0 is the most-nested
- * `<FocusContext>` ancestor of the focused element, and the last
- * entry is the outermost.
- */
+/** Test a `when` clause against the active focus-context stack (innermost-first). */
 export function whenMatches(
   when: When | undefined,
   activeContexts: readonly string[],
@@ -180,18 +111,9 @@ export function whenMatches(
 }
 
 /**
- * Compute a numeric specificity score for a `when` clause against the
- * active stack. Higher = wins.
- *
- *   undefined  → -1   (unscoped: loses to any scoped match for same key)
- *   matched    →  N   where N is `activeContexts.length - innermostIndex`,
- *                     i.e. the closer the matched id is to the focused
- *                     element, the higher the score.
- *
- * Only positive (matching) ids referenced in `all` / `any` / direct
- * string / array contribute. `not` is satisfied but doesn't raise
- * specificity (you can't "win" by virtue of *not* being inside a
- * context).
+ * Specificity score for a `when` clause; higher wins. Unscoped is -1; a match
+ * scores higher the closer the matched id is to the focused element. `not`
+ * doesn't raise specificity.
  */
 export function whenSpecificity(
   when: When | undefined,
@@ -205,11 +127,10 @@ export function whenSpecificity(
     if (when.all) ids.push(...when.all);
     if (when.any) ids.push(...when.any);
   }
-  let best = 0; // a scoped match with no referenced ids still > unscoped (-1)
+  let best = 0; // a scoped match with no referenced ids still beats unscoped (-1)
   for (const id of ids) {
     const idx = activeContexts.indexOf(id);
     if (idx === -1) continue;
-    // innermost (idx 0) gets the highest score.
     const score = activeContexts.length - idx;
     if (score > best) best = score;
   }
@@ -217,23 +138,9 @@ export function whenSpecificity(
 }
 
 /**
- * Central shortcut registry + dispatcher. Lives under `core` so any
- * plugin can register against it without depending on the host app.
- *
- * Lifecycle:
- *   1. Plugin services call `register({...})` from `evaluate()`
- *      (wrapped in `this.setup` so re-evaluates de-dup cleanly).
- *   2. Each renderer's `ZenbuProvider` mounts a `ShortcutDispatcher`
- *      that captures `keydown` on `window`, reads the active focus
- *      context stack from the DOM, and calls `handleKeydown` over
- *      RPC for dispatch.
- *   3. `handleKeydown` filters defs by their `when` clause against
- *      the active stack, picks the most-specific match, and runs
- *      its handler.
- *
- * Bindings live in `db.core.shortcuts`. The replica auto-syncs them
- * to every renderer so the settings UI and the renderer's
- * `preventDefault` cache stay consistent without manual broadcasts.
+ * Central shortcut registry + dispatcher. Lives under `core` so any plugin can
+ * register against it. Overrides live in `db.core.shortcuts` and auto-sync to
+ * every renderer.
  */
 export class ShortcutsService extends Service.create({
   key: "shortcuts",
@@ -241,11 +148,7 @@ export class ShortcutsService extends Service.create({
 }) {
   private defs = new Map<string, ShortcutDef>();
 
-  /**
-   * Register a shortcut definition. Returns an unregister function so
-   * callers can wrap the call in `this.setup(...)` and get clean teardown
-   * on hot reload.
-   */
+  /** Register a shortcut definition. Returns an unregister function for `this.setup(...)`. */
   register(def: ShortcutDef): () => void {
     if (this.defs.has(def.id)) {
       log.verbose(`re-registering "${def.id}"`);
@@ -260,10 +163,7 @@ export class ShortcutsService extends Service.create({
     };
   }
 
-  /**
-   * RPC: return the full sorted list of shortcuts plus their current
-   * effective bindings. Used by the settings UI.
-   */
+  /** RPC: sorted list of shortcuts plus effective bindings, for the settings UI. */
   list(): ShortcutListing[] {
     const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
       string,
@@ -295,10 +195,7 @@ export class ShortcutsService extends Service.create({
     return rows;
   }
 
-  /**
-   * RPC: persist a user override. Pass `binding: null` to explicitly
-   * disable the shortcut, or call `resetBinding` to revert to default.
-   */
+  /** RPC: persist a user override. `binding: null` disables the shortcut. */
   async setBinding(args: {
     id: string;
     binding: ShortcutBinding | null;
@@ -322,20 +219,11 @@ export class ShortcutsService extends Service.create({
   }
 
   /**
-   * RPC: dispatch a keystroke forwarded by the renderer's
-   * `ShortcutDispatcher`. The caller passes the active focus-context
-   * stack (innermost first) so dispatch sees the same context the
-   * renderer used to decide `preventDefault()`.
-   *
-   * Returns `{ handled, id? }`. Fire-and-forget at the renderer side
-   * — the result is only used for debug logging.
+   * RPC: dispatch a keystroke forwarded by the renderer. `contexts` is the
+   * active focus-context stack so dispatch matches what the renderer saw.
    */
   handleKeydown(args: {
     input: KeyboardInput;
-    /**
-     * Live active focus-context stack (innermost first) at the
-     * moment the keystroke fired.
-     */
     contexts?: readonly string[];
   }): { handled: boolean; id?: string } {
     const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
@@ -346,8 +234,7 @@ export class ShortcutsService extends Service.create({
       args.contexts ??
       ((this.ctx.db.client.readRoot().core?.focus?.contexts ?? []) as string[]);
 
-    // Collect all (def, binding) candidates that match the keystroke
-    // *and* whose `when` is satisfied by the current active stack.
+    // Pick the most-specific def whose binding matches and whose `when` is satisfied.
     type Cand = { def: ShortcutDef; score: number };
     let best: Cand | null = null;
     for (const def of this.defs.values()) {
@@ -368,8 +255,7 @@ export class ShortcutsService extends Service.create({
       if (best === null || score > best.score) {
         best = { def, score };
       }
-      // Ties fall to first-registered (deterministic; preserves the
-      // existing single-match behavior for un-scoped shortcuts).
+      // Ties fall to first-registered.
     }
 
     if (best) {
@@ -379,16 +265,7 @@ export class ShortcutsService extends Service.create({
     return { handled: false };
   }
 
-  /**
-   * RPC: write the flattened focus-context stack to the DB. Plugin
-   * services that want to read "which context is active right now"
-   * via `useDb` can subscribe to `root.core.focus.contexts`.
-   *
-   * The renderer's `ShortcutDispatcher` doesn't need this round-trip
-   * for its own dispatch — it reads the active stack from the DOM
-   * synchronously at keydown time — but writing it lets other
-   * subscribers observe focus changes.
-   */
+  /** RPC: publish the active focus-context stack to `root.core.focus.contexts` for other subscribers. */
   setFocus(args: { contexts: string[] }): void {
     void this.ctx.db.client
       .update((root) => {
@@ -401,23 +278,14 @@ export class ShortcutsService extends Service.create({
       .catch(() => {});
   }
 
-  /**
-   * Read the current active focus-context stack (innermost first) from
-   * the replica. Synchronous; safe to call from any service.
-   */
+  /** Read the active focus-context stack (innermost first) from the replica. */
   activeContexts(): string[] {
     return (
       (this.ctx.db.client.readRoot().core?.focus?.contexts ?? []) as string[]
     ).slice();
   }
 
-  /**
-   * RPC: snapshot of the active bindings, in the simple shape the
-   * renderer's `ShortcutDispatcher` uses for its local matcher. The
-   * `when` clause is included so the renderer can replicate the
-   * filtering logic and only `preventDefault()` when the binding
-   * would actually fire.
-   */
+  /** RPC: snapshot of active bindings (with `when`) for the renderer's local matcher. */
   bindings(): ShortcutBindingsSnapshot[] {
     const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
       string,
@@ -437,8 +305,7 @@ export class ShortcutsService extends Service.create({
   }
 
   evaluate() {
-    // No work at boot. Plugins register via `register()` during their
-    // own `evaluate()`.
+    // No work at boot; plugins register during their own `evaluate()`.
   }
 
   private invoke(def: ShortcutDef): void {
@@ -458,8 +325,7 @@ export class ShortcutsService extends Service.create({
     try {
       this.ctx.rpc.emit.core.shortcuts.changed({});
     } catch {
-      // RPC may not be initialised yet during very-early registrations
-      // (e.g. during the first evaluate pass). The next emit catches up.
+      // RPC may not be initialised during very-early registrations; the next emit catches up.
     }
   }
 }

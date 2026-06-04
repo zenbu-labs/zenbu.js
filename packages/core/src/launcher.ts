@@ -1,27 +1,12 @@
 /**
- * Zenbu launcher shim.
+ * Zenbu launcher shim. First user code Electron runs after boot (the .app's
+ * `package.json#main`). Clones/fetches the source mirror into
+ * `~/.zenbu/apps/<name>/`, installs deps, then dynamic-imports the apps-dir's
+ * `setup-gate.mjs` as the one-and-only `@zenbujs/core` instance.
  *
- * Shipped inside `@zenbujs/core/dist/launcher.mjs` and copied into the .app
- * bundle by `zen build:electron`. The bundle's `package.json#main` points
- * here, so this is the FIRST user code Electron evaluates after main process
- * boot.
- *
- * Job:
- *   1. Clone or fetch the configured source mirror into `~/.zenbu/apps/<name>/`
- *      (we no longer bundle a `seed/` snapshot — every launch picks up
- *      whatever's on the mirror's branch HEAD).
- *   2. Run `pnpm install` against the apps-dir using the bundled toolchain.
- *   3. Dynamic-`import()` the apps-dir's `@zenbujs/core/dist/setup-gate.mjs`,
- *      which becomes the one-and-only `@zenbujs/core` instance for the rest
- *      of the process lifetime.
- *
- * It must NOT import `@zenbujs/core`. Doing so would create two distinct
- * module identities (this bundled copy + the apps-dir copy) and split-brain
- * the runtime singleton, dynohot HMR, and `instanceof` checks.
- *
- * Allowed deps: node built-ins, the `electron` main-process API (provided
- * at runtime), and `isomorphic-git` (bundled into this file by tsdown — see
- * `packages/core/tsdown.config.ts` `neverBundle: ["electron"]`).
+ * Must NOT import `@zenbujs/core`: a second module identity would split-brain
+ * the runtime singleton, dynohot HMR, and `instanceof` checks. Allowed deps:
+ * node built-ins, `electron`, and `isomorphic-git` (bundled by tsdown).
  */
 import { app, BaseWindow, WebContentsView, nativeTheme, ipcMain } from "electron";
 import { existsSync } from "node:fs";
@@ -48,23 +33,10 @@ import {
   pickZenbuBgEntry,
 } from "./shared/zenbu-bg-parse";
 
-// =============================================================================
-//                          stdio + logging safety net
-// =============================================================================
-// When the .app is launched from Finder (or `open <app>`), the main process
-// inherits stdout/stderr connected to pipes whose other end launchd
-// promptly closes; subsequent writes throw EPIPE. Vite warmup / Effect's
-// failure reporter / dynohot / user `console.log`s then crash the whole app
-// with "Uncaught Exception: write EPIPE".
-//
-// Patching `console.log/error` is NOT enough — Effect (and others) capture
-// `console.error` at module init time before our wrapper installs, then
-// call the captured reference forever. The reliable fix is to patch the
-// underlying *streams* (`process.stdout.write`, `process.stderr.write`) so
-// even the captured-original `console.error` flows through our try/catch.
-/**
- * fixme this is nonsense
- */
+// stdio + logging safety net. Launched from Finder, the main process inherits
+// stdout/stderr pipes that launchd closes, so writes throw EPIPE and crash the
+// app. We patch the underlying streams (not just console.*) because Effect and
+// others capture `console.error` at init and call the original forever.
 const _logDir = path.join(os.homedir(), ".zenbu", ".internal");
 fs.mkdirSync(_logDir, { recursive: true });
 const _logStream = fs.createWriteStream(path.join(_logDir, "launcher.log"), {
@@ -163,25 +135,11 @@ const LEGACY_PACKAGE_MANAGER: PackageManagerSpec = {
 const APP_PATH = app.getAppPath();
 const RESOURCES_PATH = path.dirname(APP_PATH);
 
-// =============================================================================
-//                          installing.html window
-// =============================================================================
-// When the user ships an `installing.html` (declared by presence of
-// `<uiEntrypoint>/installing.html` and staged into Resources/ by
-// `zen build:electron`), the launcher pops a BaseWindow + WebContentsView
-// loading that HTML BEFORE clone + first install. The framework's built-in
-// preload (`installing-preload.cjs`) exposes `window.zenbuInstall.on(event, cb)`;
-// the launcher emits events on these channels:
-//
-//   zenbu:install:step      { id, label }
-//   zenbu:install:message   { text }
-//   zenbu:install:progress  { phase?, loaded?, total?, ratio? }
-//   zenbu:install:done      { id }
-//   zenbu:install:error     { id?, message }
-//
-// On successful install, the launcher hands the BaseWindow off to setup-gate
-// via `globalThis.__zenbu_boot_windows__`; setup-gate's `spawnSplashWindow`
-// adopts it and swaps the WebContentsView in place for splash content.
+// installing.html window. If the user ships `<uiEntrypoint>/installing.html`,
+// the launcher shows it in a BaseWindow before clone + first install, emitting
+// `zenbu:install:*` IPC events that its preload forwards to
+// `window.zenbuInstall`. On success the BaseWindow is handed to setup-gate via
+// `globalThis.__zenbu_boot_windows__` for splash reuse.
 
 type InstallEvent = "step" | "message" | "progress" | "done" | "error";
 
@@ -422,19 +380,11 @@ function isExistingClone(dir: string): boolean {
 }
 
 /**
- * Repair a partial working tree left behind by an interrupted clone/checkout
- * (e.g. the cold-boot install hung or was killed mid-clone). The `.git`
- * directory exists so `isExistingClone` is true and the launcher would
- * otherwise trust the tree as-is, even though tracked files are missing —
- * which surfaces downstream as confusing errors like "uiEntrypoint must point
- * at a directory".
- *
- * We only restore tracked files that are ABSENT from disk, and we check them
- * out at the CURRENT HEAD. This:
- *   - never changes the commit (preserves the "no auto-update on relaunch"
- *     guarantee — updates still go through UpdaterService at runtime), and
- *   - never clobbers files the user has edited (this is a hackable tree);
- *     only missing files are materialized via `filepaths`.
+ * Repair a partial working tree from an interrupted clone/checkout: `.git`
+ * exists (so `isExistingClone` trusts it) but tracked files are missing.
+ * Only ABSENT tracked files are restored, at the CURRENT HEAD — never changes
+ * the commit (preserves "no auto-update on relaunch") and never clobbers
+ * user-edited files (this is a hackable tree).
  */
 async function repairPartialCheckout(
   dir: string,

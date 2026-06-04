@@ -1,6 +1,3 @@
-/**
- * this file is in a really hacky state needs to be fixed
- */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -62,16 +59,10 @@ type PluginController = {
 const verbose = process.env.ZENBU_VERBOSE === "1";
 
 /**
- * Suppress `@babel/generator`'s "[BABEL] Note: The code generator has
- * deoptimised the styling of <file> as it exceeds the max of 500KB" notice.
- * It's hardcoded as `console.error` in @babel/generator's printer with no
- * opt-out (https://github.com/babel/babel/issues/7569). Vite's
- * `@vitejs/plugin-react` runs Babel for fast-refresh on prebundled deps
- * caches, hitting this for `react-dom_client.js` and similar large chunks
- * on every dev boot. We filter the one specific message at the
- * `console.error` boundary so the rest of console.error stays useful.
- *
- * Patched once at module init, before any Vite dev server has started.
+ * Suppress `@babel/generator`'s "deoptimised ... exceeds the max of 500KB"
+ * notice — hardcoded as `console.error` with no opt-out
+ * (https://github.com/babel/babel/issues/7569), fired on every dev boot by
+ * `@vitejs/plugin-react`. Filter only that one message at the boundary.
  */
 const _origConsoleError = console.error.bind(console);
 console.error = (...args: unknown[]): void => {
@@ -474,13 +465,10 @@ async function registerLoadersPhase(
   });
 
   process.env.ZENBU_ADVICE_ROOT = projectRoot;
-  // Main-process advice has no public API yet — nothing in user code
-  // calls `advise()` against a main-process module today. Registering
-  // the loader anyway costs ~2200ms of blocked event loop on boot
-  // because every user `.ts` file gets parsed by babel inside the loader
-  // worker (whose `Atomics.wait()` pins the main thread). Skip the
-  // import entirely; opt in with `ZENBU_ENABLE_MAIN_ADVICE=1` once the
-  // loader is rewritten on top of swc / a precompiled native binding.
+  // Main-process advice has no public API yet, and registering the loader
+  // costs ~2200ms of blocked event loop on boot (babel parses every user
+  // `.ts` in the loader worker, whose `Atomics.wait()` pins the main thread).
+  // Skip it; opt in with `ZENBU_ENABLE_MAIN_ADVICE=1`.
   if (process.env.ZENBU_ENABLE_MAIN_ADVICE === "1") {
     await bootTrace.span("register-advice", () => import("@zenbu/advice/node"));
   } else {
