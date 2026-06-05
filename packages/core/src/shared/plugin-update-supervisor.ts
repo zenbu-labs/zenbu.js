@@ -254,6 +254,7 @@ function runSystemInstall(
       cwd: repoPath,
       env: process.env,
       stdio: "inherit",
+      shell: process.platform === "win32",
     });
     child.on("error", reject);
     child.on("close", (code) => {

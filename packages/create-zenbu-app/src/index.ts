@@ -9,6 +9,7 @@ import { buildDesktopApp, createLogger } from "./desktop/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(__dirname, "..", "templates");
+const IS_WIN = process.platform === "win32";
 
 interface DependsOn {
   name: string;
@@ -230,6 +231,7 @@ function probeVersion(pm: PmType): string | null {
   const res = spawnSync(pm, ["--version"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
+    shell: IS_WIN,
   });
   if (res.status !== 0) return null;
   const out = (res.stdout ?? "").trim();
@@ -533,6 +535,7 @@ function runInstall(projectDir: string, pm: DetectedPm): boolean {
   const res = spawnSync(pm.type, ["install"], {
     cwd: projectDir,
     stdio: "inherit",
+    shell: IS_WIN,
   });
   return res.status === 0;
 }
@@ -553,7 +556,7 @@ function runZenLink(
     pm.type === "yarn" && pm.version.startsWith("1.")
       ? ["zen", "link", ...extraArgs]
       : args;
-  const res = spawnSync(cmd, finalArgs, { cwd, stdio: "inherit" });
+  const res = spawnSync(cmd, finalArgs, { cwd, stdio: "inherit", shell: IS_WIN });
   return res.status === 0;
 }
 
@@ -816,6 +819,7 @@ function runInstallSilent(
     cwd: projectDir,
     stdio: "pipe",
     encoding: "utf8",
+    shell: IS_WIN,
   });
   if (r.stdout) log.info(r.stdout);
   if (r.stderr) log.info(r.stderr);
@@ -991,6 +995,7 @@ async function main(): Promise<void> {
       const res = spawnSync(pm.type, ["run", "link"], {
         cwd: projectDir,
         stdio: "inherit",
+        shell: IS_WIN,
       });
       if (res.status !== 0) {
         p.log.warn(

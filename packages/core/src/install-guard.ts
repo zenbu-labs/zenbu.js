@@ -144,6 +144,7 @@ export function spawnWithInstallHangGuard(
       cwd,
       stdio: ["inherit", "pipe", "pipe"],
       env,
+      shell: process.platform === "win32",
     })
     const onAbort = (): void => {
       try {

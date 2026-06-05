@@ -61,10 +61,21 @@ function parseArgs(argv: string[]): DevArgs {
 }
 
 function resolveLocalElectron(projectDir: string): string {
-  const candidates = [
-    path.join(projectDir, "node_modules", "electron", "dist", "Electron.app", "Contents", "MacOS", "Electron"),
-    path.join(projectDir, "node_modules", ".bin", "electron"),
-  ]
+  const candidates =
+    process.platform === "win32"
+      ? [
+          path.join(projectDir, "node_modules", "electron", "dist", "electron.exe"),
+          path.join(projectDir, "node_modules", ".bin", "electron.cmd"),
+        ]
+      : process.platform === "darwin"
+        ? [
+            path.join(projectDir, "node_modules", "electron", "dist", "Electron.app", "Contents", "MacOS", "Electron"),
+            path.join(projectDir, "node_modules", ".bin", "electron"),
+          ]
+        : [
+            path.join(projectDir, "node_modules", "electron", "dist", "electron"),
+            path.join(projectDir, "node_modules", ".bin", "electron"),
+          ]
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
   }
