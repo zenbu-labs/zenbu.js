@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import { stripTypeScriptTypes } from "node:module";
+import type { HostProjectMetadata } from "../shared/host-project-metadata";
 
 type LoaderContext = {
   hot?: {
@@ -236,6 +237,7 @@ interface ResolvedPluginRecord {
 
 interface RegistryPayload {
   plugins: ResolvedPluginRecord[];
+  hostProject: HostProjectMetadata;
   appEntrypoint: string;
   splashPath?: string;
 }
@@ -337,8 +339,14 @@ function buildPluginsRoot(payload: RegistryPayload): {
  * evaluate.
  */
 function buildRegistryModule(payload: RegistryPayload): string {
+  const runtimeImports = [
+    "replacePlugins",
+    "registerAppEntrypoint",
+    "registerHostProjectMetadata",
+  ].join(", ");
   const lines = [
-    'import { replacePlugins, registerAppEntrypoint } from "@zenbujs/core/runtime"',
+    `import { ${runtimeImports} } from "@zenbujs/core/runtime"`,
+    `registerHostProjectMetadata(${JSON.stringify(payload.hostProject)})`,
     `replacePlugins(${JSON.stringify(payload.plugins)})`,
     `registerAppEntrypoint(${JSON.stringify(
       payload.appEntrypoint,

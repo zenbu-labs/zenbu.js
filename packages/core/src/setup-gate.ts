@@ -22,6 +22,10 @@ import {
   parseZenbuBgEntries,
   pickZenbuBgEntry,
 } from "./shared/zenbu-bg-parse";
+import {
+  readHostProjectMetadata,
+  type HostProjectMetadata,
+} from "./shared/host-project-metadata";
 
 type PackageJson = {
   name?: string;
@@ -371,6 +375,7 @@ type LoaderData = {
       icons?: Record<string, string>;
       args?: unknown;
     }>;
+    hostProject: HostProjectMetadata;
     appEntrypoint: string;
     splashPath?: string;
     installingPath?: string;
@@ -434,6 +439,10 @@ async function loadConfigPhase(
         icons: p.icons,
         args: p.args,
       })),
+      hostProject: readHostProjectMetadata(
+        resolved.projectDir,
+        resolved.configPath,
+      ),
       appEntrypoint: resolved.uiEntrypointPath,
       splashPath: resolved.splashPath,
       installingPath: resolved.installingPath,

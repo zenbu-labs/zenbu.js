@@ -8,6 +8,9 @@ import {
   type InjectionSpec,
 } from "./services/advice-config";
 import { bootTrace } from "./boot-trace";
+import type { HostProjectMetadata } from "./shared/host-project-metadata";
+
+export type { HostProjectMetadata } from "./shared/host-project-metadata";
 
 /**
  * The synthetic plugin name used for everything that ships inside
@@ -814,12 +817,13 @@ export interface PluginRecord {
 
 interface ConfigSubscriberEntry {
   fn: (snapshot: ConfigSnapshot) => void;
- 
   label: string;
 }
 
 interface PluginRegistry {
   plugins: Map<string, PluginRecord>;
+  /** Metadata for the running Zenbu.js host project, or null until registered. */
+  hostProject: HostProjectMetadata | null;
   /** Absolute path of the renderer entrypoint directory, or null until registered. */
   appEntrypoint: string | null;
   /** Absolute path of `splash.html` inside the entrypoint dir. */
@@ -850,6 +854,7 @@ function getPluginRegistry(): PluginRegistry {
   if (!slot.__zenbu_plugin_registry__) {
     slot.__zenbu_plugin_registry__ = {
       plugins: new Map(),
+      hostProject: null,
       appEntrypoint: null,
       splashPath: null,
       subscribers: new Set(),
@@ -859,9 +864,10 @@ function getPluginRegistry(): PluginRegistry {
     // runs `replacePlugins(...)`) can resolve its `pluginDir` and end up
     // bucketed under `"core"` in the router.
     seedCorePlugin(slot.__zenbu_plugin_registry__);
-  } else if (!slot.__zenbu_plugin_registry__.subscribers) {
-    // HMR'd into an older shape; lazily fill the field.
-    slot.__zenbu_plugin_registry__.subscribers = new Set();
+  } else {
+    // HMR'd into an older shape; lazily fill new fields.
+    slot.__zenbu_plugin_registry__.hostProject ??= null;
+    slot.__zenbu_plugin_registry__.subscribers ??= new Set();
   }
   return slot.__zenbu_plugin_registry__;
 }
@@ -1049,6 +1055,21 @@ export function getAppEntrypoint(): string | null {
 
 export function getSplashPath(): string | null {
   return getPluginRegistry().splashPath;
+}
+
+/**
+ * Register metadata for the running Zenbu.js host project. Called by the
+ * loader-emitted registry module before plugin service files evaluate.
+ */
+export function registerHostProjectMetadata(
+  metadata: HostProjectMetadata | null,
+): void {
+  getPluginRegistry().hostProject = metadata;
+}
+
+/** Metadata for the running Zenbu.js host project, or null until registered. */
+export function getHostProjectMetadata(): HostProjectMetadata | null {
+  return getPluginRegistry().hostProject;
 }
 
 /**
