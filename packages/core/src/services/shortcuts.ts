@@ -165,10 +165,8 @@ export class ShortcutsService extends Service.create({
 
   /** RPC: sorted list of shortcuts plus effective bindings, for the settings UI. */
   list(): ShortcutListing[] {
-    const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
-      string,
-      ShortcutBinding | null
-    >;
+    const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ??
+      {}) as Record<string, ShortcutBinding | null>;
     const rows: ShortcutListing[] = [];
     for (const def of this.defs.values()) {
       const hasOverride = Object.prototype.hasOwnProperty.call(
@@ -201,7 +199,7 @@ export class ShortcutsService extends Service.create({
     binding: ShortcutBinding | null;
   }): Promise<void> {
     await this.ctx.db.client.update((root) => {
-      const section = (root as any).core;
+      const section = root.core;
       if (!section.shortcuts) section.shortcuts = {};
       section.shortcuts[args.id] = args.binding;
     });
@@ -211,7 +209,7 @@ export class ShortcutsService extends Service.create({
   /** RPC: drop the override row so the default takes effect again. */
   async resetBinding(args: { id: string }): Promise<void> {
     await this.ctx.db.client.update((root) => {
-      const section = (root as any).core;
+      const section = root.core;
       if (!section.shortcuts) return;
       delete section.shortcuts[args.id];
     });
@@ -222,17 +220,14 @@ export class ShortcutsService extends Service.create({
    * RPC: dispatch a keystroke forwarded by the renderer. `contexts` is the
    * active focus-context stack so dispatch matches what the renderer saw.
    */
-  handleKeydown(args: {
-    input: KeyboardInput;
-    contexts?: readonly string[];
-  }): { handled: boolean; id?: string } {
-    const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
-      string,
-      ShortcutBinding | null
-    >;
+  handleKeydown(args: { input: KeyboardInput; contexts?: readonly string[] }): {
+    handled: boolean;
+    id?: string;
+  } {
+    const overrides = this.ctx.db.client.readRoot().core?.shortcuts ?? {};
     const active =
       args.contexts ??
-      ((this.ctx.db.client.readRoot().core?.focus?.contexts ?? []) as string[]);
+      ((this.ctx.db.client.readRoot().core.focus.contexts ?? []) as string[]);
 
     // Pick the most-specific def whose binding matches and whose `when` is satisfied.
     type Cand = { def: ShortcutDef; score: number };
@@ -269,7 +264,7 @@ export class ShortcutsService extends Service.create({
   setFocus(args: { contexts: string[] }): void {
     void this.ctx.db.client
       .update((root) => {
-        const r = root as any;
+        const r = root;
         if (!r.core.focus) {
           r.core.focus = { contexts: [] };
         }
@@ -287,10 +282,8 @@ export class ShortcutsService extends Service.create({
 
   /** RPC: snapshot of active bindings (with `when`) for the renderer's local matcher. */
   bindings(): ShortcutBindingsSnapshot[] {
-    const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ?? {}) as Record<
-      string,
-      ShortcutBinding | null
-    >;
+    const overrides = (this.ctx.db.client.readRoot().core?.shortcuts ??
+      {}) as Record<string, ShortcutBinding | null>;
     const out: ShortcutBindingsSnapshot[] = [];
     for (const def of this.defs.values()) {
       const override = Object.prototype.hasOwnProperty.call(overrides, def.id)
@@ -311,7 +304,7 @@ export class ShortcutsService extends Service.create({
   private invoke(def: ShortcutDef): void {
     try {
       const result = def.handler();
-      if (result && typeof (result as any).then === "function") {
+      if (result && typeof result.then === "function") {
         (result as Promise<void>).catch((e) =>
           log.verbose(`shortcut "${def.id}" handler rejected: ${String(e)}`),
         );
