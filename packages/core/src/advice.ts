@@ -14,6 +14,7 @@ export type {
 
 export {
   addAdvice,
+  addAdviceTarget,
   addInjection,
   getInjections,
   getAllInjectionPaths,

@@ -29,6 +29,9 @@ export type InjectionMeta = Record<string, unknown> & {
   label?: string
   icon?: string
   wraps?: { moduleId: string; name: string }
+  /** Stable advice-target id; resolved against `addAdviceTarget`
+   * registrations at prelude-generation time (see `getInjections`). */
+  wrapsTarget?: string
   adviceType?: "replace" | "before" | "after" | "around"
 }
 
@@ -39,12 +42,23 @@ export interface InjectionEntry {
   meta?: InjectionMeta
 }
 
-/** Sugar spec for `this.advise(...)`. */
+/**
+ * Sugar spec for `this.advise(...)`. Target one of two ways:
+ *
+ *  - `target` — a stable advice-target ID the owning plugin declared
+ *    via `Service#adviceTarget` / `addAdviceTarget`. Preferred: the
+ *    owner can move files freely and only updates its registration;
+ *    advisers don't break.
+ *  - `moduleId` + `name` — suffix-matched module path + export name.
+ *    Breaks silently if the owner moves the file.
+ */
 export interface AdviceSpec {
+  /** Stable advice-target id (preferred over moduleId/name). */
+  target?: string
   /** Suffix-matched against the target module's id. */
-  moduleId: string
+  moduleId?: string
   /** Name of the export to advise. */
-  name: string
+  name?: string
   /** Wrap shape — same vocab as `@zenbu/advice/runtime`. */
   type: "replace" | "before" | "after" | "around"
   /** Wrapper module. Relative paths resolve against the plugin root. */
@@ -179,29 +193,87 @@ export function addInjection(
   }
 }
 
+// ---- Stable advice targets ----
+//
+// Owners of advisable components declare a stable id → (moduleId,
+// name) mapping. Advisers reference the id; when the owner moves the
+// file it updates ONE registration and every adviser keeps working.
+// Resolution happens lazily in `getInjections()` so registration
+// order between owners and advisers doesn't matter.
+const adviceTargets = new Map<string, { moduleId: string; name: string }>()
+const warnedUnresolvedTargets = new Set<string>()
+
+/** Declare (or re-declare) a stable advice target. Returns a disposer. */
+export function addAdviceTarget(
+  id: string,
+  target: { moduleId: string; name: string },
+): () => void {
+  adviceTargets.set(id, target)
+  warnedUnresolvedTargets.delete(id)
+  emitReload()
+  return () => {
+    if (adviceTargets.get(id) === target) {
+      adviceTargets.delete(id)
+      emitReload()
+    }
+  }
+}
+
 /** Sugar over `addInjection` with the advice meta shape. */
 export function addAdvice(
   pluginDir: string | null,
   spec: AdviceSpec,
 ): () => void {
+  if (!spec.target && !(spec.moduleId && spec.name)) {
+    throw new Error(
+      `[advice] spec for "${spec.modulePath}" needs either a stable ` +
+        "`target` id or a `moduleId` + `name` pair.",
+    )
+  }
   const name =
     spec.injectionName ??
-    `advice:${spec.moduleId}:${spec.name}:${spec.type}`
+    (spec.target
+      ? `advice:@${spec.target}:${spec.type}`
+      : `advice:${spec.moduleId}:${spec.name}:${spec.type}`)
   return addInjection(pluginDir, {
     name,
     modulePath: spec.modulePath,
     exportName: spec.exportName,
     meta: {
       kind: "advice",
-      wraps: { moduleId: spec.moduleId, name: spec.name },
+      ...(spec.target
+        ? { wrapsTarget: spec.target }
+        : { wraps: { moduleId: spec.moduleId!, name: spec.name! } }),
       adviceType: spec.type,
     },
   })
 }
 
-/** Every registered injection. Read by the prelude codegen. */
+/**
+ * Every registered injection, with stable advice-target ids resolved
+ * to concrete `wraps` pairs. Read by the prelude codegen. Entries
+ * whose target id has no registration keep `wraps` undefined — the
+ * codegen skips them — and warn once per id so a typo'd or
+ * not-yet-registered target is visible instead of a silent no-op.
+ */
 export function getInjections(): InjectionEntry[] {
-  return [...injections.values()]
+  return [...injections.values()].map((entry) => {
+    const targetId = entry.meta?.wrapsTarget
+    if (!targetId || entry.meta?.wraps) return entry
+    const resolved = adviceTargets.get(targetId)
+    if (!resolved) {
+      if (!warnedUnresolvedTargets.has(targetId)) {
+        warnedUnresolvedTargets.add(targetId)
+        console.warn(
+          `[advice] no advice target registered under "${targetId}" ` +
+            `(needed by injection "${entry.name}"). The advice will not ` +
+            "apply until the owning plugin declares it via adviceTarget().",
+        )
+      }
+      return entry
+    }
+    return { ...entry, meta: { ...entry.meta, wraps: resolved } }
+  })
 }
 
 /** Source paths for HMR detection in the Vite plugin. */

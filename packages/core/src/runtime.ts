@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   addAdvice,
+  addAdviceTarget,
   addInjection,
   type AdviceSpec,
   type InjectionSpec,
@@ -150,6 +151,20 @@ export abstract class Service {
   advise(spec: AdviceSpec): () => void {
     const pluginDir = this.__getPluginDir("advise");
     return addAdvice(pluginDir, spec);
+  }
+
+  /**
+   * Declare a stable advice-target id for a component this plugin
+   * owns. Advisers can then `advise({ target: id, ... })` instead of
+   * matching module-path suffixes, so moving the file only requires
+   * updating this one registration. Returns a disposer; wrap in
+   * `this.setup(...)` like any registration.
+   */
+  adviceTarget(
+    id: string,
+    target: { moduleId: string; name: string },
+  ): () => void {
+    return addAdviceTarget(id, target);
   }
 
   /** @internal */
