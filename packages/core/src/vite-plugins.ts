@@ -99,6 +99,7 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   const reactImports: string[] = [
     "  beginInjectionBatch as __zb_beginInjectionBatch,",
     "  endInjectionBatch as __zb_endInjectionBatch,",
+    "  reportInjectionLoadFailure as __zb_reportInjectionLoadFailure,",
   ];
   if (hasValue) {
     reactImports.unshift("  registerInjection as __zb_registerInjection,");
@@ -112,25 +113,67 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
     "const __zb_disposers = []",
     "__zb_beginInjectionBatch()",
     "for (const u of __zb_prevDisposers) { try { u() } catch {} }",
+    // Per-entry isolation: one injection module throwing during
+    // evaluation must not take the other N-1 down with it. Static
+    // imports would fail the whole prelude (ES module semantics), so
+    // each entry loads via its own dynamic import; allSettled keeps
+    // processing in registration order. A failed entry is loudly
+    // logged, recorded in the renderer's failure registry (so slots
+    // can render an error state instead of an empty frame), and
+    // forwarded to the dev server terminal.
+    "function __zb_fail(name, modulePath, pluginDir, error) {",
+    "  console.error(",
+    "    '[zenbu] injection \\'' + name + '\\'' + (pluginDir ? ' (plugin at ' + pluginDir + ')' : '') + ' failed to load.',",
+    "    'Everything its module registers is disabled until it loads cleanly. Module:', modulePath, 'Error:', error,",
+    "  )",
+    "  __zb_disposers.push(__zb_reportInjectionLoadFailure({ name, modulePath, pluginDir, error }))",
+    "  if (import.meta.hot) {",
+    "    try {",
+    "      import.meta.hot.send('zenbu:injection-load-failure', {",
+    "        name, modulePath, pluginDir: pluginDir ?? null,",
+    "        error: String((error && error.stack) || error),",
+    "      })",
+    "    } catch {}",
+    "  }",
+    "}",
+    "function __zb_take(i, name, modulePath, pluginDir) {",
+    "  const r = __zb_results[i]",
+    "  if (r.status === 'fulfilled') return r.value",
+    "  __zb_fail(name, modulePath, pluginDir, r.reason)",
+    "  return null",
+    "}",
+    "function __zb_export(mod, exportName, name, modulePath, pluginDir) {",
+    "  if (mod == null) return null",
+    "  const v = mod[exportName]",
+    "  if (v === undefined) {",
+    "    __zb_fail(name, modulePath, pluginDir, new Error('module evaluated but has no export named \"' + exportName + '\"'))",
+    "    return null",
+    "  }",
+    "  return v",
+    "}",
   ];
   const setupAliases: Array<{ alias: string; index: number }> = [];
   const calls: string[] = [];
+  const moduleImports: string[] = [];
   let needsAroundWrapper = false;
   entries.forEach((entry, i) => {
-    // Namespace import per entry: gives us `.setup` plus `.default` /
-    // `.<named>` for the registered value off the same alias.
+    // Per-entry dynamic import (settled below): gives us `.setup` plus
+    // `.default` / `.<named>` for the registered value off one alias,
+    // or `null` when the module failed — every use is null-guarded.
     const ns = `__m${i}`;
-    imports.push(
-      `import * as ${ns} from ${JSON.stringify(entry.modulePath)}`,
-    );
+    moduleImports.push(`  import(${JSON.stringify(entry.modulePath)}),`);
+    const entryArgs = `${JSON.stringify(entry.name)}, ${JSON.stringify(
+      entry.modulePath,
+    )}, ${JSON.stringify(entry.pluginDir ?? null)}`;
+    calls.push(`const ${ns} = __zb_take(${i}, ${entryArgs})`);
     setupAliases.push({ alias: ns, index: i });
 
     if (isBootstrap(entry)) return; // work lives in `setup`
 
-    const valueExpr =
-      entry.exportName === "default"
-        ? `${ns}.default`
-        : `${ns}.${entry.exportName}`;
+    const valueVar = `__v${i}`;
+    const valueExpr = `__zb_export(${ns}, ${JSON.stringify(
+      entry.exportName,
+    )}, ${entryArgs})`;
 
     if (isAdvice(entry)) {
       const wraps = entry.meta?.wraps as
@@ -145,34 +188,45 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
       if (!wraps || !adviceType) return;
       const modIdLit = JSON.stringify(wraps.moduleId);
       const nameLit = JSON.stringify(wraps.name);
+      calls.push(`const ${valueVar} = ${valueExpr}`);
       if (adviceType === "around") {
         needsAroundWrapper = true;
         calls.push(
-          `__zb_disposers.push(advise(${modIdLit}, ${nameLit}, "around", __zb_wrapAround(${valueExpr})))`,
+          `if (${valueVar} != null) __zb_disposers.push(advise(${modIdLit}, ${nameLit}, "around", __zb_wrapAround(${valueVar})))`,
         );
       } else if (adviceType === "replace") {
         // `replace` doesn't return a disposer; synthesize one via
         // `unreplace`. Stack-shaped storage in @zenbu/advice would let
         // this match `advise()`'s shape — see follow-up.
-        calls.push(`replace(${modIdLit}, ${nameLit}, ${valueExpr})`);
         calls.push(
-          `__zb_disposers.push(() => unreplace(${modIdLit}, ${nameLit}))`,
+          `if (${valueVar} != null) { replace(${modIdLit}, ${nameLit}, ${valueVar}); __zb_disposers.push(() => unreplace(${modIdLit}, ${nameLit})) }`,
         );
       } else {
         calls.push(
-          `__zb_disposers.push(advise(${modIdLit}, ${nameLit}, ${JSON.stringify(adviceType)}, ${valueExpr}))`,
+          `if (${valueVar} != null) __zb_disposers.push(advise(${modIdLit}, ${nameLit}, ${JSON.stringify(adviceType)}, ${valueVar}))`,
         );
       }
       return;
     }
 
     const metaLiteral = JSON.stringify(entry.meta);
+    calls.push(`const ${valueVar} = ${valueExpr}`);
     calls.push(
-      `__zb_disposers.push(__zb_registerInjection(${JSON.stringify(
+      `if (${valueVar} != null) __zb_disposers.push(__zb_registerInjection(${JSON.stringify(
         entry.name,
-      )}, ${valueExpr}, ${metaLiteral}))`,
+      )}, ${valueVar}, ${metaLiteral}))`,
     );
   });
+
+  // Settle every entry module before any registration runs. Top-level
+  // await: the prelude is a module script, and the injection batch is
+  // already open, so React sees one notification with the final state
+  // regardless of how long the imports take.
+  setup.push(
+    "const __zb_results = await Promise.allSettled([",
+    ...moduleImports,
+    "])",
+  );
 
   // Per (aroundFn, Original) memoized React component. Stable identity
   // across renders inside one chain incarnation; fresh component when
@@ -229,7 +283,7 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   // cleanup)` in main-process services.
   for (const { alias, index } of setupAliases) {
     calls.push(
-      `if (typeof ${alias}.setup === "function") { const __r${index} = ${alias}.setup(); if (typeof __r${index} === "function") __zb_disposers.push(__r${index}) }`,
+      `if (${alias} && typeof ${alias}.setup === "function") { const __r${index} = ${alias}.setup(); if (typeof __r${index} === "function") __zb_disposers.push(__r${index}) }`,
     );
   }
 
@@ -298,6 +352,26 @@ export function advicePreludePlugin(): Plugin {
     },
 
     configureServer(server) {
+      // Renderer-side injection load failures land in the terminal the
+      // dev session was launched from, not just the webview's devtools
+      // console — a blank surface should never require hunting for the
+      // error two contexts away.
+      server.ws.on(
+        "zenbu:injection-load-failure",
+        (data: {
+          name?: string;
+          modulePath?: string;
+          pluginDir?: string | null;
+          error?: string;
+        }) => {
+          console.error(
+            `[zenbu] injection "${data?.name}" failed to load` +
+              (data?.pluginDir ? ` (plugin at ${data.pluginDir})` : "") +
+              ` — module ${data?.modulePath}\n${data?.error ?? "unknown error"}`,
+          );
+        },
+      );
+
       server.middlewares.use(async (req, res, next) => {
         const url = req.url ?? "";
         if (!url.startsWith(PRELUDE_PREFIX)) return next();

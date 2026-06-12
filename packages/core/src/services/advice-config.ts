@@ -40,6 +40,10 @@ export interface InjectionEntry {
   modulePath: string
   exportName: string
   meta?: InjectionMeta
+  /** Owning plugin's root dir, when registered from a plugin service.
+   * Diagnostics use it to name the culprit when the module fails to
+   * load — "which plugin broke" is the first question, not the path. */
+  pluginDir?: string
 }
 
 /**
@@ -181,6 +185,7 @@ export function addInjection(
     modulePath: resolveAgainstPlugin(spec.modulePath, pluginDir),
     exportName: spec.exportName ?? "default",
     meta: spec.meta,
+    pluginDir: pluginDir ?? undefined,
   }
   injections.set(spec.name, entry)
   emitReload()
