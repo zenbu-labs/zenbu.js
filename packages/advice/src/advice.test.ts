@@ -697,4 +697,36 @@ describe("runtime: short moduleId detection", () => {
     expect(error).toHaveBeenCalledWith(expect.stringContaining("views/home.tsx"))
     error.mockRestore()
   })
+
+  it("no error when the suffix-matching id is a real module, not advice", () => {
+    // App-renderer modules register under vite-root-relative ids;
+    // plugin modules register under absolute paths. One canonical id
+    // being a path-suffix of another is normal coexistence (zenbu IDE:
+    // app `lib/home-dir.ts` vs pi-footer `/abs/.../lib/home-dir.ts`)
+    // and must not be reported as stranded advice.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    __def("lib/home-dir.ts", "useHomeDir", () => "app-copy")
+    __def("/abs/plugins/pi-footer/src/views/lib/home-dir.ts", "useHomeDir", () => "plugin-copy")
+    expect(error).not.toHaveBeenCalled()
+    error.mockRestore()
+  })
+
+  it("advice on a real short-keyed module still fires and stays quiet", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    __def("lib/utils.ts", "cn", () => "app")
+    replace("lib/utils.ts", "cn", () => "advised")
+    __def("/abs/plugins/pi-commands/src/content/lib/utils.ts", "cn", () => "plugin")
+    const fn = __ref("lib/utils.ts", "cn") as () => string
+    expect(fn()).toBe("advised")
+    expect(error).not.toHaveBeenCalled()
+    error.mockRestore()
+  })
+
+  it("ref-created placeholder without advice stays quiet on suffix match", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    __ref("home.tsx", "Home") // placeholder entry, nothing attached
+    __def("components/home.tsx", "Home", () => "real")
+    expect(error).not.toHaveBeenCalled()
+    error.mockRestore()
+  })
 })
