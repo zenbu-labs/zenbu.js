@@ -92,7 +92,9 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
     );
     // around-advice runs as its own React component (its own fiber)
     // so its hooks don't shift the advised component's hook indices.
-    imports.push('import { createElement as __zb_createElement } from "react"');
+    imports.push(
+      'import { createElement as __zb_createElement, Component as __zb_Component } from "react"',
+    );
   }
   const reactImports: string[] = [
     "  beginInjectionBatch as __zb_beginInjectionBatch,",
@@ -178,6 +180,27 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   if (needsAroundWrapper) {
     setup.unshift(
       "const __zb_aroundCache = new WeakMap()",
+      // Error boundary between the host tree and each around-advice
+      // layer. A plugin's advice throwing during render must degrade
+      // to the ORIGINAL component (advice skipped, loudly logged) —
+      // never take down the host surface it wraps. Once tripped, the
+      // boundary stays in fallback for the life of the mount; editing
+      // the advice rebuilds the chain (fresh component identity →
+      // remount), which re-arms it.
+      "class __zb_AdviceBoundary extends __zb_Component {",
+      "  constructor(props) { super(props); this.state = { failed: false } }",
+      "  static getDerivedStateFromError() { return { failed: true } }",
+      "  componentDidCatch(err) {",
+      "    console.error(",
+      "      '[zenbu] around-advice \\'' + this.props.__zb_adviceName + '\\' for <' + this.props.__zb_originalName + '> threw during render. Skipping this advice and rendering the original component. Error:',",
+      "      err,",
+      "    )",
+      "  }",
+      "  render() {",
+      "    if (this.state.failed) return __zb_createElement(this.props.__zb_original, this.props.__zb_props)",
+      "    return __zb_createElement(this.props.__zb_comp, this.props.__zb_props)",
+      "  }",
+      "}",
       "function __zb_wrapAround(aroundFn) {",
       "  return function(Original, props) {",
       "    let perFn = __zb_aroundCache.get(aroundFn)",
@@ -188,7 +211,13 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
       "      try { Object.defineProperty(Comp, 'name', { value: aroundFn.name || 'AroundAdvice' }) } catch {}",
       "      perFn.set(Original, Comp)",
       "    }",
-      "    return __zb_createElement(Comp, props)",
+      "    return __zb_createElement(__zb_AdviceBoundary, {",
+      "      __zb_comp: Comp,",
+      "      __zb_original: Original,",
+      "      __zb_props: props,",
+      "      __zb_adviceName: aroundFn.name || 'around-advice',",
+      "      __zb_originalName: Original.displayName || Original.name || 'component',",
+      "    })",
       "  }",
       "}",
     );
