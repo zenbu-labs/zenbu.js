@@ -37,7 +37,8 @@ import {
 ## Database
 
 ```typescript theme={null}
-import { createSchema, z } from "@zenbujs/core/db"
+import { createSchema } from "@zenbujs/core/db"
+import { z } from "zod"
 ```
 
 ## React hooks
@@ -736,7 +737,8 @@ This means both the main process and the renderer read and write through the sam
 Each plugin defines a schema using zod that describes the shape of its data.
 
 ```typescript src/main/schema.ts theme={null}
-import { createSchema, z } from "@zenbujs/core/db"
+import { createSchema } from "@zenbujs/core/db"
+import { z } from "zod"
 
 export default createSchema({
   todos: z
@@ -845,7 +847,8 @@ Regular data fields are always held in memory across every process. Collections 
 Define a collection in your schema with `f.collection()`:
 
 ```typescript src/main/schema.ts theme={null}
-import { createSchema, f, z } from "@zenbujs/core/db"
+import { createSchema, f } from "@zenbujs/core/db"
+import { z } from "zod"
 
 export default createSchema({
   messages: f.collection(
@@ -900,7 +903,8 @@ Blobs store binary data (`Uint8Array`) like files or images. Like collections, t
 Define a blob in your schema with `f.blob()`:
 
 ```typescript src/main/schema.ts theme={null}
-import { createSchema, f, z } from "@zenbujs/core/db"
+import { createSchema, f } from "@zenbujs/core/db"
+import { z } from "zod"
 
 export default createSchema({
   avatar: f.blob({ debugName: "avatar" }),

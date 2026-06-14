@@ -125,8 +125,9 @@ export const createRecordingProxy = <T extends Record<string, any>>(
         for (let i = 0; i < value.length; i++) {
           const peeled = peelInner(value[i], onPath);
           if (peeled !== value[i]) {
-            if (!copy) copy = value.slice();
-            copy[i] = peeled;
+            const next: any[] = copy ?? value.slice();
+            next[i] = peeled;
+            copy = next;
           }
         }
         return copy ?? value;
@@ -135,8 +136,9 @@ export const createRecordingProxy = <T extends Record<string, any>>(
       for (const k of Object.keys(value)) {
         const peeled = peelInner(value[k], onPath);
         if (peeled !== value[k]) {
-          if (!copy) copy = { ...value };
-          copy[k] = peeled;
+          const next: Record<string, any> = copy ?? { ...value };
+          next[k] = peeled;
+          copy = next;
         }
       }
       return copy ?? value;
