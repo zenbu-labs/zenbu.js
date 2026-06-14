@@ -1,6 +1,6 @@
 {
   "name": "create-zenbu-app",
-  "version": "0.0.36",
+  "version": "0.0.37",
   "description": "Scaffold a new Zenbu app",
   "type": "module",
   "publishConfig": {
