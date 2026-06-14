@@ -1,3 +1,4 @@
+import { nanoid } from "nanoid";
 import zod from "zod";
 import type { infer as ZodInfer } from "zod";
 
@@ -160,7 +161,7 @@ export function makeCollection<T = unknown>(opts?: { debugName?: string; collect
 export function makeCollection<T = unknown>(debugName?: string): CollectionRefValue<T>;
 export function makeCollection<T = unknown>(arg?: string | { debugName?: string; collectionId?: string }): CollectionRefValue<T> {
   const opts = typeof arg === "string" ? { debugName: arg } : arg;
-  return { collectionId: opts?.collectionId ?? "", debugName: opts?.debugName ?? "" } as CollectionRefValue<T>;
+  return { collectionId: opts?.collectionId ?? nanoid(), debugName: opts?.debugName ?? "" } as CollectionRefValue<T>;
 }
 
 /**
