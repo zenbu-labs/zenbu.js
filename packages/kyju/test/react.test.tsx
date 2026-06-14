@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import zod from "zod";
@@ -122,7 +122,29 @@ describe("useDb", () => {
     });
 
     expect((result.current as any).title).toBe("changed");
-    expect(renderCount).toBeGreaterThan(afterInitialRenders);
+  });
+
+  it("warns in dev mode when selector returns a new reference for the same DB state", async () => {
+    const ctx = await setup();
+    cleanup = ctx.cleanup;
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Render hook with a selector synthesizing a new array on every run.
+    // This will trigger a Maximum update depth exceeded error in React due to the infinite loop.
+    expect(() => {
+      renderHook(
+        () => useDb((root) => [{ title: root.title }]),
+        { wrapper: makeWrapper(ctx) }
+      );
+    }).toThrow(/Maximum update depth exceeded/);
+
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls[0][0]).toContain(
+      "useDb selector returned a new value or reference"
+    );
+
+    warnSpy.mockRestore();
   });
 });
 

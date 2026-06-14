@@ -79,6 +79,7 @@ export function createKyjuReact<
     isEqualRef.current = isEqual;
 
     const cacheRef = useRef<{ output: T } | null>(null);
+    const lastDbStateRef = useRef<ClientState | null>(null);
 
     const subscribe = useCallback(
       (cb: () => void) => replica.subscribe(() => cb()),
@@ -95,9 +96,23 @@ export function createKyjuReact<
       const cache = cacheRef.current;
       if (cache != null) {
         const eq = isEqualRef.current ?? shallowEqual;
-        if (eq(cache.output, next)) return cache.output;
+        if (eq(cache.output, next)) {
+          lastDbStateRef.current = state;
+          return cache.output;
+        }
+        if (process.env.NODE_ENV !== "production") {
+          if (lastDbStateRef.current === state) {
+            console.warn(
+              `[zenbu] useDb selector returned a new value or reference even though the database state did not change. ` +
+                `This will trigger an infinite re-render loop in React. ` +
+                `Ensure the selector returns values owned by the database, or use useMemo to project the data outside useDb.\n\n` +
+                `Selector: ${sel.toString()}`
+            );
+          }
+        }
       }
       cacheRef.current = { output: next };
+      lastDbStateRef.current = state;
       return next;
     }, [replica]);
 

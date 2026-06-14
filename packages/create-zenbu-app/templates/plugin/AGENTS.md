@@ -908,6 +908,20 @@ function TodoList() {
 
 `useDb` is a subscription. When the selected value changes, the component re-renders automatically. Unrelated changes don't trigger re-renders.
 
+> [!WARNING]
+> **Reference Equality & Selector Rules**: Selectors must return values or slices owned by the database (or primitive types). Synthesizing/constructing a new object or array shape inside the selector (e.g. `root => root.app.items.map(...)` or returning a new object literal) will return a new reference on every call, triggering an infinite re-render loop (`Maximum update depth exceeded`).
+>
+> If you need to transform or project the database slice into a new shape, return the raw database slice from `useDb` and perform the transformation inside a React `useMemo` hook:
+>
+> ```typescript
+> // Return raw slice from useDb
+> const rawItems = useDb(root => root.app.items);
+> // Project/map in useMemo
+> const processedItems = useMemo(() => {
+>   return rawItems.map(item => ({ id: item.id, label: item.name }));
+> }, [rawItems]);
+> ```
+
 In a service, read through `DbService.client`:
 
 ```typescript theme={null}
