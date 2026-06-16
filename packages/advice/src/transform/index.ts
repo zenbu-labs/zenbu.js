@@ -8,6 +8,18 @@ interface AdvicePluginOptions {
 interface AdvicePluginState extends PluginPass {
   moduleId: string
   needsImport: boolean
+  /**
+   * `__zenbu_def(...)` registrations collected during traversal and
+   * emitted at the TOP of the module (Program exit). Function
+   * declarations hoist in plain JS — a module-scope statement may call
+   * one before its source position. The wrapper declaration we emit
+   * hoists too, but it dispatches through the registry, so the
+   * registration itself must also run before any module-scope
+   * statement or the call would find no implementation. Hoisting the
+   * def is safe: it only *creates* a closure (the body doesn't run),
+   * exactly like native hoisting.
+   */
+  hoistedDefs: BabelTypes.Statement[]
 }
 
 function isReactRefreshHelperName(name: string): boolean {
@@ -63,6 +75,32 @@ export default function zenbuAdviceTransform(
     ])
   }
 
+  /**
+   * Hoisted replacement for a top-level `function name() {}`: a
+   * function DECLARATION (so the binding hoists like the original did)
+   * that dispatches through the advice chain. Used for every named
+   * top-level function, component or not — a `const name = __ref(...)`
+   * would turn hoisting into a TDZ crash for any module that calls the
+   * function above its declaration, and would report `.name` as the
+   * registry wrapper's instead of the function's own.
+   */
+  function wrapperFnDecl(state: AdvicePluginState, name: string): BabelTypes.FunctionDeclaration {
+    const wrapperFn = t.functionDeclaration(
+      t.identifier(name),
+      [t.restElement(t.identifier("__args"))],
+      t.blockStatement([
+        t.returnStatement(
+          t.callExpression(
+            t.memberExpression(refCall(state, name), t.identifier("apply")),
+            [t.thisExpression(), t.identifier("__args")]
+          )
+        ),
+      ])
+    );
+    (wrapperFn as any)._zenbuGenerated = true
+    return wrapperFn
+  }
+
   return {
     name: "zenbu-advice",
     visitor: {
@@ -70,8 +108,12 @@ export default function zenbuAdviceTransform(
         enter(path: NodePath<BabelTypes.Program>, state: AdvicePluginState) {
           state.moduleId = makeModuleId(state.filename)
           state.needsImport = false
+          state.hoistedDefs = []
         },
         exit(path: NodePath<BabelTypes.Program>, state: AdvicePluginState) {
+          if (state.hoistedDefs.length > 0) {
+            path.unshiftContainer("body", state.hoistedDefs)
+          }
           if (!state.needsImport) return
           const importDecl = t.importDeclaration(
             [
@@ -100,39 +142,18 @@ export default function zenbuAdviceTransform(
           path.node.async
         )
 
-        const def = defCall(state, name, fnExpr)
-        const isComponent = /^[A-Z]/.test(name)
+        // Same shape for components and helpers: hoisted def + hoisted
+        // wrapper declaration. Both halves of native function hoisting
+        // are preserved — the binding exists early (wrapper declaration
+        // hoists) AND calling it early works (def runs before any other
+        // module-scope statement).
+        state.hoistedDefs.push(defCall(state, name, fnExpr))
+        const wrapperFn = wrapperFnDecl(state, name)
 
-        if (isComponent) {
-          const wrapperFn = t.functionDeclaration(
-            t.identifier(name),
-            [t.restElement(t.identifier("__args"))],
-            t.blockStatement([
-              t.returnStatement(
-                t.callExpression(
-                  t.memberExpression(refCall(state, name), t.identifier("apply")),
-                  [t.thisExpression(), t.identifier("__args")]
-                )
-              ),
-            ])
-          );
-          (wrapperFn as any)._zenbuGenerated = true
-
-          if (path.parentPath.isExportNamedDeclaration()) {
-            path.parentPath.replaceWithMultiple([def, t.exportNamedDeclaration(wrapperFn, [])])
-          } else {
-            path.replaceWithMultiple([def, wrapperFn])
-          }
+        if (path.parentPath.isExportNamedDeclaration()) {
+          path.parentPath.replaceWith(t.exportNamedDeclaration(wrapperFn, []))
         } else {
-          const varDecl = t.variableDeclaration("const", [
-            t.variableDeclarator(t.identifier(name), refCall(state, name)),
-          ])
-
-          if (path.parentPath.isExportNamedDeclaration()) {
-            path.parentPath.replaceWithMultiple([def, t.exportNamedDeclaration(varDecl, [])])
-          } else {
-            path.replaceWithMultiple([def, varDecl])
-          }
+          path.replaceWith(wrapperFn)
         }
       },
 
@@ -150,25 +171,19 @@ export default function zenbuAdviceTransform(
           decl.async
         )
 
-        const def = defCall(state, name, fnExpr)
-        const isComponent = /^[A-Z]/.test(name)
-
-        if (isComponent && name !== "default") {
-          const wrapperFn = t.functionDeclaration(
-            t.identifier(name),
-            [t.restElement(t.identifier("__args"))],
-            t.blockStatement([
-              t.returnStatement(
-                t.callExpression(
-                  t.memberExpression(refCall(state, name), t.identifier("apply")),
-                  [t.thisExpression(), t.identifier("__args")]
-                )
-              ),
-            ])
-          );
-          (wrapperFn as any)._zenbuGenerated = true
-          path.replaceWithMultiple([def, t.exportDefaultDeclaration(wrapperFn)])
+        if (decl.id) {
+          // `export default function foo() {}` declares a hoisted local
+          // binding `foo` alongside the default export. Keep BOTH: the
+          // old non-component path here dropped the local binding
+          // entirely, breaking any later in-module reference to it.
+          state.hoistedDefs.push(defCall(state, name, fnExpr))
+          path.replaceWith(t.exportDefaultDeclaration(wrapperFnDecl(state, name)))
         } else {
+          // Anonymous default: no local binding to hoist, so the const
+          // indirection is semantics-preserving (modulo circular-import
+          // access before evaluation, which the original allows and we
+          // don't — accepted edge).
+          const def = defCall(state, name, fnExpr)
           const varDecl = t.variableDeclaration("const", [
             t.variableDeclarator(t.identifier("__zenbu_default"), refCall(state, name)),
           ])

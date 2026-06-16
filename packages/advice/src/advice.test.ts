@@ -362,9 +362,23 @@ describe("transform: snapshots", () => {
     expect(out).not.toMatch(/const App\s*=/)
   })
 
-  it("lowercase function emits const assignment", () => {
+  it("lowercase function emits hoisted function declaration (not const)", () => {
+    // A const binding would turn native function hoisting into a TDZ
+    // crash for modules that call the helper above its declaration.
     const out = transform(`function helper() { return 1 }`)
-    expect(out).toMatch(/const helper\s*=/)
+    expect(out).toMatch(/function helper\(/)
+    expect(out).not.toMatch(/const helper\s*=/)
+  })
+
+  it("__zenbu_def calls are hoisted above all module statements", () => {
+    const out = transform(`
+const value = helper()
+function helper() { return 7 }
+`)
+    const defIndex = out.indexOf("__zenbu_def")
+    const valueIndex = out.indexOf("const value")
+    expect(defIndex).toBeGreaterThanOrEqual(0)
+    expect(defIndex).toBeLessThan(valueIndex)
   })
 
   it("nested functions are NOT transformed (only top-level)", () => {
@@ -470,6 +484,84 @@ describe("transform: execution", () => {
   it("transformed function works", () => {
     const { add } = evalTransformed(`function add(a, b) { return a + b }`)
     expect(add(2, 3)).toBe(5)
+  })
+
+  it("module-scope call above the declaration still works (hoisting preserved)", () => {
+    // Regression: the const-binding form turned this legal pattern into
+    // a TDZ ReferenceError once the transform reached plugin src trees
+    // (pi-commands/settings use-window-id.ts, 2026-06-12).
+    const { value } = evalTransformed(`
+const value = readWindowId()
+function readWindowId() { return "main" }
+`)
+    expect(value).toBe("main")
+  })
+
+  it("hoisting-dependent function is still advisable", () => {
+    const { helper } = evalTransformed(`
+const eager = helper(1)
+function helper(x) { return x * 2 }
+`)
+    advise("test.ts", "helper", "around", (orig: Function, x: number) => orig(x) + 100)
+    expect(helper(5)).toBe(110)
+  })
+
+  it("transformed helper keeps its own .name", () => {
+    const { helper } = evalTransformed(`function helper() { return 1 }`)
+    expect(helper.name).toBe("helper")
+  })
+
+  it("component called at module scope above its declaration works", () => {
+    // Components always got a hoisted wrapper, but their __zenbu_def
+    // used to sit at the original position — an early call found the
+    // binding but no implementation. Hoisted defs close that gap.
+    const { early } = evalTransformed(`
+const early = Banner()
+function Banner() { return "banner" }
+`)
+    expect(early).toBe("banner")
+  })
+
+  it("export-named function keeps a hoisted binding and hoisted def", () => {
+    const out = transform(`
+const eager = helper()
+export function helper() { return 1 }
+`)
+    expect(out).toMatch(/export function helper\(/)
+    expect(out).not.toMatch(/const helper\s*=/)
+    expect(out.indexOf("__zenbu_def")).toBeLessThan(out.indexOf("const eager"))
+  })
+
+  it("mutual recursion between transformed helpers works", () => {
+    const { isEven } = evalTransformed(`
+function isEven(n) { return n === 0 ? true : isOdd(n - 1) }
+function isOdd(n) { return n === 0 ? false : isEven(n - 1) }
+`)
+    expect(isEven(10)).toBe(true)
+    expect(isEven(7)).toBe(false)
+  })
+
+  it("hoisted def does not eagerly evaluate anything from the body", () => {
+    // The def only CREATES the closure; a body referencing a const
+    // declared later in the module must not throw at def time, and
+    // must see the initialized value at call time.
+    const { read } = evalTransformed(`
+function read() { return LATE }
+const LATE = "late-bound"
+`)
+    expect(read()).toBe("late-bound")
+  })
+
+  it("named default export keeps a usable local binding", () => {
+    // `export default function foo() {}` declares a hoisted local
+    // binding; the old non-component path replaced it with an internal
+    // const and dropped `foo` entirely.
+    const out = transform(`
+export default function makeThing() { return 1 }
+const again = makeThing()
+`)
+    expect(out).toContain("export default function makeThing(")
+    expect(out).not.toContain("__zenbu_default")
   })
 
   it("replace works on transformed function", () => {

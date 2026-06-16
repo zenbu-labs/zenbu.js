@@ -350,24 +350,57 @@ export function advicePreludePlugin(): Plugin {
   };
 }
 
+// Advice is a renderer-source transform, not just an entrypoint-root
+// transform. The host app's Vite root covers its own renderer tree; enabled
+// plugins can also own renderer surfaces, so their `src/**` files need the
+// same instrumentation when Vite serves them from outside `config.root`.
+const ADVICE_SOURCE_EXT_RE = /\.[jt]sx?$/;
+
+function normalizeFsPath(value: string): string {
+  return path.resolve(value).replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function stripViteRequestSuffix(id: string): string {
+  const index = id.search(/[?#]/);
+  return index === -1 ? id : id.slice(0, index);
+}
+
+function isInsideDir(file: string, dir: string): boolean {
+  return file === dir || file.startsWith(`${dir}/`);
+}
+
+function adviceTransformRoots(viteRoot: string): string[] {
+  const roots = new Set<string>([normalizeFsPath(viteRoot)]);
+  for (const plugin of getConfig().plugins) {
+    roots.add(normalizeFsPath(path.join(plugin.dir, "src")));
+  }
+  return [...roots];
+}
+
+function shouldAdviceTransform(id: string, viteRoot: string): boolean {
+  if (id.includes("\0")) return false;
+  const file = normalizeFsPath(stripViteRequestSuffix(id));
+  if (!ADVICE_SOURCE_EXT_RE.test(file)) return false;
+  return adviceTransformRoots(viteRoot).some((root) => isInsideDir(file, root));
+}
+
 /** Scoped wrapper around `@zenbu/advice/vite`'s babel transform. */
 export function zenbuAdviceTransform(): Plugin {
   let inner: any = null;
+  let viteRoot = "";
   return {
     name: "zenbu-advice-scoped",
     enforce: "pre",
     configResolved(config) {
-      const escaped = config.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      inner = zenbuAdvicePlugin({
-        root: config.root,
-        include: new RegExp(`^${escaped}.*\\.[jt]sx?$`),
-      });
+      viteRoot = config.root;
+      inner = zenbuAdvicePlugin({ root: config.root });
       const hook = (inner as any)?.configResolved;
       if (typeof hook === "function") {
         hook.call(this, config);
       }
     },
     transform(code, id) {
+      if (!viteRoot || !shouldAdviceTransform(id, viteRoot)) return null;
       const hook = (inner as any)?.transform;
       if (typeof hook !== "function") return null;
       return hook.call(this, code, id);

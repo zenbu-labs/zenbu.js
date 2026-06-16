@@ -46,7 +46,19 @@ export function getOrCreateEntry(moduleId: string, name: string): FunctionEntry 
   }
   let entry = moduleMap.get(name)
   if (!entry) {
-    entry = { impl: () => { throw new Error(`${moduleId}:${name} not yet defined`) }, replacement: null, advice: [] }
+    entry = {
+      impl: () => {
+        throw new Error(
+          `[zenbu/advice] "${name}" from module "${moduleId}" is not yet defined — ` +
+          `it was called before its module registered an implementation. ` +
+          `Likely causes: the defining module failed to evaluate (check earlier ` +
+          `console errors), or a circular import reached this binding before ` +
+          `the module body ran.`
+        )
+      },
+      replacement: null,
+      advice: [],
+    }
     moduleMap.set(name, entry)
   }
   return entry
