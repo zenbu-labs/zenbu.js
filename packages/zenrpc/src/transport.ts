@@ -1,7 +1,7 @@
 import { nanoid } from "nanoid";
 import { createClient } from "./client";
-import { createEventProxy } from "./events";
-import type { AnyRouter, RouterProxy, EventProxy } from "./types";
+import { createUnifiedEventProxy } from "./events";
+import type { AnyRouter, RouterProxy, UnifiedEventProxy } from "./types";
 
 export function createRpcRouter() {
   const routes = new Map<string, (data: string) => void>();
@@ -43,7 +43,7 @@ export async function connectRpc<
   subscribe: (cb: (data: string) => void) => () => void;
 }): Promise<{
   server: RouterProxy<TServerRouter>;
-  events: EventProxy<TEvents>;
+  events: UnifiedEventProxy<TEvents>;
   disconnect: () => void;
 }> {
   const clientId = opts.clientId ?? nanoid();
@@ -67,8 +67,9 @@ export async function connectRpc<
 
   await rpc.ready;
 
-  const events: EventProxy<TEvents> = createEventProxy<TEvents>(
+  const events: UnifiedEventProxy<TEvents> = createUnifiedEventProxy<TEvents>(
     rpc.eventListeners,
+    rpc.emitEvent,
   );
 
   return {
