@@ -40,7 +40,7 @@ import type {
 } from "@zenbu/kyju/schema";
 import { connectRpc } from "@zenbu/zenrpc";
 import type {
-  EventProxy,
+  UnifiedEventProxy,
   RouterProxy,
 } from "@zenbu/zenrpc";
 import type {
@@ -56,7 +56,7 @@ import type {
 type AnyRpc = RouterProxy<
   Record<string, Record<string, Record<string, (...args: any[]) => any>>>
 >;
-type AnyEvents = EventProxy<Record<string, Record<string, unknown>>>;
+type AnyEvents = UnifiedEventProxy<Record<string, Record<string, unknown>>>;
 type AnyDbClient = ClientProxy<SchemaShape>;
 type Replica = Awaited<ReturnType<typeof connectReplica>>["replica"];
 
@@ -592,8 +592,8 @@ export function useDbClient(): DbClient {
   return useConnection().db as unknown as DbClient;
 }
 
-export function useEvents(): EventProxy<RegisteredEvents> {
-  return useConnection().events as unknown as EventProxy<RegisteredEvents>;
+export function useEvents(): UnifiedEventProxy<RegisteredEvents> {
+  return useConnection().events as unknown as UnifiedEventProxy<RegisteredEvents>;
 }
 
 export type { CollectionRefValue };

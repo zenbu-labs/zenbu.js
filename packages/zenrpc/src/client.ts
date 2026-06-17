@@ -14,7 +14,7 @@ export type EventListeners = {
   dispatch: (path: string, data: unknown) => void;
 };
 
-const createEventListeners = (): EventListeners => {
+export const createEventListeners = (): EventListeners => {
   const listeners = new Map<string, Set<(data: unknown) => void>>();
 
   return {
@@ -57,6 +57,11 @@ export const createClient = <TServerRouter extends AnyRouter = AnyRouter>(
       version: options.version,
     }),
   );
+
+  const emitEvent = (path: string[], data: unknown) => {
+    eventListeners.dispatch(path.join("."), data);
+    options.send(serialize({ type: "event", path, data }));
+  };
 
   const postMessage = (data: string) => {
     let msg: any;
@@ -105,6 +110,7 @@ export const createClient = <TServerRouter extends AnyRouter = AnyRouter>(
     postMessage,
     server,
     eventListeners,
+    emitEvent,
     ready: handshakePromise,
     get connected() {
       return connected;

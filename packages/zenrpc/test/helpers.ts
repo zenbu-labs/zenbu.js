@@ -1,7 +1,7 @@
 import { createServer } from "../src/server";
 import { createClient } from "../src/client";
-import { createEventProxy } from "../src/events";
-import type { AnyRouter, AnyRouterFactory, EventProxy } from "../src/types";
+import { createUnifiedEventProxy } from "../src/events";
+import type { AnyRouter, AnyRouterFactory, UnifiedEventProxy } from "../src/types";
 
 export const createTransportPair = <
   TServerRouter extends AnyRouter,
@@ -31,8 +31,9 @@ export const createTransportPair = <
 
   clientPostMessages.set(args.clientId, client.postMessage);
 
-  const events: EventProxy<TEvents> = createEventProxy<TEvents>(
+  const events: UnifiedEventProxy<TEvents> = createUnifiedEventProxy<TEvents>(
     client.eventListeners,
+    client.emitEvent,
   );
 
   return { server, client, events };
@@ -67,8 +68,9 @@ export const createMultiClientTransportPair = <
 
     clientPostMessages.set(clientId, client.postMessage);
 
-    const events: EventProxy<TEvents> = createEventProxy<TEvents>(
+    const events: UnifiedEventProxy<TEvents> = createUnifiedEventProxy<TEvents>(
       client.eventListeners,
+      client.emitEvent,
     );
 
     return { client, events, clientId };

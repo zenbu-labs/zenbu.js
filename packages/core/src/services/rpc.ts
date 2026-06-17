@@ -1,6 +1,6 @@
 import type { WebSocket } from "ws";
 import { createServer, createRpcRouter } from "@zenbu/zenrpc";
-import type { AnyRouter } from "@zenbu/zenrpc";
+import type { AnyRouter, UnifiedEventProxy } from "@zenbu/zenrpc";
 import { Service, runtime } from "../runtime";
 import { HttpService } from "./http";
 import { createLogger } from "../shared/log";
@@ -31,10 +31,16 @@ export class RpcService extends Service.create({
   // This is what makes `service.ctx.rpc.emit.<plugin-namespace>.<event>(data)`
   // resolve in user-authored services without baking plugin types into core.
   private _emit: EmitProxy<ResolvedEvents> | null = null;
+  private _events: UnifiedEventProxy<ResolvedEvents> | null = null;
 
   get emit(): EmitProxy<ResolvedEvents> {
     if (!this._emit) throw new Error("RpcService not yet evaluated");
     return this._emit;
+  }
+
+  get events(): UnifiedEventProxy<ResolvedEvents> {
+    if (!this._events) throw new Error("RpcService not yet evaluated");
+    return this._events;
   }
 
   evaluate() {
@@ -50,6 +56,7 @@ export class RpcService extends Service.create({
       });
 
       this._emit = rpcServer.emit as EmitProxy<ResolvedEvents>;
+      this._events = rpcServer.events as unknown as UnifiedEventProxy<ResolvedEvents>;
 
       const wsRpcConnections = new Map<
         string,
@@ -92,6 +99,7 @@ export class RpcService extends Service.create({
 
       return () => {
         this._emit = null;
+        this._events = null;
         unsubConnected();
         unsubDisconnected();
         for (const { rpcConn, ws } of wsRpcConnections.values()) {
