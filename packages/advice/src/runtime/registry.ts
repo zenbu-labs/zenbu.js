@@ -7,6 +7,10 @@ export interface AdviceEntry {
 
 export interface FunctionEntry {
   impl: Function
+  /** True once a real module registered an implementation via
+   * `setImpl` — distinguishes a module's own entry from a placeholder
+   * created by advise()/replace() against a not-yet-loaded id. */
+  implRegistered?: boolean
   replacement: Function | null
   advice: AdviceEntry[]
   wrapper?: Function
@@ -46,7 +50,19 @@ export function getOrCreateEntry(moduleId: string, name: string): FunctionEntry 
   }
   let entry = moduleMap.get(name)
   if (!entry) {
-    entry = { impl: () => { throw new Error(`${moduleId}:${name} not yet defined`) }, replacement: null, advice: [] }
+    entry = {
+      impl: () => {
+        throw new Error(
+          `[zenbu/advice] "${name}" from module "${moduleId}" is not yet defined — ` +
+          `it was called before its module registered an implementation. ` +
+          `Likely causes: the defining module failed to evaluate (check earlier ` +
+          `console errors), or a circular import reached this binding before ` +
+          `the module body ran.`
+        )
+      },
+      replacement: null,
+      advice: [],
+    }
     moduleMap.set(name, entry)
   }
   return entry
@@ -74,7 +90,17 @@ function reportShortIdAdvice(fullModuleId: string, name: string): void {
   for (const [existingId, existingMap] of registry) {
     if (existingId === fullModuleId) continue
     if (!fullModuleId.endsWith("/" + existingId)) continue
-    if (!existingMap.has(name)) continue
+    const existingEntry = existingMap.get(name)
+    if (!existingEntry) continue
+    // A real module owns the suffix-matching id. App-renderer modules
+    // register under vite-root-RELATIVE ids while plugin modules
+    // register under absolute paths, so one module's canonical id
+    // being a path-suffix of another's is normal coexistence, not
+    // stranded advice. Warning here would cry wolf on every such pair
+    // \u2014 and false alarms train people to ignore the loud channel.
+    if (existingEntry.implRegistered) continue
+    // Placeholder entry with nothing attached that could fail to fire.
+    if (existingEntry.advice.length === 0 && !existingEntry.replacement) continue
     console.error(
       `[zenbu/advice] short moduleId "${existingId}" does not match the real module ` +
       `"${fullModuleId}" \u2014 advice on "${name}" will not fire. ` +
@@ -87,6 +113,7 @@ export function setImpl(moduleId: string, name: string, fn: Function): void {
   reportShortIdAdvice(moduleId, name)
   const entry = getOrCreateEntry(moduleId, name)
   entry.impl = fn
+  entry.implRegistered = true
   entry.wrapper = undefined
 }
 

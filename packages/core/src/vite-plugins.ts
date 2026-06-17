@@ -92,11 +92,14 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
     );
     // around-advice runs as its own React component (its own fiber)
     // so its hooks don't shift the advised component's hook indices.
-    imports.push('import { createElement as __zb_createElement } from "react"');
+    imports.push(
+      'import { createElement as __zb_createElement, Component as __zb_Component } from "react"',
+    );
   }
   const reactImports: string[] = [
     "  beginInjectionBatch as __zb_beginInjectionBatch,",
     "  endInjectionBatch as __zb_endInjectionBatch,",
+    "  reportInjectionLoadFailure as __zb_reportInjectionLoadFailure,",
   ];
   if (hasValue) {
     reactImports.unshift("  registerInjection as __zb_registerInjection,");
@@ -110,25 +113,67 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
     "const __zb_disposers = []",
     "__zb_beginInjectionBatch()",
     "for (const u of __zb_prevDisposers) { try { u() } catch {} }",
+    // Per-entry isolation: one injection module throwing during
+    // evaluation must not take the other N-1 down with it. Static
+    // imports would fail the whole prelude (ES module semantics), so
+    // each entry loads via its own dynamic import; allSettled keeps
+    // processing in registration order. A failed entry is loudly
+    // logged, recorded in the renderer's failure registry (so slots
+    // can render an error state instead of an empty frame), and
+    // forwarded to the dev server terminal.
+    "function __zb_fail(name, modulePath, pluginDir, error) {",
+    "  console.error(",
+    "    '[zenbu] injection \\'' + name + '\\'' + (pluginDir ? ' (plugin at ' + pluginDir + ')' : '') + ' failed to load.',",
+    "    'Everything its module registers is disabled until it loads cleanly. Module:', modulePath, 'Error:', error,",
+    "  )",
+    "  __zb_disposers.push(__zb_reportInjectionLoadFailure({ name, modulePath, pluginDir, error }))",
+    "  if (import.meta.hot) {",
+    "    try {",
+    "      import.meta.hot.send('zenbu:injection-load-failure', {",
+    "        name, modulePath, pluginDir: pluginDir ?? null,",
+    "        error: String((error && error.stack) || error),",
+    "      })",
+    "    } catch {}",
+    "  }",
+    "}",
+    "function __zb_take(i, name, modulePath, pluginDir) {",
+    "  const r = __zb_results[i]",
+    "  if (r.status === 'fulfilled') return r.value",
+    "  __zb_fail(name, modulePath, pluginDir, r.reason)",
+    "  return null",
+    "}",
+    "function __zb_export(mod, exportName, name, modulePath, pluginDir) {",
+    "  if (mod == null) return null",
+    "  const v = mod[exportName]",
+    "  if (v === undefined) {",
+    "    __zb_fail(name, modulePath, pluginDir, new Error('module evaluated but has no export named \"' + exportName + '\"'))",
+    "    return null",
+    "  }",
+    "  return v",
+    "}",
   ];
   const setupAliases: Array<{ alias: string; index: number }> = [];
   const calls: string[] = [];
+  const moduleImports: string[] = [];
   let needsAroundWrapper = false;
   entries.forEach((entry, i) => {
-    // Namespace import per entry: gives us `.setup` plus `.default` /
-    // `.<named>` for the registered value off the same alias.
+    // Per-entry dynamic import (settled below): gives us `.setup` plus
+    // `.default` / `.<named>` for the registered value off one alias,
+    // or `null` when the module failed — every use is null-guarded.
     const ns = `__m${i}`;
-    imports.push(
-      `import * as ${ns} from ${JSON.stringify(entry.modulePath)}`,
-    );
+    moduleImports.push(`  import(${JSON.stringify(entry.modulePath)}),`);
+    const entryArgs = `${JSON.stringify(entry.name)}, ${JSON.stringify(
+      entry.modulePath,
+    )}, ${JSON.stringify(entry.pluginDir ?? null)}`;
+    calls.push(`const ${ns} = __zb_take(${i}, ${entryArgs})`);
     setupAliases.push({ alias: ns, index: i });
 
     if (isBootstrap(entry)) return; // work lives in `setup`
 
-    const valueExpr =
-      entry.exportName === "default"
-        ? `${ns}.default`
-        : `${ns}.${entry.exportName}`;
+    const valueVar = `__v${i}`;
+    const valueExpr = `__zb_export(${ns}, ${JSON.stringify(
+      entry.exportName,
+    )}, ${entryArgs})`;
 
     if (isAdvice(entry)) {
       const wraps = entry.meta?.wraps as
@@ -143,34 +188,45 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
       if (!wraps || !adviceType) return;
       const modIdLit = JSON.stringify(wraps.moduleId);
       const nameLit = JSON.stringify(wraps.name);
+      calls.push(`const ${valueVar} = ${valueExpr}`);
       if (adviceType === "around") {
         needsAroundWrapper = true;
         calls.push(
-          `__zb_disposers.push(advise(${modIdLit}, ${nameLit}, "around", __zb_wrapAround(${valueExpr})))`,
+          `if (${valueVar} != null) __zb_disposers.push(advise(${modIdLit}, ${nameLit}, "around", __zb_wrapAround(${valueVar})))`,
         );
       } else if (adviceType === "replace") {
         // `replace` doesn't return a disposer; synthesize one via
         // `unreplace`. Stack-shaped storage in @zenbu/advice would let
         // this match `advise()`'s shape — see follow-up.
-        calls.push(`replace(${modIdLit}, ${nameLit}, ${valueExpr})`);
         calls.push(
-          `__zb_disposers.push(() => unreplace(${modIdLit}, ${nameLit}))`,
+          `if (${valueVar} != null) { replace(${modIdLit}, ${nameLit}, ${valueVar}); __zb_disposers.push(() => unreplace(${modIdLit}, ${nameLit})) }`,
         );
       } else {
         calls.push(
-          `__zb_disposers.push(advise(${modIdLit}, ${nameLit}, ${JSON.stringify(adviceType)}, ${valueExpr}))`,
+          `if (${valueVar} != null) __zb_disposers.push(advise(${modIdLit}, ${nameLit}, ${JSON.stringify(adviceType)}, ${valueVar}))`,
         );
       }
       return;
     }
 
     const metaLiteral = JSON.stringify(entry.meta);
+    calls.push(`const ${valueVar} = ${valueExpr}`);
     calls.push(
-      `__zb_disposers.push(__zb_registerInjection(${JSON.stringify(
+      `if (${valueVar} != null) __zb_disposers.push(__zb_registerInjection(${JSON.stringify(
         entry.name,
-      )}, ${valueExpr}, ${metaLiteral}))`,
+      )}, ${valueVar}, ${metaLiteral}))`,
     );
   });
+
+  // Settle every entry module before any registration runs. Top-level
+  // await: the prelude is a module script, and the injection batch is
+  // already open, so React sees one notification with the final state
+  // regardless of how long the imports take.
+  setup.push(
+    "const __zb_results = await Promise.allSettled([",
+    ...moduleImports,
+    "])",
+  );
 
   // Per (aroundFn, Original) memoized React component. Stable identity
   // across renders inside one chain incarnation; fresh component when
@@ -178,6 +234,27 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   if (needsAroundWrapper) {
     setup.unshift(
       "const __zb_aroundCache = new WeakMap()",
+      // Error boundary between the host tree and each around-advice
+      // layer. A plugin's advice throwing during render must degrade
+      // to the ORIGINAL component (advice skipped, loudly logged) —
+      // never take down the host surface it wraps. Once tripped, the
+      // boundary stays in fallback for the life of the mount; editing
+      // the advice rebuilds the chain (fresh component identity →
+      // remount), which re-arms it.
+      "class __zb_AdviceBoundary extends __zb_Component {",
+      "  constructor(props) { super(props); this.state = { failed: false } }",
+      "  static getDerivedStateFromError() { return { failed: true } }",
+      "  componentDidCatch(err) {",
+      "    console.error(",
+      "      '[zenbu] around-advice \\'' + this.props.__zb_adviceName + '\\' for <' + this.props.__zb_originalName + '> threw during render. Skipping this advice and rendering the original component. Error:',",
+      "      err,",
+      "    )",
+      "  }",
+      "  render() {",
+      "    if (this.state.failed) return __zb_createElement(this.props.__zb_original, this.props.__zb_props)",
+      "    return __zb_createElement(this.props.__zb_comp, this.props.__zb_props)",
+      "  }",
+      "}",
       "function __zb_wrapAround(aroundFn) {",
       "  return function(Original, props) {",
       "    let perFn = __zb_aroundCache.get(aroundFn)",
@@ -188,7 +265,13 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
       "      try { Object.defineProperty(Comp, 'name', { value: aroundFn.name || 'AroundAdvice' }) } catch {}",
       "      perFn.set(Original, Comp)",
       "    }",
-      "    return __zb_createElement(Comp, props)",
+      "    return __zb_createElement(__zb_AdviceBoundary, {",
+      "      __zb_comp: Comp,",
+      "      __zb_original: Original,",
+      "      __zb_props: props,",
+      "      __zb_adviceName: aroundFn.name || 'around-advice',",
+      "      __zb_originalName: Original.displayName || Original.name || 'component',",
+      "    })",
       "  }",
       "}",
     );
@@ -200,7 +283,7 @@ function generateInjectionsPreludeCode(entries: InjectionEntry[]): string {
   // cleanup)` in main-process services.
   for (const { alias, index } of setupAliases) {
     calls.push(
-      `if (typeof ${alias}.setup === "function") { const __r${index} = ${alias}.setup(); if (typeof __r${index} === "function") __zb_disposers.push(__r${index}) }`,
+      `if (${alias} && typeof ${alias}.setup === "function") { const __r${index} = ${alias}.setup(); if (typeof __r${index} === "function") __zb_disposers.push(__r${index}) }`,
     );
   }
 
@@ -269,6 +352,26 @@ export function advicePreludePlugin(): Plugin {
     },
 
     configureServer(server) {
+      // Renderer-side injection load failures land in the terminal the
+      // dev session was launched from, not just the webview's devtools
+      // console — a blank surface should never require hunting for the
+      // error two contexts away.
+      server.ws.on(
+        "zenbu:injection-load-failure",
+        (data: {
+          name?: string;
+          modulePath?: string;
+          pluginDir?: string | null;
+          error?: string;
+        }) => {
+          console.error(
+            `[zenbu] injection "${data?.name}" failed to load` +
+              (data?.pluginDir ? ` (plugin at ${data.pluginDir})` : "") +
+              ` — module ${data?.modulePath}\n${data?.error ?? "unknown error"}`,
+          );
+        },
+      );
+
       server.middlewares.use(async (req, res, next) => {
         const url = req.url ?? "";
         if (!url.startsWith(PRELUDE_PREFIX)) return next();
@@ -321,24 +424,57 @@ export function advicePreludePlugin(): Plugin {
   };
 }
 
+// Advice is a renderer-source transform, not just an entrypoint-root
+// transform. The host app's Vite root covers its own renderer tree; enabled
+// plugins can also own renderer surfaces, so their `src/**` files need the
+// same instrumentation when Vite serves them from outside `config.root`.
+const ADVICE_SOURCE_EXT_RE = /\.[jt]sx?$/;
+
+function normalizeFsPath(value: string): string {
+  return path.resolve(value).replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function stripViteRequestSuffix(id: string): string {
+  const index = id.search(/[?#]/);
+  return index === -1 ? id : id.slice(0, index);
+}
+
+function isInsideDir(file: string, dir: string): boolean {
+  return file === dir || file.startsWith(`${dir}/`);
+}
+
+function adviceTransformRoots(viteRoot: string): string[] {
+  const roots = new Set<string>([normalizeFsPath(viteRoot)]);
+  for (const plugin of getConfig().plugins) {
+    roots.add(normalizeFsPath(path.join(plugin.dir, "src")));
+  }
+  return [...roots];
+}
+
+function shouldAdviceTransform(id: string, viteRoot: string): boolean {
+  if (id.includes("\0")) return false;
+  const file = normalizeFsPath(stripViteRequestSuffix(id));
+  if (!ADVICE_SOURCE_EXT_RE.test(file)) return false;
+  return adviceTransformRoots(viteRoot).some((root) => isInsideDir(file, root));
+}
+
 /** Scoped wrapper around `@zenbu/advice/vite`'s babel transform. */
 export function zenbuAdviceTransform(): Plugin {
   let inner: any = null;
+  let viteRoot = "";
   return {
     name: "zenbu-advice-scoped",
     enforce: "pre",
     configResolved(config) {
-      const escaped = config.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      inner = zenbuAdvicePlugin({
-        root: config.root,
-        include: new RegExp(`^${escaped}.*\\.[jt]sx?$`),
-      });
+      viteRoot = config.root;
+      inner = zenbuAdvicePlugin({ root: config.root });
       const hook = (inner as any)?.configResolved;
       if (typeof hook === "function") {
         hook.call(this, config);
       }
     },
     transform(code, id) {
+      if (!viteRoot || !shouldAdviceTransform(id, viteRoot)) return null;
       const hook = (inner as any)?.transform;
       if (typeof hook !== "function") return null;
       return hook.call(this, code, id);

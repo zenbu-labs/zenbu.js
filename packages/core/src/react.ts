@@ -812,6 +812,75 @@ function subscribeInjectionRegistry(cb: () => void) {
   };
 }
 
+// ---- Injection load failures ----
+//
+// When the injections prelude fails to load an entry's module (the
+// module threw during evaluation, or the named export is missing) it
+// records the failure here instead of letting the whole prelude die.
+// Surfaces that render through `useInjection` can interrogate this to
+// show a real error state instead of their silent "still loading"
+// fallback — a fallback that can't explain itself is a debugging trap.
+
+export interface InjectionLoadFailure {
+  name: string;
+  modulePath: string;
+  /** Root dir of the plugin that registered the injection, if known. */
+  pluginDir?: string;
+  /** The import() rejection or a missing-export description. */
+  error: unknown;
+}
+
+const injectionLoadFailures = new Map<string, InjectionLoadFailure>();
+
+/**
+ * Record a load failure for an injection. Returns a disposer (the
+ * prelude pushes it alongside registration disposers, so a fixed
+ * module clears its failure on the next HMR round). Notifies the same
+ * listeners as the injection registry — `useInjectionFailure` users
+ * re-render when failures appear or clear.
+ */
+export function reportInjectionLoadFailure(
+  failure: InjectionLoadFailure,
+): () => void {
+  injectionLoadFailures.set(failure.name, failure);
+  emitInjectionRegistryChange();
+  return () => {
+    if (injectionLoadFailures.get(failure.name) === failure) {
+      injectionLoadFailures.delete(failure.name);
+      emitInjectionRegistryChange();
+    }
+  };
+}
+
+/** Read the load failure for one injection name, if any. Reactive. */
+export function useInjectionFailure(
+  name: string,
+): InjectionLoadFailure | undefined {
+  return useSyncExternalStore(
+    subscribeInjectionRegistry,
+    () => injectionLoadFailures.get(name),
+    () => injectionLoadFailures.get(name),
+  );
+}
+
+/** All current injection load failures. Reactive, stable snapshot. */
+export function useInjectionFailures(): InjectionLoadFailure[] {
+  const lastFailuresRef = useRef<InjectionLoadFailure[]>([]);
+  const getSnapshot = () => {
+    const current = [...injectionLoadFailures.values()];
+    const last = lastFailuresRef.current;
+    if (
+      current.length === last.length &&
+      current.every((f, i) => f === last[i])
+    ) {
+      return last;
+    }
+    lastFailuresRef.current = current;
+    return current;
+  };
+  return useSyncExternalStore(subscribeInjectionRegistry, getSnapshot, getSnapshot);
+}
+
 /**
  * Hook companion to `registerInjection`. Registers `value` under
  * `name` while the calling component is mounted; re-registers when

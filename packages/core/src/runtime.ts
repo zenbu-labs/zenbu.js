@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   addAdvice,
+  addAdviceTarget,
   addInjection,
   type AdviceSpec,
   type InjectionSpec,
@@ -150,6 +151,20 @@ export abstract class Service {
   advise(spec: AdviceSpec): () => void {
     const pluginDir = this.__getPluginDir("advise");
     return addAdvice(pluginDir, spec);
+  }
+
+  /**
+   * Declare a stable advice-target id for a component this plugin
+   * owns. Advisers can then `advise({ target: id, ... })` instead of
+   * matching module-path suffixes, so moving the file only requires
+   * updating this one registration. Returns a disposer; wrap in
+   * `this.setup(...)` like any registration.
+   */
+  adviceTarget(
+    id: string,
+    target: { moduleId: string; name: string },
+  ): () => void {
+    return addAdviceTarget(id, target);
   }
 
   /** @internal */
@@ -596,11 +611,53 @@ export class ServiceRuntime {
         this.draining = null;
         if (this.dirtyKeys.size > 0) {
           void this.scheduleReconcile([]);
+        } else {
+          this.scheduleBlockedDiagnostic();
         }
       }
     })();
 
     return this.draining;
+  }
+
+  private blockedDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * A service whose dep key never resolves stays `blocked` forever —
+   * historically with no signal at all unless it had been ready before
+   * a hot reload. That silent no-op is how a typo'd string-key dep (or
+   * a disabled plugin) turns into "feature mysteriously does nothing".
+   * After the runtime goes idle, give stragglers a grace period, then
+   * name them loudly with WHY each dep is missing.
+   */
+  private scheduleBlockedDiagnostic(): void {
+    if (this.blockedDiagnosticTimer) clearTimeout(this.blockedDiagnosticTimer);
+    this.blockedDiagnosticTimer = setTimeout(() => {
+      this.blockedDiagnosticTimer = null;
+      if (this.draining || this.dirtyKeys.size > 0) return; // another batch is in flight
+      for (const [key, slot] of this.slots) {
+        if (slot.status !== "blocked") continue;
+        const ServiceClass = this.definitions.get(key);
+        if (!ServiceClass) continue;
+        const reasons = this.listMissingDeps(ServiceClass).map((dep) => {
+          const depSlot = this.resolveDepSlot(dep);
+          if (!depSlot && !this.definitions.has(dep)) {
+            return `"${dep}" (no service registered under this key — typo in a string-key dep, or the owning plugin is disabled)`;
+          }
+          if (depSlot?.status === "failed") {
+            return `"${dep}" (failed to evaluate — see its error above)`;
+          }
+          return `"${dep}" (still ${depSlot?.status ?? "unregistered"})`;
+        });
+        if (reasons.length === 0) continue;
+        console.warn(
+          `[runtime] service "${key}" is blocked waiting on: ${reasons.join(", ")}. ` +
+            `Its RPC surface and evaluate() side effects are NOT active.`,
+        );
+      }
+    }, 5000);
+    // Don't keep the process alive just for diagnostics.
+    this.blockedDiagnosticTimer?.unref?.();
   }
 
   private async reconcileBatch(changedKeys: readonly string[]): Promise<void> {
