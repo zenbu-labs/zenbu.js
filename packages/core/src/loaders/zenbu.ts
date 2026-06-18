@@ -109,6 +109,14 @@ function buildSource(imports: string[]): string {
     .join("");
 }
 
+function buildSafeSource(imports: string[]): string {
+  const entries = imports.map(
+    (specifier) =>
+      `  import(${JSON.stringify(specifier)}).catch(e => console.error("[zenbu-loader] failed to load module", ${JSON.stringify(specifier)} + ":", e.message ?? e))`,
+  );
+  return `await Promise.allSettled([\n${entries.join(",\n")}\n])\n`;
+}
+
 /**
  * Matches a service class declaration after dynohot has stripped `export` and
  * minified the source, so it can't require `export`. (`zen link` runs on
@@ -323,9 +331,8 @@ function buildPluginsRoot(payload: RegistryPayload): {
   const barrelUrls = payload.plugins.map(
     (p) => `zenbu:barrel?plugin=${encodeURIComponent(JSON.stringify(p))}`,
   );
-  const imports = [registryUrl, ...barrelUrls];
   return {
-    source: `${buildSource(imports)}import.meta.hot?.accept()\n`,
+    source: `${buildSource([registryUrl])}${buildSafeSource(barrelUrls)}import.meta.hot?.accept()\n`,
     barrelUrls,
   };
 }
@@ -379,7 +386,7 @@ function buildPluginBarrel(plugin: ResolvedPluginRecord): {
   }
 
   return {
-    source: `${buildSource(imports)}import.meta.hot?.accept()\n`,
+    source: `${buildSafeSource(imports)}import.meta.hot?.accept()\n`,
     watchPaths,
   };
 }
@@ -587,21 +594,58 @@ function loadImpl(
         isInsidePluginDir(filePath) &&
         fs.existsSync(filePath)
       ) {
-        const stripped = loadNativeStrippedTs(filePath);
-        return isServiceFile ? appendAutoRegister(stripped, filePath) : stripped;
+        if (isServiceFile) {
+          try {
+            const stripped = loadNativeStrippedTs(filePath);
+            return appendAutoRegister(stripped, filePath);
+          } catch (err) {
+            console.error(
+              `[zenbu-loader] failed to load ${filePath}:`,
+              (err as Error).message ?? err,
+            );
+            return {
+              format: "module",
+              source: "export {}\n",
+              shortCircuit: true,
+            } satisfies LoaderResult;
+          }
+        }
+        return loadNativeStrippedTs(filePath);
       }
 
       if (isServiceFile) {
-        const downstream = nextLoad(url, context);
-        if (
-          downstream &&
-          typeof (downstream as PromiseLike<unknown>).then === "function"
-        ) {
-          return Promise.resolve(downstream).then((r) =>
-            appendAutoRegister(r, filePath),
+        try {
+          const downstream = nextLoad(url, context);
+          if (
+            downstream &&
+            typeof (downstream as PromiseLike<unknown>).then === "function"
+          ) {
+            return Promise.resolve(downstream)
+              .then((r) => appendAutoRegister(r, filePath))
+              .catch((err) => {
+                console.error(
+                  `[zenbu-loader] failed to load ${filePath}:`,
+                  (err as Error).message ?? err,
+                );
+                return {
+                  format: "module",
+                  source: "export {}\n",
+                  shortCircuit: true,
+                } satisfies LoaderResult;
+              });
+          }
+          return appendAutoRegister(downstream, filePath);
+        } catch (err) {
+          console.error(
+            `[zenbu-loader] failed to load ${filePath}:`,
+            (err as Error).message ?? err,
           );
+          return {
+            format: "module",
+            source: "export {}\n",
+            shortCircuit: true,
+          } satisfies LoaderResult;
         }
-        return appendAutoRegister(downstream, filePath);
       }
     }
   }
