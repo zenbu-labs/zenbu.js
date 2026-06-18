@@ -110,12 +110,11 @@ function buildSource(imports: string[]): string {
 }
 
 function buildSafeSource(imports: string[]): string {
-  return imports
-    .map(
-      (specifier) =>
-        `await import(${JSON.stringify(specifier)}).catch(e => console.error("[zenbu-loader] failed to load module", ${JSON.stringify(specifier)} + ":", e.message ?? e))\n`,
-    )
-    .join("");
+  const entries = imports.map(
+    (specifier) =>
+      `  import(${JSON.stringify(specifier)}).catch(e => console.error("[zenbu-loader] failed to load module", ${JSON.stringify(specifier)} + ":", e.message ?? e))`,
+  );
+  return `await Promise.allSettled([\n${entries.join(",\n")}\n])\n`;
 }
 
 /**
@@ -595,20 +594,23 @@ function loadImpl(
         isInsidePluginDir(filePath) &&
         fs.existsSync(filePath)
       ) {
-        try {
-          const stripped = loadNativeStrippedTs(filePath);
-          return isServiceFile ? appendAutoRegister(stripped, filePath) : stripped;
-        } catch (err) {
-          console.error(
-            `[zenbu-loader] failed to load ${filePath}:`,
-            (err as Error).message ?? err,
-          );
-          return {
-            format: "module",
-            source: "export {}\n",
-            shortCircuit: true,
-          } satisfies LoaderResult;
+        if (isServiceFile) {
+          try {
+            const stripped = loadNativeStrippedTs(filePath);
+            return appendAutoRegister(stripped, filePath);
+          } catch (err) {
+            console.error(
+              `[zenbu-loader] failed to load ${filePath}:`,
+              (err as Error).message ?? err,
+            );
+            return {
+              format: "module",
+              source: "export {}\n",
+              shortCircuit: true,
+            } satisfies LoaderResult;
+          }
         }
+        return loadNativeStrippedTs(filePath);
       }
 
       if (isServiceFile) {
