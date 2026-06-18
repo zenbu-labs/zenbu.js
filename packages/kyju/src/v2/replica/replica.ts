@@ -314,6 +314,7 @@ const createReplicaEffect = (
 
           case "write": {
             const state = yield* requireConnected({ ref: stateRef });
+            const snapshot = yield* Ref.get(stateRef);
             yield* traceKyju(
               "kyju:replica.applyWrite",
               applyWrite({ stateRef, op: event.op }),
@@ -335,13 +336,18 @@ const createReplicaEffect = (
               ),
               { op: event.op.type },
             );
-            if (writeAck.error) return yield* Effect.fail(writeAck.error);
+            if (writeAck.error) {
+              yield* Ref.set(stateRef, snapshot);
+              return yield* Effect.fail(writeAck.error);
+            }
             return;
           }
 
           case "write-batch": {
             const state = yield* requireConnected({ ref: stateRef });
             if (event.ops.length === 0) return;
+
+            const batchSnapshot = yield* Ref.get(stateRef);
 
             // ONE Ref.update for the whole batch — subscribers see one
             // transition for the entire `client.update(fn)` call, so
@@ -359,9 +365,8 @@ const createReplicaEffect = (
             }
 
             // Replicate to server op-by-op so the wire protocol stays
-            // unchanged. If an ack errors we surface it; earlier ops in
-            // the batch are already applied locally — same loss-of-atomicity
-            // contract as the single-op `kind: "write"` path on failure.
+            // unchanged. If an ack errors we roll back the whole batch and
+            // surface the error to the caller.
             for (const op of event.ops) {
               const writeRequestId = nanoid();
               const writeAck = yield* traceKyju(
@@ -378,7 +383,10 @@ const createReplicaEffect = (
                 ),
                 { op: op.type },
               );
-              if (writeAck.error) return yield* Effect.fail(writeAck.error);
+              if (writeAck.error) {
+                yield* Ref.set(stateRef, batchSnapshot);
+                return yield* Effect.fail(writeAck.error);
+              }
             }
             return;
           }
