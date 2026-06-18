@@ -148,9 +148,13 @@ export type EffectClientProxy<Shape extends SchemaShape> = {
   update(
     fn: (root: InferRoot<Shape>) => void | InferRoot<Shape>,
   ): Effect.Effect<void, KyjuError>;
-  createBlob(data: Uint8Array, hot?: boolean): Effect.Effect<string, KyjuError>;
+  createBlob(
+    data: Uint8Array,
+    opts?: { contentType?: string; hot?: boolean } | boolean,
+  ): Effect.Effect<string, KyjuError>;
   deleteBlob(blobId: string): Effect.Effect<void, KyjuError>;
   getBlobData(blobId: string): Effect.Effect<Uint8Array | null, KyjuError>;
+  getBlobMetadata(blobId: string): Effect.Effect<{ fileSize: number; contentType: string | null } | null, never>;
   /**
    * Refcounted subscription to a collection by its id.
    *
@@ -177,9 +181,13 @@ export type ClientProxy<Shape extends SchemaShape> = {
   update(
     fn: (root: InferRoot<Shape>) => void | InferRoot<Shape>,
   ): Promise<void>;
-  createBlob(data: Uint8Array, hot?: boolean): Promise<string>;
+  createBlob(
+    data: Uint8Array,
+    opts?: { contentType?: string; hot?: boolean } | boolean,
+  ): Promise<string>;
   deleteBlob(blobId: string): Promise<void>;
   getBlobData(blobId: string): Promise<Uint8Array | null>;
+  getBlobMetadata(blobId: string): Promise<{ fileSize: number; contentType: string | null } | null>;
   /** See `EffectClientProxy.subscribeCollection`. */
   subscribeCollection(collectionId: string): () => void;
 };
@@ -672,14 +680,31 @@ function createClientCore<TShape extends SchemaShape>(
       }),
     );
 
-  const createBlobFn = (data: Uint8Array, hot?: boolean) =>
+  const createBlobFn = (
+    data: Uint8Array,
+    opts?: { contentType?: string; hot?: boolean } | boolean,
+  ) =>
     Effect.gen(function* () {
       const blobId = nanoid();
+      const hot = typeof opts === "boolean" ? opts : opts?.hot;
+      const contentType = typeof opts === "object" ? opts?.contentType : undefined;
       yield* send({
         kind: "write",
-        op: { type: "blob.create", blobId, data, hot },
+        op: { type: "blob.create", blobId, data, hot, contentType },
       });
       return blobId;
+    });
+
+  const getBlobMetadataFn = (blobId: string) =>
+    Effect.sync(() => {
+      const state = replica.getState();
+      if (state.kind !== "connected") return null;
+      const blob = state.blobs.find((b) => b.id === blobId);
+      if (!blob) return null;
+      return {
+        fileSize: blob.fileSize,
+        contentType: blob.contentType ?? null,
+      };
     });
 
   const deleteBlobFn = (blobId: string) =>
@@ -718,6 +743,7 @@ function createClientCore<TShape extends SchemaShape>(
       if (prop === "createBlob") return createBlobFn;
       if (prop === "deleteBlob") return deleteBlobFn;
       if (prop === "getBlobData") return getBlobDataFn;
+      if (prop === "getBlobMetadata") return getBlobMetadataFn;
       if (prop === "subscribeCollection") return subscribeCollectionFn;
 
       const rootVal = getAtPath(getRoot(), [prop as string]);

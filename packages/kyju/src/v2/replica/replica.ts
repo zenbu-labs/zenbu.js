@@ -92,6 +92,7 @@ const reduceWrite = (state: ConnectedState, op: WriteOp): ConnectedState => {
           ? { kind: "hot", value: op.data }
           : { kind: "cold" },
         fileSize: 0,
+        ...(op.contentType !== undefined && { contentType: op.contentType }),
       };
       return { ...state, blobs: [...state.blobs, blob] };
     }
@@ -468,7 +469,11 @@ const createReplicaEffect = (
                     ...state,
                     blobs: state.blobs.map((blob) =>
                       blob.id === msg.blobId
-                        ? { ...blob, fileSize: msg.fileSize }
+                        ? {
+                            ...blob,
+                            fileSize: msg.fileSize,
+                            ...(msg.contentType !== undefined && { contentType: msg.contentType }),
+                          }
                         : blob,
                     ),
                   }),

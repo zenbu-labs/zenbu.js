@@ -95,6 +95,7 @@ export type BlobCreateOp = {
   blobId: string;
   data: Uint8Array;
   hot?: boolean;
+  contentType?: string;
 };
 
 export type BlobSetOp = {
@@ -135,6 +136,7 @@ export type BlobMetadataUpdate = {
   type: "blob.metadataUpdate";
   blobId: string;
   fileSize: number;
+  contentType?: string;
 };
 
 export type ReconnectUpdate = {
@@ -236,6 +238,7 @@ export type ClientBlob = {
   id: string;
   data: BlobData;
   fileSize: number;
+  contentType?: string;
 };
 
 export type ClientState =

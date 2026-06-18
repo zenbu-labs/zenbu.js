@@ -15,6 +15,7 @@ import {
   makeAck,
   makeErrorAck,
   paths,
+  readJsonFile,
   sendAck,
   setAtPath,
   writeJsonFile,
@@ -482,6 +483,7 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
           config: ctx.config,
           blobId: event.op.blobId,
           data: event.op.data,
+          contentType: event.op.contentType,
         });
 
         sendAck({
@@ -528,9 +530,22 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
             yield* ctx.fs.writeFile(dataPath, typedOp.data);
             const blobStats = yield* ctx.fs.stat(dataPath);
 
+            const existingIdx = yield* readJsonFile({
+              fs: ctx.fs,
+              path: paths.blobIndex({ config: ctx.config, blobId: typedOp.blobId }),
+            }).pipe(Effect.catchAll(() => Effect.succeed(null)));
+            const existingContentType =
+              existingIdx != null &&
+              typeof existingIdx === "object" &&
+              !Array.isArray(existingIdx) &&
+              "contentType" in existingIdx
+                ? (existingIdx.contentType as string | undefined)
+                : undefined;
+
             const bIdx: BlobIndex = {
               blobId: typedOp.blobId,
               fileSize: Number(blobStats.size),
+              ...(existingContentType !== undefined && { contentType: existingContentType }),
             };
             yield* writeJsonFile({
               fs: ctx.fs,
@@ -560,6 +575,7 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
                 type: "blob.metadataUpdate",
                 blobId: typedOp.blobId,
                 fileSize: Number(blobStats.size),
+                ...(existingContentType !== undefined && { contentType: existingContentType }),
               },
             });
           }),

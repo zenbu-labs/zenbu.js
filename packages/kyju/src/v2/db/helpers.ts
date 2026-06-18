@@ -285,6 +285,7 @@ export type PageIndex = {
 export type BlobIndex = {
   blobId: string;
   fileSize: number;
+  contentType?: string;
 };
 
 export const createCollection = ({
@@ -340,11 +341,13 @@ export const createBlob = ({
   config,
   blobId,
   data,
+  contentType,
 }: {
   fs: FileSystem.FileSystem;
   config: DbConfig;
   blobId: string;
   data: Uint8Array;
+  contentType?: string;
 }) =>
   Effect.gen(function* () {
     yield* fs.makeDirectory(paths.blob({ config, blobId }), {
@@ -362,6 +365,7 @@ export const createBlob = ({
       data: {
         blobId,
         fileSize: Number(stats.size),
+        ...(contentType !== undefined && { contentType }),
       } satisfies BlobIndex,
     });
   });
