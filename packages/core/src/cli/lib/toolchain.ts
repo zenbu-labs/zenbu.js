@@ -32,6 +32,26 @@ const PINNED_BUN = {
       sha256:
         "0f58c53a3e7947f1e626d2f8d285f97c14b7cadcca9c09ebafc0ae9d35b58c3d",
     },
+    "linux-x64": {
+      asset: "bun-linux-x64.zip",
+      sha256:
+        "11dc3ee11bc1695e149737c6ca3d5619302cf4346e6b8a6ec7988967ef01ddc5",
+    },
+    "linux-aarch64": {
+      asset: "bun-linux-aarch64.zip",
+      sha256:
+        "c40bc0ebca11bde7d75af497a654a874d0c7fd8d6a8d6031c173c10c9064297b",
+    },
+    "windows-x64": {
+      asset: "bun-windows-x64.zip",
+      sha256:
+        "841ff9c5dffcaa3a2620d1e3f87ee500f32a4ca830b001cade7a3479609d4a89",
+    },
+    "windows-aarch64": {
+      asset: "bun-windows-aarch64.zip",
+      sha256:
+        "6cac24eab41e8d7e6b39b4dd3b4bca5ea0d11a1f43f94126bdff6e849f9f7f51",
+    },
   },
 } as const
 
@@ -45,12 +65,21 @@ function defaultCacheRoot(): string {
   return path.join(os.homedir(), ".zenbu", "cache", "toolchain")
 }
 
-type BunArch = "darwin-aarch64" | "darwin-x64"
+type BunArch = keyof typeof PINNED_BUN.targets
 
 function bunTarget(): BunArch {
-  if (process.arch === "arm64") return "darwin-aarch64"
-  if (process.arch === "x64") return "darwin-x64"
-  throw new Error(`zenbu toolchain: unsupported architecture ${process.arch}`)
+  const plat =
+    process.platform === "darwin"
+      ? "darwin"
+      : process.platform === "win32"
+        ? "windows"
+        : "linux"
+  const arch = process.arch === "arm64" ? "aarch64" : "x64"
+  const key = `${plat}-${arch}` as BunArch
+  if (!(key in PINNED_BUN.targets)) {
+    throw new Error(`zenbu toolchain: unsupported platform/arch ${key}`)
+  }
+  return key
 }
 
 // =============================================================================
@@ -222,8 +251,10 @@ async function ensureBunCached(
   cacheRoot: string,
 ): Promise<string> {
   const target = bunTarget()
+  const isWin = process.platform === "win32"
+  const binName = isWin ? "bun.exe" : "bun"
   const dir = path.join(cacheRoot, `bun-${spec.version}-${target}`)
-  const cached = path.join(dir, "bun")
+  const cached = path.join(dir, binName)
   if (fs.existsSync(cached)) return cached
 
   await fsp.mkdir(dir, { recursive: true })
@@ -250,13 +281,20 @@ async function ensureBunCached(
     }
     await verifySha256(zipPath, expected)
 
-    await execFileAsync("unzip", ["-q", zipPath, "-d", tmp])
-    const extracted = await findExecutable(tmp, "bun")
+    if (isWin) {
+      await execFileAsync("powershell", [
+        "-NoProfile", "-Command",
+        `Expand-Archive -Force -Path '${zipPath}' -DestinationPath '${tmp}'`,
+      ])
+    } else {
+      await execFileAsync("unzip", ["-q", zipPath, "-d", tmp])
+    }
+    const extracted = await findExecutable(tmp, binName)
     if (!extracted) {
-      throw new Error(`zenbu toolchain: could not find bun in ${asset}`)
+      throw new Error(`zenbu toolchain: could not find ${binName} in ${asset}`)
     }
     await fsp.copyFile(extracted, cached)
-    await fsp.chmod(cached, 0o755)
+    if (!isWin) await fsp.chmod(cached, 0o755)
   } finally {
     await fsp.rm(tmp, { recursive: true, force: true })
   }
@@ -464,11 +502,6 @@ export async function provisionToolchain(
   stagingDir: string,
   opts: ProvisionOptions,
 ): Promise<ProvisionedToolchain> {
-  if (process.platform !== "darwin") {
-    throw new Error(
-      `zenbu toolchain: only darwin is supported today (got ${process.platform})`,
-    )
-  }
   await fsp.mkdir(stagingDir, { recursive: true })
   const cacheRoot = opts.cacheRoot ?? defaultCacheRoot()
 
@@ -486,16 +519,21 @@ export async function provisionToolchain(
           }
         })()
 
+  const isWin = process.platform === "win32"
   const cachedBun = await ensureBunCached(bunSpec, cacheRoot)
-  const bunOut = path.join(stagingDir, "bun")
+  const bunOut = path.join(stagingDir, isWin ? "bun.exe" : "bun")
   await fsp.copyFile(cachedBun, bunOut)
-  await fsp.chmod(bunOut, 0o755)
+  if (!isWin) await fsp.chmod(bunOut, 0o755)
 
-  const nodeOut = path.join(stagingDir, "node")
+  const nodeOut = path.join(stagingDir, isWin ? "node.exe" : "node")
   try {
     await fsp.unlink(nodeOut)
   } catch {}
-  await fsp.symlink("bun", nodeOut)
+  if (isWin) {
+    await fsp.copyFile(cachedBun, nodeOut)
+  } else {
+    await fsp.symlink("bun", nodeOut)
+  }
 
   switch (pm.type) {
     case "pnpm": {
