@@ -162,3 +162,6 @@ packages/init/.zenbu/db/
 
 # Perf experiment output
 **/perf-experiment-out/
+
+# Local test apps
+my-zenbu-app/
