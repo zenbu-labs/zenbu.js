@@ -429,6 +429,28 @@ export class WindowService extends Service.create({
     return { windowId };
   }
 
+  async closeWindow(args: { windowId: string }): Promise<void> {
+    const windowId = args.windowId;
+    const existing = this.mounted.get(windowId);
+    if (existing) {
+      const win = this.ctx.baseWindow.windows.get(windowId);
+      try {
+        win?.contentView.removeChildView(existing.view);
+      } catch {}
+      try {
+        existing.disposeContextMenu();
+      } catch {}
+      existing.view.webContents.close();
+      this.mounted.delete(windowId);
+    }
+    const win = this.ctx.baseWindow.windows.get(windowId);
+    if (win && !win.isDestroyed()) {
+      try {
+        win.close();
+      } catch {}
+    }
+  }
+
   async focusWindow(windowId: string): Promise<{ ok: true }> {
     const win = this.ctx.baseWindow.windows.get(windowId);
     if (win && !win.isDestroyed()) {
