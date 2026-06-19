@@ -7,6 +7,7 @@
 
 import { register } from "tsx/esm/api"
 import { loadConfig } from "./lib/load-config"
+import { readHostProjectMetadata } from "../shared/host-project-metadata"
 
 async function main(): Promise<void> {
   register()
@@ -30,6 +31,10 @@ async function main(): Promise<void> {
       icons: p.icons,
       args: p.args,
     })),
+    hostProject: readHostProjectMetadata(
+      resolved.projectDir,
+      resolved.configPath,
+    ),
     appEntrypoint: resolved.uiEntrypointPath,
     splashPath: resolved.splashPath,
   }
