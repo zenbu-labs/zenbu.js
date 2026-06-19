@@ -78,7 +78,9 @@ export class RpcService extends Service.create({
         });
         wsRpcConnections.set(id, { rpcConn, ws });
 
-        ws.on("message", (raw: Buffer) => {
+        ws.on("message", (raw: Buffer, isBinary: boolean) => {
+          // The rpc channel is text-only; ignore binary db frames.
+          if (isBinary) return;
           const msg = JSON.parse(String(raw));
           if (msg.ch === "rpc") {
             rpcConn.receive(msg.data);

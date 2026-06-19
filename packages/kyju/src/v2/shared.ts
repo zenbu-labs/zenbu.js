@@ -95,6 +95,7 @@ export type BlobCreateOp = {
   blobId: string;
   data: Uint8Array;
   hot?: boolean;
+  contentType?: string;
 };
 
 export type BlobSetOp = {

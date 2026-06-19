@@ -148,7 +148,11 @@ export type EffectClientProxy<Shape extends SchemaShape> = {
   update(
     fn: (root: InferRoot<Shape>) => void | InferRoot<Shape>,
   ): Effect.Effect<void, KyjuError>;
-  createBlob(data: Uint8Array, hot?: boolean): Effect.Effect<string, KyjuError>;
+  createBlob(
+    data: Uint8Array,
+    hot?: boolean,
+    contentType?: string,
+  ): Effect.Effect<string, KyjuError>;
   deleteBlob(blobId: string): Effect.Effect<void, KyjuError>;
   getBlobData(blobId: string): Effect.Effect<Uint8Array | null, KyjuError>;
   /**
@@ -177,7 +181,7 @@ export type ClientProxy<Shape extends SchemaShape> = {
   update(
     fn: (root: InferRoot<Shape>) => void | InferRoot<Shape>,
   ): Promise<void>;
-  createBlob(data: Uint8Array, hot?: boolean): Promise<string>;
+  createBlob(data: Uint8Array, hot?: boolean, contentType?: string): Promise<string>;
   deleteBlob(blobId: string): Promise<void>;
   getBlobData(blobId: string): Promise<Uint8Array | null>;
   /** See `EffectClientProxy.subscribeCollection`. */
@@ -672,12 +676,12 @@ function createClientCore<TShape extends SchemaShape>(
       }),
     );
 
-  const createBlobFn = (data: Uint8Array, hot?: boolean) =>
+  const createBlobFn = (data: Uint8Array, hot?: boolean, contentType?: string) =>
     Effect.gen(function* () {
       const blobId = nanoid();
       yield* send({
         kind: "write",
-        op: { type: "blob.create", blobId, data, hot },
+        op: { type: "blob.create", blobId, data, hot, contentType },
       });
       return blobId;
     });

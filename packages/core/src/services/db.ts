@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { createReadStream, statSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -14,7 +15,8 @@ import type {
   FieldNode,
 } from "@zenbu/kyju";
 import type * as Effect from "effect/Effect";
-import { createRouter, dbStringify, dbParse } from "@zenbu/kyju/transport";
+import { createRouter } from "@zenbu/kyju/transport";
+import { encodeFrame, decodeFrame } from "../transport/ws-frame";
 import { loadMigrationsFromDir } from "@zenbu/kyju/loader";
 import { Service, runtime, getPlugins, subscribeConfig } from "../runtime";
 import type { ResolvedDbRoot } from "../registry";
@@ -702,6 +704,64 @@ export class DbService extends Service.create({
    */
   private armWsTransport(): void {
     const http = this.ctx.http;
+
+    // First-class blob URLs: stream a blob's bytes straight from disk over
+    // the host's HTTP server so the browser can fetch/cache it by URL
+    // (`useBlobUrl`), instead of marshalling megabytes through the DB
+    // channel into a `Blob`/object URL on every render.
+    this.setup("blob-http", () =>
+      http.addRequestHandler("/__blob/", (req, res) => {
+        try {
+          const u = new URL(req.url ?? "/", "http://127.0.0.1");
+          if (u.searchParams.get("token") !== http.authToken) {
+            res.writeHead(403);
+            res.end("forbidden");
+            return;
+          }
+          const blobId = decodeURIComponent(
+            u.pathname.slice("/__blob/".length),
+          );
+          if (!/^[A-Za-z0-9_-]+$/.test(blobId)) {
+            res.writeHead(400);
+            res.end("bad blob id");
+            return;
+          }
+          const dir = path.join(this.dbPath, "blobs", blobId);
+          const file = path.join(dir, "data");
+          const stat = statSync(file, { throwIfNoEntry: false });
+          if (!stat) {
+            res.writeHead(404);
+            res.end("not found");
+            return;
+          }
+          // Prefer the content-type stored alongside the blob (zenbu.js#8);
+          // fall back to an explicit `?type=` hint, then octet-stream.
+          let storedType: string | undefined;
+          try {
+            const idx = JSON.parse(
+              readFileSync(path.join(dir, "index.json"), "utf8"),
+            );
+            if (typeof idx?.contentType === "string") storedType = idx.contentType;
+          } catch {}
+          res.writeHead(200, {
+            "Content-Type":
+              storedType || u.searchParams.get("type") || "application/octet-stream",
+            "Content-Length": String(stat.size),
+            // blobIds are immutable, so the bytes for one never change.
+            "Cache-Control": "public, max-age=31536000, immutable",
+          });
+          if (req.method === "HEAD") {
+            res.end();
+            return;
+          }
+          createReadStream(file).pipe(res);
+        } catch {
+          if (!res.headersSent) res.writeHead(500);
+          res.end("error");
+        }
+      }),
+    );
+
     this.setup("ws-transport", () => {
       const wsDbConnections = new Map<
         string,
@@ -711,15 +771,15 @@ export class DbService extends Service.create({
         const dbConn = this.dbRouter!.connection({
           send: (event: any) => {
             if (ws.readyState === ws.OPEN) {
-              ws.send(dbStringify({ ch: "db", data: event }));
+              ws.send(encodeFrame({ ch: "db", data: event }));
             }
           },
           postMessage: this.db!.postMessage,
         });
         wsDbConnections.set(id, dbConn);
 
-        ws.on("message", async (raw: Buffer) => {
-          const msg = dbParse(String(raw));
+        ws.on("message", async (raw: Buffer, isBinary: boolean) => {
+          const msg = decodeFrame(isBinary ? raw : raw.toString(), isBinary);
           if (msg.ch === "db") {
             await dbConn.receive(msg.data);
           }

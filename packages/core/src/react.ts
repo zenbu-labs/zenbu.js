@@ -25,11 +25,8 @@ import {
   type ReactNode,
   type Ref,
 } from "react";
-import {
-  connectReplica,
-  dbStringify,
-  dbParse,
-} from "@zenbu/kyju/transport";
+import { connectReplica } from "@zenbu/kyju/transport";
+import { encodeFrame, decodeFrame } from "./transport/ws-frame";
 import type {
   ClientProxy,
   SchemaShape,
@@ -157,6 +154,8 @@ export function ZenbuProvider({
       cleanupRef.current = null;
 
       const ws = new WebSocket(resolvedUrl as string);
+      // Binary db frames arrive as ArrayBuffer rather than Blob.
+      ws.binaryType = "arraybuffer";
 
       ws.onopen = async () => {
         try {
@@ -175,6 +174,8 @@ export function ZenbuProvider({
             },
             subscribe: (cb) => {
               const handler = (e: MessageEvent) => {
+                // The rpc channel is text-only; ignore binary db frames.
+                if (typeof e.data !== "string") return;
                 const msg = JSON.parse(e.data);
                 if (msg.ch === "rpc") cb(msg.data);
               };
@@ -190,12 +191,12 @@ export function ZenbuProvider({
           } = await connectReplica({
             send: (event) => {
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(dbStringify({ ch: "db", data: event }));
+                ws.send(encodeFrame({ ch: "db", data: event }));
               }
             },
             subscribe: (cb) => {
               const handler = (e: MessageEvent) => {
-                const msg = dbParse(e.data);
+                const msg = decodeFrame(e.data, typeof e.data !== "string");
                 if (msg.ch === "db") cb(msg.data);
               };
               ws.addEventListener("message", handler);
@@ -583,13 +584,42 @@ export type DbClient = {
   update(
     fn: (root: RegisteredDbRoot) => void | RegisteredDbRoot,
   ): Promise<void>;
-  createBlob(data: Uint8Array, hot?: boolean): Promise<string>;
+  createBlob(data: Uint8Array, hot?: boolean, contentType?: string): Promise<string>;
   deleteBlob(blobId: string): Promise<void>;
   getBlobData(blobId: string): Promise<Uint8Array | null>;
 };
 
 export function useDbClient(): DbClient {
   return useConnection().db as unknown as DbClient;
+}
+
+/**
+ * Build a stable HTTP URL for a blob's bytes, served straight from disk by
+ * the host (see the `/__blob/` route in the db service). Works in any
+ * renderer context — including ones outside `<ZenbuProvider>` such as
+ * CodeMirror widgets — because it derives the host port/token from the view
+ * URL rather than React context. Returns "" when unavailable.
+ *
+ * Prefer this over reading bytes + `URL.createObjectURL` for images/media:
+ * no DB-channel transfer, no per-render byte copy, browser-cached, and
+ * stable per `blobId` (so it doesn't flicker on remount).
+ */
+export function blobUrl(blobId: string, mime?: string): string {
+  const params = new URLSearchParams(window.location.search);
+  const port = params.get("wsPort");
+  const token = params.get("wsToken");
+  if (!port || !token || !blobId) return "";
+  const q = new URLSearchParams({ token });
+  if (mime) q.set("type", mime);
+  return `http://127.0.0.1:${port}/__blob/${encodeURIComponent(blobId)}?${q.toString()}`;
+}
+
+/** React convenience wrapper around {@link blobUrl}; `null` when no blobId. */
+export function useBlobUrl(
+  blobId: string | null | undefined,
+  mime?: string,
+): string | null {
+  return blobId ? blobUrl(blobId, mime) : null;
 }
 
 export function useEvents(): UnifiedEventProxy<RegisteredEvents> {
