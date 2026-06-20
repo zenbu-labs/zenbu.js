@@ -282,6 +282,51 @@ export class WindowService extends Service.create({
             window: view,
           });
 
+    // ── External-link interception ────────────────────────────────
+    // Links that point outside the app's own renderer (Vite dev
+    // server / file:// in prod) should open in the user's default
+    // browser instead of spawning a new Electron window or navigating
+    // the current webContents away from the app.
+    const isAppUrl = (raw: string): boolean => {
+      try {
+        const parsed = new URL(raw);
+        if (rendererUrl) {
+          const appOrigin = new URL(rendererUrl).origin;
+          if (parsed.origin === appOrigin) return true;
+        }
+        // Allow devtools and chrome-internal schemes.
+        if (
+          parsed.protocol === "devtools:" ||
+          parsed.protocol === "chrome-devtools:" ||
+          parsed.protocol === "chrome:"
+        ) {
+          return true;
+        }
+        return false;
+      } catch {
+        return true; // malformed → let Electron handle it
+      }
+    };
+
+    view.webContents.setWindowOpenHandler(({ url }) => {
+      if (!isAppUrl(url)) {
+        shell.openExternal(url).catch((err) => {
+          log.error("openExternal failed:", err);
+        });
+        return { action: "deny" };
+      }
+      return { action: "allow" };
+    });
+
+    view.webContents.on("will-navigate", (event, url) => {
+      if (!isAppUrl(url)) {
+        event.preventDefault();
+        shell.openExternal(url).catch((err) => {
+          log.error("openExternal (will-navigate) failed:", err);
+        });
+      }
+    });
+
     if (args.devtoolsShortcut !== false) {
       const handleInput = (_event: Electron.Event, input: Electron.Input) => {
         if (input.key !== "F12") return;
