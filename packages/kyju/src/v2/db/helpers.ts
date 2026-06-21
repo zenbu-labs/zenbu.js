@@ -285,6 +285,7 @@ export type PageIndex = {
 export type BlobIndex = {
   blobId: string;
   fileSize: number;
+  contentType?: string;
 };
 
 export const createCollection = ({
@@ -340,11 +341,13 @@ export const createBlob = ({
   config,
   blobId,
   data,
+  contentType,
 }: {
   fs: FileSystem.FileSystem;
   config: DbConfig;
   blobId: string;
   data: Uint8Array;
+  contentType?: string;
 }) =>
   Effect.gen(function* () {
     yield* fs.makeDirectory(paths.blob({ config, blobId }), {
@@ -355,15 +358,19 @@ export const createBlob = ({
     yield* fs.writeFile(dataPath, data);
     const stats = yield* fs.stat(dataPath);
 
+    const blobIndex: BlobIndex = {
+      blobId,
+      fileSize: Number(stats.size),
+      ...(contentType !== undefined && { contentType }),
+    };
+
     yield* writeJsonFile({
       fs,
       config,
       path: paths.blobIndex({ config, blobId }),
-      data: {
-        blobId,
-        fileSize: Number(stats.size),
-      } satisfies BlobIndex,
+      data: blobIndex,
     });
+    return blobIndex;
   });
 
 export const readJsonFile = ({ fs, path: filePath }: { fs: FileSystem.FileSystem; path: string }) =>

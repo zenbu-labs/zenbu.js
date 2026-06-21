@@ -92,6 +92,7 @@ const reduceWrite = (state: ConnectedState, op: WriteOp): ConnectedState => {
           ? { kind: "hot", value: op.data }
           : { kind: "cold" },
         fileSize: 0,
+        ...(op.contentType !== undefined && { contentType: op.contentType }),
       };
       return { ...state, blobs: [...state.blobs, blob] };
     }
@@ -426,17 +427,17 @@ const createReplicaEffect = (
                 yield* applyState({
                   ref: stateRef,
                   fn: (state) => {
-                    const entry: ClientBlob = {
-                      id: readOp.blobId,
-                      data: { kind: "hot" as const, value: ack.data },
-                      fileSize: 0,
-                    };
-                    const exists = state.blobs.some(
+                    const existing = state.blobs.find(
                       (b) => b.id === readOp.blobId,
                     );
+                    const entry: ClientBlob = {
+                      ...(existing ?? { id: readOp.blobId, fileSize: 0 }),
+                      id: readOp.blobId,
+                      data: { kind: "hot" as const, value: ack.data },
+                    };
                     return {
                       ...state,
-                      blobs: exists
+                      blobs: existing
                         ? state.blobs.map((b) =>
                             b.id === readOp.blobId ? entry : b,
                           )
@@ -468,7 +469,11 @@ const createReplicaEffect = (
                     ...state,
                     blobs: state.blobs.map((blob) =>
                       blob.id === msg.blobId
-                        ? { ...blob, fileSize: msg.fileSize }
+                        ? {
+                            ...blob,
+                            fileSize: msg.fileSize,
+                            ...(msg.contentType !== undefined && { contentType: msg.contentType }),
+                          }
                         : blob,
                     ),
                   }),
