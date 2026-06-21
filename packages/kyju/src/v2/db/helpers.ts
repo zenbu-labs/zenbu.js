@@ -358,16 +358,19 @@ export const createBlob = ({
     yield* fs.writeFile(dataPath, data);
     const stats = yield* fs.stat(dataPath);
 
+    const blobIndex: BlobIndex = {
+      blobId,
+      fileSize: Number(stats.size),
+      ...(contentType !== undefined && { contentType }),
+    };
+
     yield* writeJsonFile({
       fs,
       config,
       path: paths.blobIndex({ config, blobId }),
-      data: {
-        blobId,
-        fileSize: Number(stats.size),
-        ...(contentType !== undefined && { contentType }),
-      } satisfies BlobIndex,
+      data: blobIndex,
     });
+    return blobIndex;
   });
 
 export const readJsonFile = ({ fs, path: filePath }: { fs: FileSystem.FileSystem; path: string }) =>

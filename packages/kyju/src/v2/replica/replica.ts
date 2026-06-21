@@ -427,17 +427,17 @@ const createReplicaEffect = (
                 yield* applyState({
                   ref: stateRef,
                   fn: (state) => {
-                    const entry: ClientBlob = {
-                      id: readOp.blobId,
-                      data: { kind: "hot" as const, value: ack.data },
-                      fileSize: 0,
-                    };
-                    const exists = state.blobs.some(
+                    const existing = state.blobs.find(
                       (b) => b.id === readOp.blobId,
                     );
+                    const entry: ClientBlob = {
+                      ...(existing ?? { id: readOp.blobId, fileSize: 0 }),
+                      id: readOp.blobId,
+                      data: { kind: "hot" as const, value: ack.data },
+                    };
                     return {
                       ...state,
-                      blobs: exists
+                      blobs: existing
                         ? state.blobs.map((b) =>
                             b.id === readOp.blobId ? entry : b,
                           )

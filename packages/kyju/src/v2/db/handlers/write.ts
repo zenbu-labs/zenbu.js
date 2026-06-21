@@ -478,7 +478,7 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
       }
 
       case "blob.create": {
-        yield* createBlob({
+        const blobIndex = yield* createBlob({
           fs: ctx.fs,
           config: ctx.config,
           blobId: event.op.blobId,
@@ -499,6 +499,16 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
           sessions,
           excludeSessionId: event.sessionId,
           op: event.op,
+        });
+
+        broadcastDbUpdate({
+          sessions,
+          message: {
+            type: "blob.metadataUpdate",
+            blobId: event.op.blobId,
+            fileSize: blobIndex.fileSize,
+            ...(blobIndex.contentType !== undefined && { contentType: blobIndex.contentType }),
+          },
         });
         return;
       }
