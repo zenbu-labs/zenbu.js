@@ -217,6 +217,50 @@ const createReplicaEffect = (
         }
       });
 
+    const doReconnect = () =>
+      Effect.gen(function* () {
+        const reconState = yield* requireConnected({ ref: stateRef });
+        const disconnectId = nanoid();
+        const disconnectAck = yield* sendToServer<Ack<any, any>>(
+          {
+            kind: "disconnect",
+            replicaId,
+            message: {
+              type: "disconnect",
+              sessionId: reconState.sessionId,
+              requestId: disconnectId,
+            },
+          },
+          disconnectId,
+        );
+        if (disconnectAck.error) return yield* Effect.fail(disconnectAck.error);
+
+        yield* Ref.set(stateRef, { kind: "disconnected" as const });
+
+        const connectId = nanoid();
+        const connectAck = yield* sendToServer<ConnectAck>(
+          {
+            kind: "connect",
+            message: {
+              type: "connect",
+              version: VERSION,
+              requestId: connectId,
+              replicaId,
+            },
+          },
+          connectId,
+        );
+        if (connectAck.error) return yield* Effect.fail(connectAck.error);
+
+        yield* Ref.set(stateRef, {
+          kind: "connected" as const,
+          sessionId: connectAck.sessionId,
+          root: connectAck.root,
+          collections: [],
+          blobs: [],
+        });
+      });
+
     const postMessage = (event: ClientEvent) =>
       Effect.gen(function* () {
         switch (event.kind) {
@@ -314,7 +358,6 @@ const createReplicaEffect = (
 
           case "write": {
             const state = yield* requireConnected({ ref: stateRef });
-            const snapshot = yield* Ref.get(stateRef);
             yield* traceKyju(
               "kyju:replica.applyWrite",
               applyWrite({ stateRef, op: event.op }),
@@ -337,7 +380,7 @@ const createReplicaEffect = (
               { op: event.op.type },
             );
             if (writeAck.error) {
-              yield* Ref.set(stateRef, snapshot);
+              yield* doReconnect();
               return yield* Effect.fail(writeAck.error);
             }
             return;
@@ -346,8 +389,6 @@ const createReplicaEffect = (
           case "write-batch": {
             const state = yield* requireConnected({ ref: stateRef });
             if (event.ops.length === 0) return;
-
-            const batchSnapshot = yield* Ref.get(stateRef);
 
             // ONE Ref.update for the whole batch — subscribers see one
             // transition for the entire `client.update(fn)` call, so
@@ -365,8 +406,8 @@ const createReplicaEffect = (
             }
 
             // Replicate to server op-by-op so the wire protocol stays
-            // unchanged. If an ack errors we roll back the whole batch and
-            // surface the error to the caller.
+            // unchanged. If an ack errors we force a reconnect to resync
+            // state cleanly instead of rolling back non-atomically.
             for (const op of event.ops) {
               const writeRequestId = nanoid();
               const writeAck = yield* traceKyju(
@@ -384,7 +425,7 @@ const createReplicaEffect = (
                 { op: op.type },
               );
               if (writeAck.error) {
-                yield* Ref.set(stateRef, batchSnapshot);
+                yield* doReconnect();
                 return yield* Effect.fail(writeAck.error);
               }
             }
@@ -485,48 +526,7 @@ const createReplicaEffect = (
               }
 
               case "reconnect": {
-                const reconState = yield* requireConnected({ ref: stateRef });
-                const disconnectId = nanoid();
-                const disconnectAck = yield* sendToServer<Ack<any, any>>(
-                  {
-                    kind: "disconnect",
-                    replicaId,
-                    message: {
-                      type: "disconnect",
-                      sessionId: reconState.sessionId,
-                      requestId: disconnectId,
-                    },
-                  },
-                  disconnectId,
-                );
-                if (disconnectAck.error)
-                  return yield* Effect.fail(disconnectAck.error);
-
-                yield* Ref.set(stateRef, { kind: "disconnected" as const });
-
-                const connectId = nanoid();
-                const connectAck = yield* sendToServer<ConnectAck>(
-                  {
-                    kind: "connect",
-                    message: {
-                      type: "connect",
-                      version: VERSION,
-                      requestId: connectId,
-                      replicaId,
-                    },
-                  },
-                  connectId,
-                );
-                if (connectAck.error)
-                  return yield* Effect.fail(connectAck.error);
-
-                yield* Ref.set(stateRef, {
-                  kind: "connected" as const,
-                  sessionId: connectAck.sessionId,
-                  root: connectAck.root,
-                  collections: [],
-                  blobs: [],
-                });
+                yield* doReconnect();
                 return;
               }
             }
