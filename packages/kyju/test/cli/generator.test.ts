@@ -129,6 +129,8 @@ describe("generator", () => {
     const content = fs.readFileSync(result.migrationPath, "utf-8");
     expect(content).toContain("migrate(prev, { apply })");
     expect(content).toContain("apply(prev)");
+    expect(content).toContain("Migration requires a custom transform");
+    expect(content).not.toContain("// customize transformation here");
   });
 
   it("alter ops auto-trigger custom migration", () => {
@@ -143,6 +145,7 @@ describe("generator", () => {
 
     const content = fs.readFileSync(result.migrationPath, "utf-8");
     expect(content).toContain("migrate(prev, { apply })");
+    expect(content).toContain("Migration requires a custom transform");
   });
 
   it("getLastSnapshot returns null for empty journal", () => {
