@@ -146,7 +146,9 @@ const migration: KyjuMigration = {
   operations: ${opsJson},
   migrate(prev, { apply }) {
     const result = apply(prev)
-    // customize transformation here
+    throw new Error(
+      "Migration requires a custom transform. Replace this stub before running the application.",
+    )
     return result
   },
 }
