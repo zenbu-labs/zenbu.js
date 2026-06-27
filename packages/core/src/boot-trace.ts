@@ -1,12 +1,4 @@
-/**
- * Boot-trace — opt-in startup tracer (`ZENBU_BOOT_TRACE=1`). Records spans and
- * marks across the main process; `flush()` prints an ASCII flame graph and
- * writes JSON to `<project>/traces/boot/`. Anchored to process start via
- * `process.uptime()` so the pre-JS Electron spin-up gap is visible.
- *
- * Stored on `globalThis.__zenbu_boot_trace__` so HMR and the tsx loader worker
- * (separate module graph) share one buffer.
- */
+
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -16,9 +8,9 @@ export type TraceSource = "main" | "renderer" | "user";
 export interface TraceSpan {
   kind: "span";
   name: string;
-  /** ms since process start */
+  
   startedAt: number;
-  /** ms since process start */
+  
   endedAt: number;
   durationMs: number;
   parent: string | null;
@@ -30,7 +22,7 @@ export interface TraceSpan {
 export interface TraceMark {
   kind: "mark";
   name: string;
-  /** ms since process start */
+  
   at: number;
   source: TraceSource;
   meta?: Record<string, unknown>;
@@ -39,7 +31,7 @@ export interface TraceMark {
 export type TraceEvent = TraceSpan | TraceMark;
 
 interface OpenSpan {
-  /** Stable handle returned by pushSpan; popSpan(handle) matches against it. */
+  
   id: number;
   name: string;
   startedAt: number;
@@ -49,24 +41,17 @@ interface OpenSpan {
 }
 
 interface BootTraceState {
-  /** wall-clock at process start (ms epoch), used for the JSON timestamps. */
+  
   processStartedAtEpoch: number;
-  /** `performance.now()` value at process start. Subtract from later
-   * `performance.now()` values to get ms-since-process-start. */
+  
   perfOriginMs: number;
   events: TraceEvent[];
-  /**
-   * In-flight spans, keyed by handle id. Async / concurrent spans
-   * cannot share a LIFO stack — popping the top would frequently match
-   * the wrong logical span. Every `pushSpan` returns a numeric handle
-   * and `popSpan(handle)` removes that specific entry.
-   */
+  
   openSpansById: Map<number, OpenSpan>;
-  /** Stack used solely to compute `parent` at push-time. Best-effort. */
+  
   parentStack: OpenSpan[];
   nextHandleId: number;
-  /** Where to write the JSON file. Set late by the framework once it
-   * knows the project root. */
+  
   projectRoot: string | null;
   flushed: boolean;
   enabled: boolean;
@@ -78,14 +63,11 @@ function init(): BootTraceState {
   const slot = globalThis as unknown as { [SLOT_KEY]?: BootTraceState };
   if (slot[SLOT_KEY]) return slot[SLOT_KEY];
 
-  // `process.uptime()` returns seconds since process start. Subtracting
-  // from `Date.now()` gives us the absolute epoch of process start. We
-  // anchor `performance.now()` (which starts at 0 at module load, not at
-  // process start) to that same origin.
+  
   const nowEpoch = Date.now();
   const uptimeMs = Math.round(process.uptime() * 1000);
   const processStartedAtEpoch = nowEpoch - uptimeMs;
-  // Align perf clock so `perfNow() - perfOriginMs === ms since process start`.
+  
   const perfOriginMs = performance.now() - uptimeMs;
 
   const state: BootTraceState = {
@@ -101,7 +83,7 @@ function init(): BootTraceState {
   };
   slot[SLOT_KEY] = state;
 
-  // Always seed a "process-start" mark at t=0 so the timeline anchors visibly.
+  
   if (state.enabled) {
     state.events.push({
       kind: "mark",
@@ -116,27 +98,26 @@ function init(): BootTraceState {
 
 const state = init();
 
-// Event-loop lag sampler & CPU usage tracking — distinguishes "slow because of
-// other work" from "slow intrinsically".
+
 
 interface LagBlock {
-  /** When the block started (ms since process start). */
+  
   startedAt: number;
-  /** How long the JS thread was blocked (ms). */
+  
   durationMs: number;
 }
 interface LagState {
-  /** Cumulative wall-clock blocked above 50ms threshold (ms). */
+  
   blockedMs: number;
-  /** Single longest contiguous block observed (ms). */
+  
   maxBlockMs: number;
-  /** Total samples taken. */
+  
   samples: number;
-  /** Tick of last sample (perf-clock). */
+  
   lastTick: number;
-  /** Top long-block instances, sorted by duration desc. */
+  
   topBlocks: LagBlock[];
-  /** Stop function. */
+  
   stop?: () => void;
 }
 const lagState: LagState = {
@@ -147,8 +128,7 @@ const lagState: LagState = {
   topBlocks: [],
 };
 
-/** Poll the event loop every 5ms; lag beyond ~50ms over the expected interval
- * means the JS thread was blocked. `blockedMs` proxies boot saturation. */
+
 function startLagSampler(): void {
   if (lagState.stop) return;
   const intervalMs = 5;
@@ -159,13 +139,11 @@ function startLagSampler(): void {
     lagState.lastTick = now;
     lagState.samples++;
     const lag = Math.max(0, delta - intervalMs);
-    // 50ms is a generous threshold; below that timers fire roughly on
-    // schedule. Above it the event loop was actively blocked.
+    
     if (lag > 50) {
       lagState.blockedMs += lag;
       if (lag > lagState.maxBlockMs) lagState.maxBlockMs = lag;
-      // Keep top 10 blocks for the flame summary so we can attribute
-      // the longest synchronous tasks to a wall-clock window.
+      
       const blockStart = now - lag - intervalMs - state.perfOriginMs;
       lagState.topBlocks.push({
         startedAt: blockStart,
@@ -175,7 +153,7 @@ function startLagSampler(): void {
       if (lagState.topBlocks.length > 10) lagState.topBlocks.length = 10;
     }
   }, intervalMs);
-  // Don't keep the process alive just for the sampler.
+  
   id.unref?.();
   lagState.stop = () => clearInterval(id);
 }
@@ -222,12 +200,7 @@ export function mark(name: string, meta?: Record<string, unknown>): void {
   state.events.push(ev);
 }
 
-/**
- * Begin a manually-managed span. Pair with `popSpan(handle)`. Returns a
- * numeric handle that identifies *this exact* span — popping by handle
- * avoids the LIFO-mismatch problem you get when many async spans run
- * concurrently and pops arrive out of push-order.
- */
+
 export function pushSpan(
   name: string,
   meta?: Record<string, unknown>,
@@ -309,14 +282,14 @@ export function spanSync<T>(
   }
 }
 
-/** Bulk-ingest events from another source (e.g. renderer). */
+
 export function addEvents(
   events: ReadonlyArray<TraceEvent>,
   source: TraceSource,
 ): void {
   if (!state.enabled) return;
   for (const ev of events) {
-    // Stamp the source if missing (renderer omits it on the wire).
+    
     const stamped: TraceEvent =
       ev.source === source
         ? ev
@@ -339,11 +312,11 @@ export function getTotalMs(): number {
 }
 
 interface FlushOptions {
-  /** Free-form reason string included in the printed header. */
+  
   reason?: string;
-  /** Whether to log the ASCII flame. Default true. */
+  
   log?: boolean;
-  /** Whether to write the JSON snapshot. Default true. */
+  
   write?: boolean;
 }
 
@@ -355,7 +328,7 @@ export function flush(options: FlushOptions = {}): void {
   if (log) {
     try {
       const flame = renderFlame(reason);
-      // One big block, write to stdout via process.stdout to keep ordering.
+      
       process.stdout.write(flame + "\n");
     } catch (err) {
       console.error("[boot-trace] flame render failed:", err);
@@ -391,9 +364,7 @@ function writeJson(): void {
   fs.writeFileSync(path.join(dir, "latest.json"), json);
 }
 
-// ---------------------------------------------------------------------------
-// ASCII flame rendering
-// ---------------------------------------------------------------------------
+
 
 interface Row {
   label: string;
@@ -422,7 +393,7 @@ function renderFlame(reason: string, barWidth = 60): string {
     `╭─ [boot-trace] ${reason} — total ${fmtMs(total)} (${spans.length} spans, ${marks.length} marks)`,
   );
 
-  // Marks section first — point-in-time milestones across the whole timeline.
+  
   if (marks.length > 0) {
     const maxMarkLen = marks.reduce(
       (m, k) => Math.max(m, k.name.length + 6),
@@ -441,22 +412,16 @@ function renderFlame(reason: string, barWidth = 60): string {
     lines.push("│");
   }
 
-  // Build span rows. Each span is rendered as a single row, sorted by
-  // start time, indented by its containment depth in the timeline (a span
-  // whose [start, end] is fully inside another's is its child). This
-  // doesn't require accurate `parent` linkage from the recorder — useful
-  // because async spans frequently lose their parent context across
-  // promise boundaries.
+  
   type SpanNode = TraceSpan & { children: SpanNode[]; depth: number };
   const nodes: SpanNode[] = spans.map((s) => ({ ...s, children: [], depth: 0 }));
-  // Sort: earlier start first, then longer duration first (so parents come
-  // before children).
+  
   nodes.sort(
     (a, b) => a.startedAt - b.startedAt || b.durationMs - a.durationMs,
   );
   const stack: SpanNode[] = [];
   for (const node of nodes) {
-    // Pop anything that ended before this span started.
+    
     while (stack.length && stack[stack.length - 1]!.endedAt <= node.startedAt) {
       stack.pop();
     }
@@ -494,7 +459,7 @@ function renderFlame(reason: string, barWidth = 60): string {
     lines.push(`│ ${label}  │${bar}│ ${timing}${suffix}`);
   }
 
-  // Slowest leaders table.
+  
   const allDurations: { label: string; durationMs: number }[] = [];
   for (const s of spans) {
     allDurations.push({ label: s.name, durationMs: s.durationMs });
@@ -508,11 +473,7 @@ function renderFlame(reason: string, barWidth = 60): string {
       .join(", ")}`);
   }
 
-  // Advice Babel plugin stats. Each Vite root gets a row showing how
-  // many files went through `transformSync` and how much wall-clock
-  // they consumed cumulatively. If this row is large relative to
-  // total boot, the advice transform is a top candidate for migration
-  // to SWC / esbuild.
+  
   const adviceStats = (globalThis as any).__zenbu_advice_stats__ as
     | Map<string, { files: number; totalMs: number; maxMs: number }>
     | undefined;
@@ -527,12 +488,7 @@ function renderFlame(reason: string, barWidth = 60): string {
     }
   }
 
-  // CPU utilization & event-loop lag. If `userMs` divided by `totalMs`
-  // wall-clock is close to 1.0, the JS thread is CPU-saturated — we'd
-  // win by moving work off-thread (workers, SWC, esbuild). If well
-  // below 1.0, the bottleneck is I/O or async waits and parallelism
-  // won't help much. `blockedMs` shows total wall-clock spent in long
-  // synchronous tasks (> 50ms each) which never yielded to other work.
+  
   const cpu = captureCpuSnapshot();
   if (cpu) {
     const wallMs = total;
@@ -548,7 +504,7 @@ function renderFlame(reason: string, barWidth = 60): string {
     );
     if (lagState.topBlocks.length > 0) {
       lines.push("│ top blocks (sync work that never yielded):");
-      // Sort the top-N by start time for readability against the timeline above.
+      
       const inOrder = [...lagState.topBlocks].sort(
         (a, b) => a.startedAt - b.startedAt,
       );
@@ -560,10 +516,7 @@ function renderFlame(reason: string, barWidth = 60): string {
     }
   }
 
-  // Per-Vite-server request stats: how many HTTP requests Vite served
-  // during boot and where the wall-clock went. A high request count
-  // with low avg means "chatty module waterfall"; a few big requests
-  // means a fat transform somewhere.
+  
   const viteStats = (globalThis as any).__zenbu_vite_stats__ as
     | Map<string, {
         requests: {
@@ -600,7 +553,7 @@ function fmtMs(ms: number): string {
   return `${Math.round(ms)}ms`;
 }
 
-// Convenience aggregate export — call sites tend to grab the whole module.
+
 export const bootTrace = {
   mark,
   span,
