@@ -18,11 +18,7 @@ export const createEventProxy = <T extends Record<string, any>>(
     },
   );
 
-/**
- * Creates a unified event proxy where each node is both callable (emit)
- * and subscribable. Calling `proxy.path.to.event(data)` invokes `onEmit`;
- * `proxy.path.to.event.subscribe(cb)` registers a listener.
- */
+
 export const createUnifiedEventProxy = <T extends Record<string, any>>(
   listeners: EventListeners,
   onEmit: (path: string[], data: unknown) => void,
