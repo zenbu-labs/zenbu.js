@@ -8,14 +8,7 @@ export default defineConfig({
   // Boot-window HTML. The single ui entrypoint for the whole app.
   uiEntrypoint: "./src/renderer",
 
-  // Plugins are pure main-process: services + optional schema/preload/events.
-  // The "host plugin" is just the first entry by convention.
-  plugins: [
-    definePlugin({
-      name: "app",
-      services: ["./src/main/services/*.ts"],
-    }),
-  ],
+  pluginsFiles: ["./zenbu.plugins.jsonc"],
 
   // Build pipeline for `zen build:source` (mirror staging) and
   // `zen build:electron` (signed .app via electron-builder). Set
