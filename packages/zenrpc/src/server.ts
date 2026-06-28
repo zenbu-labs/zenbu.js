@@ -1,6 +1,8 @@
-import type { AnyRouter, AnyRouterFactory, RpcContext, ExtractRequirements } from "./types";
+import type { AnyRouter, AnyRouterFactory, RpcContext, UnifiedEventProxy } from "./types";
 import { serialize, deserialize } from "./protocol";
 import { resolveMethod, executeMethod } from "./execute";
+import { createEventListeners } from "./client";
+import { createUnifiedEventProxy } from "./events";
 
 type ClientEntry = {
   clientId: string;
@@ -33,9 +35,22 @@ export const createServer = <
   options: CreateServerOptions,
 ) => {
   const clients = new Map<string, ClientEntry>();
+  const serverListeners = createEventListeners();
 
   const sendTo = (clientId: string) => (data: string) =>
     options.send(data, clientId);
+
+  const broadcastToClients = (path: string[], data: unknown) => {
+    const msg = serialize({ type: "event", path, data });
+    for (const [clientId] of clients) {
+      options.send(msg, clientId);
+    }
+  };
+
+  const emitFn = (path: string[], data: unknown) => {
+    serverListeners.dispatch(path.join("."), data);
+    broadcastToClients(path, data);
+  };
 
   const postMessage = (data: string, clientId: string) => {
     const msg = deserialize(data);
@@ -106,6 +121,11 @@ export const createServer = <
         }
         break;
       }
+
+      case "event": {
+        serverListeners.dispatch(msg.path.join("."), msg.data);
+        break;
+      }
     }
   };
 
@@ -119,14 +139,7 @@ export const createServer = <
       : (data: T[K]) => void;
   };
 
-  const emit: EmitProxy<TEvents> = createEmitProxy(
-    (path: string[], data: unknown) => {
-      const msg = serialize({ type: "event", path, data });
-      for (const [clientId] of clients) {
-        options.send(msg, clientId);
-      }
-    },
-  );
+  const emit: EmitProxy<TEvents> = createEmitProxy(emitFn);
 
   const emitTo = (clientId: string): EmitProxy<TEvents> =>
     createEmitProxy((path: string[], data: unknown) => {
@@ -134,5 +147,10 @@ export const createServer = <
       options.send(serialize({ type: "event", path, data }), clientId);
     });
 
-  return { postMessage, removeClient, emit, emitTo };
+  const events: UnifiedEventProxy<TEvents> = createUnifiedEventProxy<TEvents>(
+    serverListeners,
+    emitFn,
+  );
+
+  return { postMessage, removeClient, emit, emitTo, events };
 };

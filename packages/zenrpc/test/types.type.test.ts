@@ -6,6 +6,7 @@ import type {
   SerializedError,
   EffectResult,
   EventProxy,
+  UnifiedEventProxy,
   ExtractRequirements,
 } from "../src/types";
 
@@ -530,3 +531,56 @@ type NoReqRouter = {
 type _test_extract_no_req = Expect<
   Equal<ExtractRequirements<NoReqRouter>, never>
 >;
+
+// ============================
+// UnifiedEventProxy type tests
+// ============================
+
+// --- Flat event is both callable and subscribable ---
+
+type _test_unified_flat_callable =
+  UnifiedEventProxy<FlatEvents>["ping"] extends (data: { ts: number }) => void
+    ? true
+    : false;
+
+type _test_unified_flat_call = Expect<Equal<_test_unified_flat_callable, true>>;
+
+type _test_unified_flat_sub =
+  UnifiedEventProxy<FlatEvents>["ping"] extends {
+    subscribe: (cb: (data: { ts: number }) => void) => () => void;
+  }
+    ? true
+    : false;
+
+type _test_unified_flat_subscribe = Expect<Equal<_test_unified_flat_sub, true>>;
+
+// --- Nested unified events are callable + subscribable at leaves ---
+
+type _test_unified_nested_callable =
+  UnifiedEventProxy<NestedEvents>["chat"]["messageReceived"] extends (
+    data: { viewId: string; content: string },
+  ) => void
+    ? true
+    : false;
+
+type _test_unified_nested_call = Expect<Equal<_test_unified_nested_callable, true>>;
+
+type _test_unified_nested_sub =
+  UnifiedEventProxy<NestedEvents>["chat"]["messageReceived"] extends {
+    subscribe: (
+      cb: (data: { viewId: string; content: string }) => void,
+    ) => () => void;
+  }
+    ? true
+    : false;
+
+type _test_unified_nested_subscribe = Expect<Equal<_test_unified_nested_sub, true>>;
+
+// --- UnifiedEventProxy is assignable to EventProxy (backward compat) ---
+
+type _test_unified_compat =
+  UnifiedEventProxy<FlatEvents> extends EventProxy<FlatEvents>
+    ? true
+    : false;
+
+type _test_unified_backward_compat = Expect<Equal<_test_unified_compat, true>>;

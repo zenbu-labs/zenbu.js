@@ -285,6 +285,9 @@ export type PageIndex = {
 export type BlobIndex = {
   blobId: string;
   fileSize: number;
+  /** Stored MIME type of the bytes, when the creator knew it. Lets the
+   * host serve a correct `Content-Type` without sniffing (zenbu.js#8). */
+  contentType?: string;
 };
 
 export const createCollection = ({
@@ -340,11 +343,13 @@ export const createBlob = ({
   config,
   blobId,
   data,
+  contentType,
 }: {
   fs: FileSystem.FileSystem;
   config: DbConfig;
   blobId: string;
   data: Uint8Array;
+  contentType?: string;
 }) =>
   Effect.gen(function* () {
     yield* fs.makeDirectory(paths.blob({ config, blobId }), {
@@ -362,6 +367,7 @@ export const createBlob = ({
       data: {
         blobId,
         fileSize: Number(stats.size),
+        ...(contentType ? { contentType } : {}),
       } satisfies BlobIndex,
     });
   });

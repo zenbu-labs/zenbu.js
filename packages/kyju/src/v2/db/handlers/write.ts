@@ -482,6 +482,7 @@ const handleWriteImpl = (ctx: DbHandlerContext, event: WriteEvent) =>
           config: ctx.config,
           blobId: event.op.blobId,
           data: event.op.data,
+          contentType: event.op.contentType,
         });
 
         sendAck({

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { createTransportPair, createMultiClientTransportPair } from "./helpers";
+import { createEventListeners } from "../src/client";
+import { createUnifiedEventProxy } from "../src/events";
 
 const echoRouter = () => ({
   echo: (msg: string) => `echo: ${msg}`,
@@ -259,5 +261,155 @@ describe("events", () => {
 
     await vi.waitFor(() => expect(received).toHaveLength(1));
     expect(received[0]).toEqual({ viewId: "v1", content: "event" });
+  });
+
+  it("server.emit dispatches to server-side listeners (intra-process)", async () => {
+    const { server, client } = createTransportPair<ServerRouter, TestEvents>({
+      serverRouter: echoRouter,
+      version: "0",
+      clientId: "c1",
+    });
+
+    await client.ready;
+
+    const serverReceived: any[] = [];
+    server.events.chat.messageReceived.subscribe((data) => serverReceived.push(data));
+
+    server.emit.chat.messageReceived({ viewId: "v1", content: "intra" });
+
+    expect(serverReceived).toHaveLength(1);
+    expect(serverReceived[0]).toEqual({ viewId: "v1", content: "intra" });
+  });
+
+  it("server.events is callable to emit (unified proxy)", async () => {
+    const { server, client, events } = createTransportPair<ServerRouter, TestEvents>({
+      serverRouter: echoRouter,
+      version: "0",
+      clientId: "c1",
+    });
+
+    await client.ready;
+
+    const serverReceived: any[] = [];
+    const clientReceived: any[] = [];
+    server.events.chat.typing.subscribe((data) => serverReceived.push(data));
+    events.chat.typing.subscribe((data) => clientReceived.push(data));
+
+    (server.events.chat.typing as any)({ userId: "u1" });
+
+    expect(serverReceived).toHaveLength(1);
+    expect(serverReceived[0]).toEqual({ userId: "u1" });
+
+    await vi.waitFor(() => expect(clientReceived).toHaveLength(1));
+    expect(clientReceived[0]).toEqual({ userId: "u1" });
+  });
+
+  it("client can emit events (intra-client + sent to server)", async () => {
+    const { server, client, events } = createTransportPair<ServerRouter, TestEvents>({
+      serverRouter: echoRouter,
+      version: "0",
+      clientId: "c1",
+    });
+
+    await client.ready;
+
+    const clientReceived: any[] = [];
+    const serverReceived: any[] = [];
+    events.chat.messageReceived.subscribe((data) => clientReceived.push(data));
+    server.events.chat.messageReceived.subscribe((data) => serverReceived.push(data));
+
+    (events.chat.messageReceived as any)({ viewId: "v1", content: "from-client" });
+
+    expect(clientReceived).toHaveLength(1);
+    expect(clientReceived[0]).toEqual({ viewId: "v1", content: "from-client" });
+
+    await vi.waitFor(() => expect(serverReceived).toHaveLength(1));
+    expect(serverReceived[0]).toEqual({ viewId: "v1", content: "from-client" });
+  });
+
+  it("client-emitted events are NOT re-broadcast to other clients", async () => {
+    const { server, clients } = createMultiClientTransportPair<ServerRouter, TestEvents>({
+      serverRouter: echoRouter,
+      version: "0",
+      clientIds: ["c1", "c2"],
+    });
+
+    await Promise.all(clients.map((c) => c.client.ready));
+
+    const c1Received: any[] = [];
+    const c2Received: any[] = [];
+    const serverReceived: any[] = [];
+    clients[0].events.chat.messageReceived.subscribe((data) => c1Received.push(data));
+    clients[1].events.chat.messageReceived.subscribe((data) => c2Received.push(data));
+    server.events.chat.messageReceived.subscribe((data) => serverReceived.push(data));
+
+    (clients[0].events.chat.messageReceived as any)({ viewId: "v1", content: "from-c1" });
+
+    expect(c1Received).toHaveLength(1);
+    expect(c1Received[0]).toEqual({ viewId: "v1", content: "from-c1" });
+
+    await vi.waitFor(() => expect(serverReceived).toHaveLength(1));
+    expect(serverReceived[0]).toEqual({ viewId: "v1", content: "from-c1" });
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(c2Received).toHaveLength(0);
+  });
+});
+
+describe("unified event proxy (standalone)", () => {
+  it("emit fires local subscribers synchronously", () => {
+    const listeners = createEventListeners();
+    const emitted: Array<{ path: string[]; data: unknown }> = [];
+    const proxy = createUnifiedEventProxy<TestEvents>(
+      listeners,
+      (path, data) => {
+        listeners.dispatch(path.join("."), data);
+        emitted.push({ path, data });
+      },
+    );
+
+    const received: any[] = [];
+    proxy.chat.messageReceived.subscribe((data: any) => received.push(data));
+
+    proxy.chat.messageReceived({ viewId: "v1", content: "hello" });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toEqual({ viewId: "v1", content: "hello" });
+    expect(emitted).toHaveLength(1);
+  });
+
+  it("subscribe without emit works", () => {
+    const listeners = createEventListeners();
+    const proxy = createUnifiedEventProxy<TestEvents>(
+      listeners,
+      () => {},
+    );
+
+    const received: any[] = [];
+    proxy.view.tabChanged.subscribe((data: any) => received.push(data));
+
+    listeners.dispatch("view.tabChanged", { tabs: ["x"] });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toEqual({ tabs: ["x"] });
+  });
+
+  it("unsubscribe stops delivery", () => {
+    const listeners = createEventListeners();
+    const proxy = createUnifiedEventProxy<TestEvents>(
+      listeners,
+      (path, data) => listeners.dispatch(path.join("."), data),
+    );
+
+    const received: any[] = [];
+    const unsub = proxy.chat.typing.subscribe((data: any) => received.push(data));
+
+    proxy.chat.typing({ userId: "u1" });
+    expect(received).toHaveLength(1);
+
+    unsub();
+
+    proxy.chat.typing({ userId: "u2" });
+    expect(received).toHaveLength(1);
   });
 });

@@ -83,3 +83,17 @@ export type EventProxy<T> = {
     ? EventProxy<T[K]> & { subscribe: (cb: (data: T[K]) => void) => () => void }
     : { subscribe: (cb: (data: T[K]) => void) => () => void };
 };
+
+/**
+ * Unified event proxy: each node is both callable (emit) and subscribable.
+ * Calling a node emits the event; `.subscribe()` listens for it.
+ * Assignable to `EventProxy<T>` for backward compatibility.
+ */
+export type UnifiedEventProxy<T> = {
+  [K in keyof T]: T[K] extends Record<string, any>
+    ? UnifiedEventProxy<T[K]> &
+        ((data: T[K]) => void) &
+        { subscribe: (cb: (data: T[K]) => void) => () => void }
+    : ((data: T[K]) => void) &
+        { subscribe: (cb: (data: T[K]) => void) => () => void };
+};

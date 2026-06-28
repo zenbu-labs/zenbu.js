@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { createReadStream, statSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -14,7 +15,8 @@ import type {
   FieldNode,
 } from "@zenbu/kyju";
 import type * as Effect from "effect/Effect";
-import { createRouter, dbStringify, dbParse } from "@zenbu/kyju/transport";
+import { createRouter } from "@zenbu/kyju/transport";
+import { encodeFrame, decodeFrame } from "../transport/ws-frame";
 import { loadMigrationsFromDir } from "@zenbu/kyju/loader";
 import { Service, runtime, getPlugins, subscribeConfig } from "../runtime";
 import type { ResolvedDbRoot } from "../registry";
@@ -25,11 +27,7 @@ import { createLogger } from "../shared/log";
 
 const log = createLogger("db");
 
-/**
- * Walk up from this file's location until we hit the @zenbujs/core
- * package.json. Same trick as `loaders/zenbu.ts` and `vite-plugins.ts`;
- * worth deduping into a shared helper once we have a fourth caller.
- */
+
 async function findCorePackageRoot(): Promise<string> {
   const here = path.dirname(fileURLToPath(import.meta.url));
   let dir = here;
@@ -48,17 +46,7 @@ async function findCorePackageRoot(): Promise<string> {
   );
 }
 
-/**
- * Build the core's DB section from the schema in this package + any
- * migrations shipped in `<core>/migrations/`. Loaded via tsx (registered
- * by setup-gate before the runtime services boot), so the source `.ts`
- * files in the published package are imported directly with no extra
- * compile step.
- *
- * If the migrations directory is missing (e.g. before the first
- * `npm run db:generate` runs in the core package), the section degrades
- * to `migrations: []` — same behavior as before this builder existed.
- */
+
 async function buildCoreSection(): Promise<SectionConfig> {
   const corePackageRoot = await findCorePackageRoot();
   const migrationsDir = path.join(corePackageRoot, "migrations");
@@ -70,11 +58,7 @@ async function buildCoreSection(): Promise<SectionConfig> {
     // `pnpm db:generate` having run yet. Emit an empty section.
     return { name: "core", schema: coreSchema, migrations };
   }
-  // Once the dir exists, any load failure (missing file, bad TS, etc.)
-  // is a real bug. Loud-fail rather than swallow — swallowing means
-  // `sectionMigrationPlugin` sees `targetVersion = 0` and silently
-  // leaves the section at its current state, which makes a "my new
-  // field is undefined" symptom impossible to attribute.
+  
   migrations = await loadMigrationsFromDir(migrationsDir);
   log.verbose(
     `core section: loaded ${migrations.length} migration(s) from ${migrationsDir}`,
@@ -90,18 +74,13 @@ type SectionProxy<S> = {
   [K in keyof S]: FieldNode<S[K]>;
 };
 
-// `Root` is the resolved DB root: `ZenbuRegister["db"]` from the user's
-// generated `zenbu-register.ts`, falling back to `{}` when no plugin has
-// augmented the registry. Lets the same baked dts ship with core while
-// consumer types flow in via module augmentation. Each top-level key on
-// `Root` is a section (e.g. `core`, `app`); section names are the only
-// namespace.
+
 type Root = ResolvedDbRoot;
 
 export type SectionedEffectClient = {
   readRoot(): Root;
   update(fn: (root: Root) => void | Root): Effect.Effect<void, KyjuError>;
-  createBlob(data: Uint8Array, hot?: boolean): Effect.Effect<string, KyjuError>;
+  createBlob(data: Uint8Array, hot?: boolean, contentType?: string): Effect.Effect<string, KyjuError>;
   deleteBlob(blobId: string): Effect.Effect<void, KyjuError>;
   getBlobData(blobId: string): Effect.Effect<Uint8Array | null, KyjuError>;
 } & {
@@ -111,7 +90,7 @@ export type SectionedEffectClient = {
 export type SectionedClient = {
   readRoot(): Root;
   update(fn: (root: Root) => void | Root): Promise<void>;
-  createBlob(data: Uint8Array, hot?: boolean): Promise<string>;
+  createBlob(data: Uint8Array, hot?: boolean, contentType?: string): Promise<string>;
   deleteBlob(blobId: string): Promise<void>;
   getBlobData(blobId: string): Promise<Uint8Array | null>;
 } & {
@@ -140,7 +119,7 @@ export async function resolveManifestModulePath(
       const stat = await fs.stat(candidate);
       if (stat.isFile() || stat.isDirectory()) return candidate;
     } catch {
-      // keep trying candidates
+      
     }
   }
 
@@ -150,13 +129,7 @@ export async function resolveManifestModulePath(
 }
 
 async function importFreshModule(modulePath: string): Promise<any> {
-  // Plain `import()` so dynohot wraps the schema/migrations as live deps of
-  // DbService. When these files change, dynohot's file watcher invalidates
-  // them and propagates upward via `iterateWithDynamics`; DbService's
-  // `runtime.register(..., import.meta)` accept handler re-runs
-  // evaluate(), which re-discovers sections and calls createDb with the new
-  // migrations array. Kyju's migration plugin then applies only the delta
-  // against the existing on-disk DB.
+  
   return import(pathToFileURL(modulePath).href);
 }
 
@@ -170,12 +143,7 @@ function resolveConfigPath(): string {
   return fromEnv;
 }
 
-/**
- * Load just the `db` field from the user's `zenbu.config.ts`. Used to feed
- * `resolveDbPath` (which expects a relative-or-absolute string). The full
- * plugin set comes from `runtime.getPlugins()` instead — populated by the
- * loader-emitted barrel before any service evaluates.
- */
+
 async function loadAppDbField(configPath: string): Promise<string> {
   const { loadConfig } = await import("../cli/lib/load-config");
   const { resolved } = await loadConfig(path.dirname(configPath));
@@ -194,9 +162,7 @@ export async function discoverSections(): Promise<SectionConfig[]> {
     totalMs: number;
   }> = [];
 
-  // Parallelize two axes:
-  //   - Across plugins: all manifests process concurrently (outer Promise.all)
-  //   - Within a plugin: schema chain and migrations chain overlap
+  
   const tasks = plugins.map(
     async (plugin): Promise<SectionConfig | null> => {
       const pluginStart = Date.now();
@@ -327,21 +293,10 @@ export class DbService extends Service.create({
   db: Db | null = null;
   dbRouter: ReturnType<typeof createRouter> | null = null;
   private _dbPath: string | null = null;
-  /**
-   * Names of sections currently registered with kyju, mirrored from
-   * the kyju Db. Used by `armPluginSetWatcher` to compute the
-   * add/remove diff when the plugin set changes. Single source of
-   * truth for the in-memory section set lives inside kyju
-   * (`db.listSections()`); this Map is just the cached cross-snapshot
-   * comparison input.
-   */
+  
   private knownSections = new Map<string, SectionConfig>();
 
-  /**
-   * Resolved DB path. Throws if accessed before `evaluate()` has run — the
-   * service contract guarantees deps are evaluated before dependents, so any
-   * access from a dependent service or RPC handler is safe.
-   */
+  
   get dbPath(): string {
     if (this._dbPath === null) {
       throw new Error("DbService.dbPath accessed before evaluate()");
@@ -357,11 +312,7 @@ export class DbService extends Service.create({
     return this.db!.effectClient as unknown as SectionedEffectClient;
   }
 
-  /**
-   * Drain kyju's lagged-persistence queue. Safe to call anytime; idempotent
-   * when nothing is pending. Used by service teardown (effect cleanup) so
-   * shutdown / hot-reload don't lose in-memory writes.
-   */
+  
   async flush(): Promise<void> {
     if (!this.db) return;
     try {
@@ -371,11 +322,7 @@ export class DbService extends Service.create({
     }
   }
 
-  /**
-   * Flush + release the kyju cross-process lock at `<dbPath>/.lock`.
-   * Called on service teardown so a subsequent process can open the DB
-   * without seeing a stale lock. Idempotent.
-   */
+  
   async close(): Promise<void> {
     if (!this.db) return;
     try {
@@ -393,20 +340,7 @@ export class DbService extends Service.create({
     this.armWsTransport();
   }
 
-  /**
-   * Create the kyju `Db` instance once, with whatever sections the
-   * plugin set currently declares. After this completes, the
-   * instance is alive for the entire lifetime of this DbService
-   * — plugin enable/disable mutates it in place via
-   * `db.addSection` / `db.removeSection` rather than rebuilding,
-   * so existing renderer sessions stay valid across toggles.
-   *
-   * Only the database path itself ever justifies a rebuild (a
-   * different on-disk file is fundamentally a different db). The
-   * dbPath is resolved here once and stashed; changes require a
-   * full process restart, which is the right granularity for that
-   * kind of change.
-   */
+  
   private async bootDb(): Promise<void> {
     const configPath = resolveConfigPath();
     const configDir = path.dirname(configPath);
@@ -432,9 +366,7 @@ export class DbService extends Service.create({
       }),
     );
     this._dbPath = dbPath;
-    // Seed the section cache so the plugin-set-watcher's initial
-    // "diff against last snapshot" produces an empty delta against
-    // boot (everything in the boot snapshot is already installed).
+    
     this.knownSections = new Map(sections.map((s) => [s.name, s]));
     addDb(dbPath).catch((err) => {
       log.error("failed to bump registry lastUsedAt:", err);
@@ -446,34 +378,14 @@ export class DbService extends Service.create({
     );
   }
 
-  /**
-   * On any teardown (hot-reload OR shutdown), drain kyju's lagged
-   * writes AND release the cross-process lock. Without `close()`, in-
-   * memory writes that haven't reached setImmediate's flush would
-   * vanish, AND the next process attempting to open this DB would
-   * either be blocked by a stale lock or (in the same-process re-init
-   * case) would race against the abandoned writer.
-   */
+  
   private armKyjuCloseOnCleanup(): void {
     this.setup("kyju-close-on-cleanup", () => async () => {
       await this.close();
     });
   }
 
-  /**
-   * Watch each plugin's migrations directory so `zen db generate` —
-   * which writes a fresh file plus updates `meta/_journal.json` —
-   * picks up the newly-generated migration without a process
-   * restart.
-   *
-   * Implementation: re-discover the current section list (which now
-   * has the new migration in its `migrations` array) and re-call
-   * `db.addSection(section)` for each. `addSection` is idempotent
-   * — sections already at head version are a no-op, sections with
-   * pending migrations get them applied in place. No kyju instance
-   * is rebuilt, no sessions are touched, replicas see the migration
-   * writes as ordinary `db-update` events.
-   */
+  
   private armMigrationsWatcher(): void {
     this.setup("migrations-watcher", () => {
       const subs: AsyncSubscription[] = [];
@@ -521,10 +433,7 @@ export class DbService extends Service.create({
           try {
             isDir = (await fs.stat(migPath)).isDirectory();
           } catch {
-            // Missing dir is fine — plugin hasn't generated migrations
-            // yet. The first generate creates the dir; the next time
-            // DbService re-evaluates (e.g. on a schema edit) this
-            // watcher gets installed.
+            
             continue;
           }
           if (!isDir) continue;
@@ -579,30 +488,13 @@ export class DbService extends Service.create({
     });
   }
 
-  /**
-   * Pick up plugin-set changes from `zenbu.config.ts` (a plugin
-   * added, removed, or its schema/migrations paths swapped) and
-   * apply them as a delta against the live kyju Db.
-   *
-   * For each enabled plugin not already registered with kyju:
-   * `db.addSection(...)` (idempotent; if its data slot already
-   * exists on disk from a previous run, it's preserved and only
-   * pending migrations run). For each previously-registered plugin
-   * that disappeared from the snapshot: `db.removeSection(name)`
-   * with the default `deleteData: false`, so the plugin's data
-   * survives the toggle and re-enabling restores it instantly.
-   *
-   * No kyju instance is rebuilt. Renderer sessions stay valid.
-   * Connected replicas observe the section-init writes + any
-   * migration writes as ordinary `db-update` broadcasts.
-   */
+  
   private armPluginSetWatcher(): void {
     this.setup("plugin-set-watcher", () => {
       let initialFire = true;
       return subscribeConfig(() => {
         if (initialFire) {
-          // First fire happens synchronously inside subscribeConfig;
-          // boot has already loaded the initial section set.
+          
           initialFire = false;
           return;
         }
@@ -613,17 +505,7 @@ export class DbService extends Service.create({
     });
   }
 
-  /**
-   * Re-discover the current section set (from the live
-   * `runtime.getPlugins()` map) and apply the delta to kyju via
-   * `addSection` / `removeSection`. Called by the plugin-set
-   * watcher (when the config changes) and the migrations watcher
-   * (when `zen db generate` lands a new migration file).
-   *
-   * Idempotent and reentrancy-safe: kyju's section ops are
-   * serialized internally, and `addSection` against an already-
-   * registered section with the same migrations is a no-op.
-   */
+  
   private async applyCurrentSectionsToDb(reason: string): Promise<void> {
     const db = this.db;
     if (!db) return;
@@ -659,12 +541,7 @@ export class DbService extends Service.create({
       `apply sections (${reason}): +[${added.join(",")}] -[${removed.join(",")}] ~[${changed.join(",")}]`,
     );
 
-    // For changed migration sets (the same name with more migrations
-    // than we last saw), we need to feed kyju the *new* section
-    // config so its idempotency check uses the new migration list.
-    // `addSection` rejects an already-registered name with different
-    // migrations to catch caller mistakes — so first removeSection
-    // (data-preserving), then addSection with the new config.
+    
     for (const name of changed) {
       const section = next.get(name)!;
       try {
@@ -692,16 +569,78 @@ export class DbService extends Service.create({
     this.knownSections = next;
   }
 
-  /**
-   * Wire each ws connection up to the kyju replication router.
-   *
-   * One-shot setup — since kyju is no longer rebuilt on plugin
-   * toggles (it grows/shrinks sections in place via
-   * `addSection`/`removeSection`), the `dbRouter` is stable for the
-   * service's lifetime and the transport never needs to re-arm.
-   */
+  
   private armWsTransport(): void {
     const http = this.ctx.http;
+
+    
+    this.setup("blob-http", () =>
+      http.addRequestHandler("/__blob/", (req, res) => {
+        const corsHeaders: Record<string, string> = {
+          "Access-Control-Allow-Origin": req.headers.origin || "*",
+          Vary: "Origin",
+        };
+        if (req.method === "OPTIONS") {
+          res.writeHead(204, {
+            ...corsHeaders,
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+          });
+          res.end();
+          return;
+        }
+        try {
+          const u = new URL(req.url ?? "/", "http://127.0.0.1");
+          if (u.searchParams.get("token") !== http.authToken) {
+            res.writeHead(403, corsHeaders);
+            res.end("forbidden");
+            return;
+          }
+          const blobId = decodeURIComponent(
+            u.pathname.slice("/__blob/".length),
+          );
+          if (!/^[A-Za-z0-9_-]+$/.test(blobId)) {
+            res.writeHead(400, corsHeaders);
+            res.end("bad blob id");
+            return;
+          }
+          const dir = path.join(this.dbPath, "blobs", blobId);
+          const file = path.join(dir, "data");
+          const stat = statSync(file, { throwIfNoEntry: false });
+          if (!stat) {
+            res.writeHead(404, corsHeaders);
+            res.end("not found");
+            return;
+          }
+          
+          let storedType: string | undefined;
+          try {
+            const idx = JSON.parse(
+              readFileSync(path.join(dir, "index.json"), "utf8"),
+            );
+            if (typeof idx?.contentType === "string") storedType = idx.contentType;
+          } catch {}
+          res.writeHead(200, {
+            ...corsHeaders,
+            "Content-Type":
+              storedType || u.searchParams.get("type") || "application/octet-stream",
+            "Content-Length": String(stat.size),
+           
+            "Cache-Control": "public, max-age=31536000, immutable",
+          });
+          if (req.method === "HEAD") {
+            res.end();
+            return;
+          }
+          createReadStream(file).pipe(res);
+        } catch {
+          if (!res.headersSent) res.writeHead(500, corsHeaders);
+          res.end("error");
+        }
+      }),
+    );
+
     this.setup("ws-transport", () => {
       const wsDbConnections = new Map<
         string,
@@ -711,15 +650,15 @@ export class DbService extends Service.create({
         const dbConn = this.dbRouter!.connection({
           send: (event: any) => {
             if (ws.readyState === ws.OPEN) {
-              ws.send(dbStringify({ ch: "db", data: event }));
+              ws.send(encodeFrame({ ch: "db", data: event }));
             }
           },
           postMessage: this.db!.postMessage,
         });
         wsDbConnections.set(id, dbConn);
 
-        ws.on("message", async (raw: Buffer) => {
-          const msg = dbParse(String(raw));
+        ws.on("message", async (raw: Buffer, isBinary: boolean) => {
+          const msg = decodeFrame(isBinary ? raw : raw.toString(), isBinary);
           if (msg.ch === "db") {
             await dbConn.receive(msg.data);
           }
