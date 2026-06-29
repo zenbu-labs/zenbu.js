@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import zod from "zod";
@@ -342,6 +342,73 @@ function makeArrayWrapper(ctx: { client: any; replica: any }) {
     });
   };
 }
+
+describe("useDb projecting selector (issue #11)", () => {
+  it("does not infinite-loop when the selector returns fresh literals", async () => {
+    const ctx = await setup();
+    cleanup = ctx.cleanup;
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    let renderCount = 0;
+    const { result } = renderHook(
+      () => {
+        renderCount++;
+        // Projects into a fresh array of fresh objects every call — the
+        // shape the default shallowEqual can't see through. Before the
+        // fix this looped with "Maximum update depth exceeded".
+        return useDb((root) => [{ label: root.title }]);
+      },
+      { wrapper: makeWrapper(ctx) },
+    );
+
+    await act(async () => {
+      await delay(20);
+    });
+
+    expect(result.current).toEqual([{ label: "untitled" }]);
+    // Must settle instead of looping; hundreds of renders means the guard
+    // failed.
+    expect(renderCount).toBeLessThan(10);
+    // And it warns the developer once (dev mode), rather than just crashing.
+    expect(errSpy).toHaveBeenCalled();
+
+    const before = renderCount;
+    await act(async () => {
+      await ctx.client.title.set("changed");
+      await delay(20);
+    });
+
+    // A real db change still flows through.
+    expect(result.current).toEqual([{ label: "changed" }]);
+    expect(renderCount).toBeGreaterThan(before);
+
+    errSpy.mockRestore();
+  });
+
+  it("still reflects prop-driven selector changes without a db write", async () => {
+    const ctx = await setup();
+    cleanup = ctx.cleanup;
+
+    // Selector closes over a prop. Changing the prop (no db write) must
+    // still re-select — the loop guard must not freeze deterministic
+    // prop-dependent selectors, and must not warn for them.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { result, rerender } = renderHook(
+      ({ suffix }: { suffix: string }) =>
+        useDb((root) => `${root.title}-${suffix}`),
+      { wrapper: makeWrapper(ctx), initialProps: { suffix: "a" } },
+    );
+
+    expect(result.current).toBe("untitled-a");
+    rerender({ suffix: "b" });
+    expect(result.current).toBe("untitled-b");
+    expect(errSpy).not.toHaveBeenCalled();
+
+    errSpy.mockRestore();
+  });
+});
 
 describe("useDb nested array reactivity", () => {
   it("re-renders when a nested field in an array element changes via update()", async () => {
