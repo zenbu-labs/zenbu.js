@@ -78,7 +78,8 @@ export function createKyjuReact<
     const isEqualRef = useRef<((a: T, b: T) => boolean) | undefined>(isEqual);
     isEqualRef.current = isEqual;
 
-    const cacheRef = useRef<{ output: T } | null>(null);
+    const cacheRef = useRef<{ root: Root; output: T } | null>(null);
+    const warnedRef = useRef(false);
 
     const subscribe = useCallback(
       (cb: () => void) => replica.subscribe(() => cb()),
@@ -96,8 +97,28 @@ export function createKyjuReact<
       if (cache != null) {
         const eq = isEqualRef.current ?? shallowEqual;
         if (eq(cache.output, next)) return cache.output;
+        // The db is unchanged (replica swaps `root` by reference on every
+        // write) yet the selector produced a non-equal value AND keeps
+        // producing fresh values when called again on the same root. That
+        // means it allocates a new object/array each call, which would make
+        // useSyncExternalStore loop forever ("Maximum update depth
+        // exceeded"). Hold the cached snapshot stable instead, and warn the
+        // developer once. Deterministic prop-dependent selectors return the
+        // same ref here, so they fall through and re-select normally.
+        if (cache.root === root && !eq(next, sel(root))) {
+          if (process.env.NODE_ENV !== "production" && !warnedRef.current) {
+            warnedRef.current = true;
+            console.error(
+              "[kyju] A useDb selector returned a new object/array for an " +
+                "unchanged db state, which causes an infinite re-render. " +
+                "Selectors should return values owned by the db; move any " +
+                "projection into useMemo or pass a custom isEqual.",
+            );
+          }
+          return cache.output;
+        }
       }
-      cacheRef.current = { output: next };
+      cacheRef.current = { root, output: next };
       return next;
     }, [replica]);
 
