@@ -747,11 +747,11 @@ function wrapEffectProxy(target: any): any {
         return (...args: any[]) => {
           const result = val(...args);
           if (Effect.isEffect(result)) {
-            return Effect.runPromise(
-              (result as Effect.Effect<any, any, never>).pipe(
-                Effect.catchAll(() => Effect.void),
-              ),
-            );
+            const promise = Effect.runPromise(result as Effect.Effect<any, any, never>);
+            promise.catch((err) => {
+              console.error("[kyju] Unhandled client effect error:", err);
+            });
+            return promise;
           }
           if (result != null && typeof result === "object" && !Array.isArray(result)) {
             return wrapEffectProxy(result);
